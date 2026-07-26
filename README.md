@@ -32,7 +32,8 @@ See the examples below before using the pipeline.
 ## Installation:
 
 Pick a safe location on your PC and create a folder name "Pog_Engine"
-Create a folder called ```models``` download and put these items in there:
+
+Inside said folder create a folder called ```models```, download and put these files in ```models```:
 
 [Whisper Large V3 for whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)
 >Download: ggml-large-v3.bin
