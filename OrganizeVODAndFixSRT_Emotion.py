@@ -19,21 +19,17 @@ from typing import Iterable
 
 from pipeline_config import MODEL, JUDGE_MODEL, OLLAMA_URL
 
-
 DEFAULT_CHUNK_MINUTES = 25
 MIN_REPEAT_SENTENCE_WORDS = 3
 MIN_SUBTITLE_WORDS = 3
 MAX_SUBTITLE_WORDS = 6
 MAX_SUBTITLE_LINE_CHARS = 42
-# Roughly how many words make one natural "thought" for the LLM discovery
-# passes to read - see merge_entries_for_analysis(). Independent of the
-# on-screen caption size above; captions are short for readability, but the
-# LLM does better with fuller sentences/thoughts than a stream of 3-6 word
-# fragments with no surrounding context.
+# Words per "thought" for LLM discovery to read (see merge_entries_for_
+# analysis()) - independent of the on-screen caption size above; the LLM
+# does better with fuller thoughts than a stream of 3-6 word fragments.
 TRANSCRIPT_MERGE_TARGET_WORDS = 30
-# A gap this long between two consecutive captions is treated as a natural
-# pause/new-thought boundary when merging for LLM analysis, even if the
-# target word count above hasn't been reached yet.
+# A gap this long between captions is a new-thought boundary when merging
+# for LLM analysis, even before the target word count above is hit.
 TRANSCRIPT_MERGE_MAX_GAP_MS = 2500
 SCRIPT_DIR = Path(__file__).resolve().parent
 ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
@@ -43,29 +39,25 @@ GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 # Edit these if your whisper.cpp install moves.
 WHISPER_CLI = r"G:\whisper-cublas-12.4.0-bin-x64\Release\whisper-cli.exe"
 WHISPER_MODEL = r"G:\whisper-cublas-12.4.0-bin-x64\models\ggml-large-v3.bin"
-WHISPER_VAD = r"G:\whisper-cublas-12.4.0-bin-x64\models\silero-v6.2.0-ggml.bin"
+WHISPER_VAD = r"G:\whisper-cublas-12.4.0-bin-x64\models\ggml-silero-v6.2.0.bin"
 
-# Noise gate applied before loudnorm, so quiet background noise (keyboard,
-# game bleed, room tone) gets pushed down instead of amplified into
-# something the VAD mistakes for continuous speech.
-#   threshold: anything quieter than this is treated as "silence" and
-#              attenuated. Raise it (e.g. -30) if noise still leaks through;
-#              lower it (e.g. -45) if your own quiet speech gets gated out.
-#   ratio:     how hard the gate closes below threshold. Higher = harder cutoff.
-#   attack:    how fast (ms) the gate closes when audio drops below threshold.
-#   release:   how fast (ms) the gate reopens when audio rises above threshold.
+# Noise gate before loudnorm: pushes down quiet background noise (keyboard,
+# game bleed, room tone) instead of letting it get amplified into something
+# the VAD mistakes for speech.
+#   threshold: below this = "silence", attenuated. Raise (e.g. -30) if noise
+#              leaks through; lower (e.g. -45) if quiet speech gets gated out.
+#   ratio:     how hard the gate closes below threshold (higher = harder).
+#   attack/release: ms for the gate to close/reopen.
 NOISE_GATE_THRESHOLD_DB = -35
 NOISE_GATE_RATIO = 8
 NOISE_GATE_ATTACK_MS = 10
 NOISE_GATE_RELEASE_MS = 200
-
 
 @dataclass(frozen=True)
 class SubtitleEntry:
     block: str
     start_ms: int
     end_ms: int
-
 
 def parse_srt_time(value: str) -> int:
     """Convert HH:MM:SS,mmm into milliseconds."""
@@ -81,7 +73,6 @@ def parse_srt_time(value: str) -> int:
         + int(milliseconds.ljust(3, "0"))
     )
 
-
 def format_srt_time(milliseconds: int) -> str:
     """Convert milliseconds into HH:MM:SS,mmm."""
     if milliseconds < 0:
@@ -92,7 +83,6 @@ def format_srt_time(milliseconds: int) -> str:
     seconds, millis = divmod(remainder, 1_000)
     return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
 
-
 def format_plain_time(milliseconds: int) -> str:
     """Convert milliseconds into HH:MM:SS for transcript_part files."""
     hours, remainder = divmod(max(milliseconds, 0), 3_600_000)
@@ -100,24 +90,19 @@ def format_plain_time(milliseconds: int) -> str:
     seconds = remainder // 1_000
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
-
 def split_srt_blocks(content: str) -> list[str]:
     return [block.strip() for block in re.split(r"\r?\n\r?\n+", content.strip()) if block.strip()]
-
 
 def read_text(path: Path) -> str:
     # utf-8-sig handles the BOM emitted by some Windows tools.
     return path.read_text(encoding="utf-8-sig")
 
-
 def write_text_crlf(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     normalized = re.sub(r"\r?\n", "\r\n", content)
     path.write_text(normalized, encoding=encoding, newline="")
 
-
 def clean_subtitle_lines(lines: Iterable[str]) -> list[str]:
     return [line.replace("â™ª", "").replace("♪", "") for line in lines]
-
 
 def normalize_caption_text(lines: Iterable[str]) -> str:
     return re.sub(r"\s+", " ", " ".join(clean_subtitle_lines(lines))).strip()
@@ -125,10 +110,8 @@ def normalize_caption_text(lines: Iterable[str]) -> str:
 def normalize_repeated_sentence_key(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", text.casefold())).strip()
 
-
 def is_repeat_sentence_candidate(text_key: str) -> bool:
     return len(text_key.split()) >= MIN_REPEAT_SENTENCE_WORDS
-
 
 def remove_consecutive_repeated_sentences(text: str) -> tuple[str, int]:
     """Collapse only adjacent duplicate multi-word sentences inside one caption."""
@@ -151,13 +134,10 @@ def remove_consecutive_repeated_sentences(text: str) -> tuple[str, int]:
 
     return " ".join(kept_units), removed_count
 
-
-
 NATURAL_BREAK_LEAD_WORDS = {
     "and", "but", "so", "because", "then", "or", "which", "that",
     "when", "if", "since", "while", "though", "although",
 }
-
 
 def find_natural_break_indices(words: list[str]) -> set[int]:
     """Word indices that make a reasonable pause point for a caption break:
@@ -171,7 +151,6 @@ def find_natural_break_indices(words: list[str]) -> set[int]:
         if index > 0 and word.strip(".,!?\"'").lower() in NATURAL_BREAK_LEAD_WORDS:
             natural.add(index)
     return natural
-
 
 def split_sentence_into_natural_chunks(sentence: str) -> list[str]:
     """Splits one sentence into ~MIN_SUBTITLE_WORDS-MAX_SUBTITLE_WORDS-word
@@ -220,7 +199,6 @@ def split_sentence_into_natural_chunks(sentence: str) -> list[str]:
     chunks.append(" ".join(words[start:]))
     return [chunk for chunk in chunks if chunk]
 
-
 def split_caption_text(text: str, duration_ms: int) -> list[str]:
     """Split a long Whisper subtitle into short, natural-sounding captions
     (target MIN_SUBTITLE_WORDS-MAX_SUBTITLE_WORDS words each), without ever
@@ -243,7 +221,6 @@ def split_caption_text(text: str, duration_ms: int) -> list[str]:
 
     return [piece for piece in pieces if piece]
 
-
 def wrap_caption_text(text: str) -> list[str]:
     wrapped = textwrap.wrap(
         text,
@@ -253,7 +230,6 @@ def wrap_caption_text(text: str) -> list[str]:
     )
     return wrapped or [text]
 
-
 def make_srt_block(index: int, start_ms: int, end_ms: int, text: str) -> str:
     return "\r\n".join(
         [
@@ -262,7 +238,6 @@ def make_srt_block(index: int, start_ms: int, end_ms: int, text: str) -> str:
             *wrap_caption_text(text),
         ]
     )
-
 
 def split_caption_block(block: str, start_index: int) -> list[str]:
     lines = re.split(r"\r?\n", block)
@@ -292,7 +267,6 @@ def split_caption_block(block: str, start_index: int) -> list[str]:
         cursor_ms = piece_end_ms
 
     return split_blocks
-
 
 def fix_srt(input_path: Path) -> Path:
     """Fix bad Whisper SRT timestamps, collapse adjacent repeats, and renumber."""
@@ -376,7 +350,6 @@ def fix_srt(input_path: Path) -> Path:
     print(f"Fixed file saved as: {output_path}")
     return output_path
 
-
 def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, str]]:
     """Regroups the short (3-6 word) on-screen captions back into fuller,
     more natural chunks for the LLM discovery passes to read - a stream of
@@ -428,7 +401,6 @@ def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, 
 
     return merged
 
-
 def split_srt_into_chunks(input_path: Path, chunk_minutes: int = DEFAULT_CHUNK_MINUTES) -> list[Path]:
     """Create transcript_partN.txt files grouped into N-minute chunks."""
     entries: list[SubtitleEntry] = []
@@ -477,10 +449,8 @@ def split_srt_into_chunks(input_path: Path, chunk_minutes: int = DEFAULT_CHUNK_M
     print("Each block keeps the real start timestamp of the caption that began it.")
     return output_paths
 
-
 def batch_quote(path: Path | str) -> str:
     return str(path).replace('"', '""')
-
 
 def make_extract_mic_bat(target_folder: Path, base_name: str) -> str:
     mic_wav_name = f"{base_name}_mic.wav"
@@ -509,7 +479,6 @@ echo You can now drag {mic_wav_name} onto 2_TranscribeAudio.bat
 if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
-
 
 def make_transcribe_bat() -> str:
     return f'''@echo off
@@ -588,7 +557,6 @@ if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
 
-
 def make_fix_srt_bat(script_path: Path) -> str:
     return f'''@echo off
 if "%~1"=="" (
@@ -617,7 +585,6 @@ echo Next: drag the *_fixed.srt file onto 4_SplitSRT.bat
 if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
-
 
 def make_split_srt_bat(script_path: Path) -> str:
     return f'''@echo off
@@ -649,7 +616,6 @@ if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
 
-
 def make_analyze_bat(target_folder: Path) -> str:
     """Step 5, the main entry point RunAll uses. Calls the merged analyzer
     with no --stage flag, so it walks discovery -> audioscan -> emotion ->
@@ -669,7 +635,6 @@ if errorlevel 1 (
 if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
-
 
 def make_debug_stage_bat(stage_key: str, step_label: str) -> str:
     """5a-5f: force-reruns exactly one internal stage, for debugging (e.g.
@@ -691,7 +656,6 @@ pause
 exit /b 0
 '''
 
-
 def make_run_all_bat(target_folder: Path, base_name: str, script_path: Path) -> str:
     return f'''@echo off
 python "{batch_quote(script_path)}" --run-all-gui "{batch_quote(target_folder)}" --base-name "{batch_quote(base_name)}" --no-pause
@@ -704,7 +668,6 @@ if errorlevel 1 (
 exit /b 0
 '''
 
-
 @dataclass(frozen=True)
 class RunAllStep:
     label: str
@@ -713,28 +676,24 @@ class RunAllStep:
     pass_input: bool = False
     expected_kind: str | None = None
 
-
 def build_run_all_steps(target_folder: Path, base_name: str) -> list[RunAllStep]:
     return [
         RunAllStep("1. Extract mic audio", "1_ExtractMicAudio.bat", expected_kind="mic_wav"),
         RunAllStep("2. Transcribe audio", "2_TranscribeAudio.bat", "mic_wav", True, "raw_srt"),
         RunAllStep("3. Fix SRT", "3_FixSRT.bat", "raw_srt", True, "fixed_srt"),
         RunAllStep("4. Split SRT", "4_SplitSRT.bat", "fixed_srt", True, "transcript_part"),
-        # Step 5 is one external process from the GUI's point of view, but
-        # internally walks 6 checkpointed sub-stages (discovery -> ... ->
-        # export) with its own resume logic - see analyze_highlights_emotion.py.
-        # "Done" for THIS step means the final CSV exists; the script itself
-        # decides what, if anything, still needs to run beneath that.
+        # One external process from the GUI's view, but internally walks 6
+        # checkpointed sub-stages (discovery -> ... -> export) with its own
+        # resume logic - see analyze_highlights_emotion.py. "Done" here means
+        # the final CSV exists; the script decides what still needs to run.
         RunAllStep("5. Analyze highlights", "5_AnalyzeHighlights.bat", "transcript_part", False, "highlights_csv"),
     ]
-
 
 def newest_file(paths: Iterable[Path]) -> Path | None:
     existing_paths = [path for path in paths if path.exists()]
     if not existing_paths:
         return None
     return max(existing_paths, key=lambda path: path.stat().st_mtime)
-
 
 def find_run_all_file(target_folder: Path, base_name: str, kind: str) -> Path | None:
     if kind == "mic_wav":
@@ -754,7 +713,6 @@ def find_run_all_file(target_folder: Path, base_name: str, kind: str) -> Path | 
         return newest_file(target_folder.glob("top*_highlights.csv"))
     raise ValueError(f"Unknown run-all file kind: {kind}")
 
-
 def describe_run_all_file(target_folder: Path, base_name: str, kind: str) -> str:
     if kind == "mic_wav":
         return f"{target_folder / f'{base_name}_mic.wav'} or newest *_mic.wav"
@@ -768,7 +726,6 @@ def describe_run_all_file(target_folder: Path, base_name: str, kind: str) -> str
         return f"{target_folder} / top*_highlights.csv"
     raise ValueError(f"Unknown run-all file kind: {kind}")
 
-
 def gallery_image_paths(gallery_dir: Path = GALLERY_DIR) -> list[Path]:
     if not gallery_dir.exists():
         return []
@@ -780,10 +737,8 @@ def gallery_image_paths(gallery_dir: Path = GALLERY_DIR) -> list[Path]:
     ]
     return sorted(image_paths, key=lambda path: path.stat().st_mtime, reverse=True)
 
-
 def make_step6_log_path(target_folder: Path) -> Path:
     return target_folder / f"step6_run_{datetime.now():%Y%m%d_%H%M%S}.log"
-
 
 def run_all_gui(target_folder: Path, base_name: str) -> int:
     target_folder = target_folder.resolve()
@@ -807,10 +762,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     run_log.write(f"Folder: {target_folder}\n")
     run_log.write(f"Base name: {base_name}\n\n")
 
-    # Stop-button state: the currently-running step's subprocess (so Stop
-    # can kill it), whether a stop has been requested (so a step that dies
-    # because we killed it reports "Stopped" rather than "Failed"), and a
-    # place to note the last fully-completed step for the status bar.
+    # Stop-button state: current step's subprocess (so Stop can kill it),
+    # whether a stop was requested (so a killed step reports "Stopped" not
+    # "Failed"), and the last fully-completed step for the status bar.
     current_process: dict[str, subprocess.Popen | None] = {"popen": None}
     stop_requested = {"value": False}
 
@@ -826,7 +780,6 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         run_log.write(f"\nClosed: {datetime.now().isoformat(timespec='seconds')}\n")
         run_log.close()
         run_log_closed["value"] = True
-
 
     root = tk.Tk()
     root.title("Step 6 - Run All VOD Steps - Emotion Edition")
@@ -1031,10 +984,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         if process is None or process.poll() is not None:
             return  # nothing running, or it already exited on its own
         try:
-            # taskkill /T kills the whole process tree, not just cmd.exe -
-            # Popen.terminate() alone only signals cmd.exe, which does NOT
-            # reliably take the python.exe (and anything it's waiting on)
-            # down with it on Windows.
+            # taskkill /T kills the whole tree, not just cmd.exe - Popen.
+            # terminate() alone only signals cmd.exe, which won't reliably
+            # take python.exe (and whatever it's waiting on) down with it.
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                 capture_output=True, timeout=15,
@@ -1089,10 +1041,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         events.put(("log", "\n--- STOP requested ---\n"))
 
         def stop_worker() -> None:
-            # Runs on a background thread so a slow taskkill or an
-            # unresponsive Ollama server can't freeze the GUI - all
-            # cross-thread communication goes through the events queue,
-            # same as the main worker() thread already does.
+            # Background thread so a slow taskkill or unresponsive Ollama
+            # can't freeze the GUI - cross-thread comms go through the
+            # events queue, same as the main worker() thread.
             kill_process_tree(current_process["popen"])
             unload_ollama_models_now()
             clear_in_progress_temp_files()
@@ -1178,7 +1129,6 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     close_run_log()
     return exit_code["value"]
 
-
 def move_related_files(video_file: Path, target_folder: Path) -> int:
     base_name = video_file.stem.lower()
     moved_count = 0
@@ -1200,7 +1150,6 @@ def move_related_files(video_file: Path, target_folder: Path) -> int:
 
     return moved_count
 
-
 def organize_video(video_file: Path) -> Path:
     video_file = video_file.resolve()
     if not video_file.exists():
@@ -1221,10 +1170,9 @@ def organize_video(video_file: Path) -> Path:
         "4_SplitSRT.bat": make_split_srt_bat(script_path),
         "5_AnalyzeHighlights.bat": make_analyze_bat(target_folder),
         "6_RunAllSteps.bat": make_run_all_bat(target_folder, base_name, script_path),
-        # Debug-only sub-steps: not part of the main numbered sequence and
-        # not tracked by the RunAll GUI. Force-rerun one internal stage in
-        # isolation (e.g. after tweaking a prompt) without redoing
-        # everything before it.
+        # Debug-only sub-steps: not in the main numbered sequence or tracked
+        # by the RunAll GUI. Force-rerun one internal stage in isolation
+        # (e.g. after tweaking a prompt) without redoing everything before it.
         "5a_Discovery.bat": make_debug_stage_bat("discovery", "Discovery"),
         "5b_AudioScan.bat": make_debug_stage_bat("audioscan", "Audio Scan"),
         "5c_EmotionScoring.bat": make_debug_stage_bat("emotion", "Emotion Scoring"),
@@ -1258,7 +1206,6 @@ def organize_video(video_file: Path) -> Path:
     print("\nDone.")
     return target_folder
 
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Organize an OBS VOD folder, create helper batch files, fix/split Whisper SRT files, and run emotion-enhanced highlight analysis."
@@ -1273,14 +1220,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-pause", action="store_true", help="Do not wait for Enter before exiting.")
     return parser.parse_args(argv)
 
-
 def pause_if_needed(enabled: bool) -> None:
     if enabled:
         try:
             input("Press Enter to continue...")
         except EOFError:
             pass
-
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
@@ -1311,7 +1256,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         pause_if_needed(should_pause)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

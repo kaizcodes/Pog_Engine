@@ -1,56 +1,51 @@
 """Emotion-enhanced highlight analyzer - discovery, full-file audio scan,
 speech-emotion scoring, content verification, judging, and export, all in
-one file and one process.
+one file/process.
 
-Internally this walks 6 checkpointed sub-stages (discovery -> audioscan ->
-emotion -> verify -> judge -> export). Each one saves its result to a JSON
-checkpoint in the stream folder before moving to the next, so a run that
-dies partway through (a crash, an Ollama timeout, or hitting Stop in the
-RunAll GUI) can be resumed with no wasted work:
+Walks 6 checkpointed sub-stages (discovery -> audioscan -> emotion ->
+verify -> judge -> export). Each saves its result to a JSON checkpoint in
+the stream folder before the next, so a run that dies partway (crash,
+Ollama timeout, Stop in the RunAll GUI) resumes with no wasted work:
 
   python analyze_highlights_emotion.py <folder>
-      Runs every stage that hasn't already checkpointed, in order, through
-      export. This is what 5_AnalyzeHighlights.bat and 6_RunAllSteps.bat
-      both use - safe to re-run as many times as needed.
+      Runs every non-checkpointed stage in order through export. Used by
+      5_AnalyzeHighlights.bat and 6_RunAllSteps.bat - safe to re-run.
 
   python analyze_highlights_emotion.py <folder> --stage verify
-      Force-reruns just ONE stage (used by the 5a-5f debug bats), clearing
-      every checkpoint after it since they'd otherwise be stale. Useful
-      for testing a prompt/logic change to a single stage without redoing
-      everything before it.
+      Force-reruns ONE stage (used by the 5a-5f debug bats), clearing
+      every checkpoint after it (else stale). For testing a prompt/logic
+      change to one stage without redoing everything before it.
 
-Checkpoint files, written to the stream folder:
+Checkpoint files (in the stream folder):
   checkpoint_1_discovery.json  - after discovery (raw, deduped/filtered)
-  checkpoint_2_audioscan.json  - after the audio scan (+ candidates, merged)
+  checkpoint_2_audioscan.json  - after audio scan (+ candidates, merged)
   checkpoint_3_emotion.json    - after emotion scoring (+ scores, sorted)
   checkpoint_4_verified.json   - after content verification
   checkpoint_5_judged.json     - after judging (final ranked top N)
-  pipeline_stats.json          - running Ollama call/timing totals and the
-                                  last-completed-stage marker, read by the
-                                  export stage for the final run summary.
+  pipeline_stats.json          - running Ollama call/timing totals + the
+                                  last-completed-stage marker, read by
+                                  export for the final run summary.
   log_<stage>.txt              - full console output for that stage,
-                                  appended across every run/resume attempt.
+                                  appended across every run/resume.
 
-discovery, audioscan, and verify each sanity-check their own result before
-checkpointing it: if the output looks like it came from a broken run
-(Ollama unreachable, a model response that stopped parsing entirely)
-rather than a stream that legitimately had nothing to offer, the stage
-exits WITHOUT writing its checkpoint, so the next run retries it from
-scratch instead of silently treating a bad result as permanently done.
-This only guards against future runs - an already-existing empty
-checkpoint from before this check was added won't retroactively get
-cleared, so a folder stuck on an old run still needs one manual nudge
-(delete the relevant checkpoint_*.json, or run its 5a/5b/5d debug bat).
+discovery, audioscan, and verify each sanity-check their result before
+checkpointing: if it looks like a broken run (Ollama unreachable, a
+response that stopped parsing entirely) rather than a stream that
+legitimately had nothing to offer, the stage exits WITHOUT writing its
+checkpoint, so the next run retries instead of treating a bad result as
+done. Only guards future runs - a pre-existing empty checkpoint from
+before this check won't retroactively clear, so a stuck folder still
+needs one manual nudge (delete the checkpoint_*.json, or run its 5a/5b/5d
+debug bat).
 
-pipeline_run_history.csv is NOT written to the stream folder - it lives
-next to this script (see SCRIPT_DIR) and gets one row appended every time
-a normal (non --stage) run reaches the end of the pipeline, so it
-accumulates per-stage and total timing across every stream you process,
-not just this one. See record_pipeline_run_history().
+pipeline_run_history.csv is NOT in the stream folder - it lives next to
+this script (SCRIPT_DIR) and gets one row per normal (non --stage) run
+that reaches the end, accumulating per-stage/total timing across every
+stream processed. See record_pipeline_run_history().
 
-See STAGE_ORDER / STAGE_FUNCS near the bottom of this file for the stage
-dispatch, and invalidate_downstream() for how forced single-stage reruns
-keep the checkpoint chain consistent.
+See STAGE_ORDER / STAGE_FUNCS near the bottom for stage dispatch, and
+invalidate_downstream() for how forced single-stage reruns keep the
+checkpoint chain consistent.
 """
 
 import re
@@ -86,13 +81,12 @@ from pipeline_config import (
     RUN_INFO_FILENAME, RUN_HISTORY_FILENAME,
 )
 
-# Folder this script itself lives in (as opposed to stream_folder, which is
-# whichever VOD folder was passed on the command line) - constant across
-# every stream you process, since the .bat launchers always invoke this
-# same script in place rather than a per-VOD copy of it. Used only for
-# pipeline_run_history.csv (see record_pipeline_run_history()), which is
-# deliberately kept next to the scripts rather than inside any one VOD's
-# folder so it accumulates timing across every run, not just one stream's.
+# Folder this script lives in (vs stream_folder, the VOD folder passed on
+# the command line) - constant since .bat launchers always invoke this
+# same script in place, never a per-VOD copy. Used only for
+# pipeline_run_history.csv, deliberately kept next to the scripts (not
+# per-VOD) so it accumulates timing across every run - see
+# record_pipeline_run_history().
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 EMOTION_HALF_WINDOW_SECONDS = EMOTION_WINDOW_SECONDS / 2
@@ -109,19 +103,16 @@ CALL_STATS = {"ollama_calls": 0, "ollama_seconds": 0.0, "ollama_retries": 0}
 AUDIO_SCAN_STATS = {"candidates_found": 0, "candidates_kept": 0}
 PROCESS_START_TIME = time.time()
 
-
 # --- Checkpoint I/O -----------------------------------------------------
-# The mechanism that makes each stage resumable: every stage function checks
-# checkpoint_exists() for its own output before doing any work, and every
-# RunAll GUI re-run relies on the same files to decide what to skip.
+# Makes each stage resumable: every stage function checks checkpoint_exists()
+# for its own output before doing work, and every RunAll GUI re-run relies
+# on the same files to decide what to skip.
 
 def checkpoint_path(stream_folder, name):
     return os.path.join(stream_folder, f"checkpoint_{name}.json")
 
-
 def checkpoint_exists(stream_folder, name):
     return os.path.exists(checkpoint_path(stream_folder, name))
-
 
 def save_checkpoint(stream_folder, name, data):
     """Atomic write: build the file fully as a .tmp, then os.replace() it
@@ -136,14 +127,12 @@ def save_checkpoint(stream_folder, name, data):
     os.replace(tmp_path, path)
     return path
 
-
 def load_checkpoint(stream_folder, name):
     path = checkpoint_path(stream_folder, name)
     if not os.path.exists(path):
         return None
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
 
 def require_checkpoint(stream_folder, name, stage_label):
     """Load a checkpoint that this stage depends on, or exit with a clear
@@ -156,7 +145,6 @@ def require_checkpoint(stream_folder, name, stage_label):
         print(f"[{stage_label}] Run the earlier steps first (or run RunAllSteps.bat, which runs them in order).")
         sys.exit(1)
     return data
-
 
 # Canonical stage order and which checkpoint each one produces. "export" has
 # no checkpoint of its own - its output IS the final CSV/EDL/run_info.json.
@@ -176,7 +164,6 @@ STAGE_LABELS = {
     "judge": "5e. Judging",
     "export": "5f. Export",
 }
-
 
 def invalidate_downstream(stream_folder, from_stage):
     """Deletes the checkpoint for from_stage and every stage after it (plus
@@ -205,7 +192,6 @@ def invalidate_downstream(stream_folder, from_stage):
     if removed:
         print(f"Invalidated {len(removed)} stale downstream file(s): {', '.join(removed)}")
 
-
 # --- Pipeline-wide stats (Ollama calls, per-stage timing) ----------------
 # Persisted across stages/processes so stage 10 (export) can report a full
 # run summary even though no single process saw the whole pipeline.
@@ -221,14 +207,12 @@ def load_pipeline_stats(stream_folder):
         "stage_seconds": {},
     }
 
-
 def save_pipeline_stats(stream_folder, stats):
     path = os.path.join(stream_folder, "pipeline_stats.json")
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
     os.replace(tmp_path, path)
-
 
 def record_stage_stats(stream_folder, stage_name, stage_seconds):
     """Call at the end of every stage that finishes successfully: folds this
@@ -252,7 +236,6 @@ def record_stage_stats(stream_folder, stage_name, stage_seconds):
     save_pipeline_stats(stream_folder, stats)
     print(f"[{stage_name}] Stage finished in {stage_seconds:.1f}s")
 
-
 class _Tee:
     """Duplicates writes to multiple streams - used to make every stage's
     console output also land in a persistent per-stage log file, without
@@ -268,7 +251,6 @@ class _Tee:
     def flush(self):
         for s in self.streams:
             s.flush()
-
 
 @contextlib.contextmanager
 def stage_log(stream_folder, stage_name):
@@ -293,12 +275,11 @@ def stage_log(stream_folder, stage_name):
         sys.stdout = original_stdout
         f.close()
 
-
 # --- Transcript utilities shared across stages ---------------------------
-# Stages after discovery run as separate processes, so they can't share the
-# transcript_blocks_by_part dict discovery built in memory - it gets rebuilt
-# fresh here instead. This is just re-parsing the (already split)
-# transcript_part*.txt files, so it's cheap regardless of VOD length.
+# Stages after discovery run as separate processes, so they can't share its
+# in-memory transcript_blocks_by_part dict - rebuilt fresh here instead by
+# re-parsing the already-split transcript_part*.txt files (cheap regardless
+# of VOD length).
 
 def list_transcript_parts(stream_folder):
     parts = sorted(
@@ -306,7 +287,6 @@ def list_transcript_parts(stream_folder):
         key=lambda f: int(re.search(r'\d+', f).group())
     )
     return parts
-
 
 def build_transcript_blocks_by_part(stream_folder):
     blocks_by_part = {}
@@ -318,9 +298,6 @@ def build_transcript_blocks_by_part(stream_folder):
             transcript = f.read()
         blocks_by_part[part] = parse_srt_blocks(transcript)
     return blocks_by_part
-
-
-
 
 def ollama_generate(payload, timeout, url=None):
     """POST to an Ollama endpoint (default /api/generate) with a couple of
@@ -357,7 +334,6 @@ def ollama_generate(payload, timeout, url=None):
                 time.sleep(OLLAMA_RETRY_BACKOFF_SECONDS * (attempt + 1))
     raise last_exc
 
-
 def find_mic_wav(stream_folder):
     """Find the mic WAV produced by step 1."""
     candidates = []
@@ -370,7 +346,6 @@ def find_mic_wav(stream_folder):
         return None
     return max(candidates, key=os.path.getmtime)
 
-
 def find_source_video(stream_folder):
     """Find the original recording (mp4/mkv/mov) that step 0 moved into this
     folder, so preview clips can be cut with picture, not just the extracted
@@ -382,7 +357,6 @@ def find_source_video(stream_folder):
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
-
 
 def export_preview_clips(stream_folder, highlights, before_seconds, after_seconds):
     """Cuts a short clip around each final highlight into stream_folder/clips/
@@ -432,7 +406,6 @@ def export_preview_clips(stream_folder, highlights, before_seconds, after_second
     if exported:
         print(f"[preview] Saved {exported} preview clip(s) to: {clips_dir}")
 
-
 def unload_ollama_model(model_name):
     """Ask Ollama to unload a model so CUDA VRAM is available for emotion scoring."""
     try:
@@ -444,7 +417,6 @@ def unload_ollama_model(model_name):
         print(f"[emotion] Requested Ollama unload for {model_name}")
     except Exception as exc:
         print(f"[emotion] Could not unload Ollama model {model_name}: {exc}")
-
 
 def emotion_boost(label, confidence):
     label = (label or "").strip().lower()
@@ -459,7 +431,6 @@ def emotion_boost(label, confidence):
         boost += 0.5
     return min(boost, 2.0)
 
-
 def load_existing_emotion_scores(csv_path):
     if not os.path.exists(csv_path):
         return {}
@@ -472,7 +443,6 @@ def load_existing_emotion_scores(csv_path):
                 continue
             loaded[timestamp] = row
     return loaded
-
 
 def classify_candidate_emotions(stream_folder, highlights):
     """Classify audio around candidate timestamps and write emotion_scores.csv."""
@@ -638,13 +608,11 @@ def classify_candidate_emotions(stream_folder, highlights):
         pass
     return {row["Timestamp"]: row for row in rows}
 
-
 def format_plain_seconds(seconds):
     seconds = max(0, int(round(seconds)))
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
 
 def apply_emotion_scores_to_highlights(highlights, stream_folder):
     if not highlights:
@@ -681,11 +649,9 @@ def apply_emotion_scores_to_highlights(highlights, stream_folder):
 
     print(f"Emotion scoring attached to {len(scores_by_timestamp)} timestamp(s); boosted {boosted} candidate(s).")
 
-
 def timestamp_to_seconds(ts):
     h, m, s = map(int, ts.split(":"))
     return h * 3600 + m * 60 + s
-
 
 def extract_transcript_timestamps(transcript_text):
     """Returns a sorted list of all HH:MM:SS timestamps (in seconds)
@@ -693,7 +659,6 @@ def extract_transcript_timestamps(transcript_text):
     raw = re.findall(r'(\d{2}:\d{2}:\d{2})', transcript_text)
     seconds = sorted(set(timestamp_to_seconds(ts) for ts in raw))
     return seconds
-
 
 def nearest_distance(target_seconds, sorted_seconds_list):
     """Returns distance in seconds to the closest real transcript timestamp."""
@@ -710,7 +675,6 @@ def nearest_distance(target_seconds, sorted_seconds_list):
 
     return min(abs(target_seconds - c) for c in candidates)
 
-
 def similar_titles(title_a, title_b, threshold=0.75):
     """Fuzzy similarity check for near-duplicate detection."""
     a = title_a.strip().lower()
@@ -718,7 +682,6 @@ def similar_titles(title_a, title_b, threshold=0.75):
     if not a or not b:
         return False
     return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
-
 
 def merge_near_duplicates(highlights_list, time_window=10):
     """Merges highlights that are within `time_window` seconds of each
@@ -751,7 +714,6 @@ def merge_near_duplicates(highlights_list, time_window=10):
 
     return kept
 
-
 def parse_srt_blocks(transcript_text):
     """Parses the transcript_partN.txt block format produced by
     split_srt_into_chunks() in OrganizeVODAndFixSRT_Emotion.py:
@@ -776,7 +738,6 @@ def parse_srt_blocks(transcript_text):
     blocks.sort(key=lambda b: b[0])
     return blocks
 
-
 def get_snippet(blocks, target_seconds, window=20):
     """Returns the joined transcript text for all blocks whose timestamp
     falls within +/- window seconds of target_seconds."""
@@ -790,26 +751,22 @@ def get_snippet(blocks, target_seconds, window=20):
 
     return " / ".join(matched)
 
-
 # --- Full-file audio scan: a second, independent candidate source ----------
+# Everything above can only produce a candidate if it starts as text in a
+# transcript_part file and gets picked by an LLM discovery prompt - so a
+# pure reaction with no words (a scream, silence-then-yell, laughter with
+# no dialogue) could never become one, no matter how loud, since there was
+# no transcript text for the model to read.
 #
-# Everything above this point can only produce a candidate if it starts as
-# text in a transcript_part file and gets picked by one of the LLM discovery
-# prompts. That means a pure reaction with no words - a scream, a long
-# silence-then-yell, laughter with no dialogue - could never become a
-# candidate, no matter how loud it was, because there was no transcript text
-# for the model to read in the first place.
-#
-# This section closes that gap by scanning the *entire* mic track directly:
+# This closes that gap by scanning the *entire* mic track directly:
 #   1. Cheap, model-free signal processing (loudness + a speech-rate proxy)
-#      sweeps the whole file to find energetic/fast moments.
-#   2. Peaks that aren't already close to an LLM-discovered candidate become
-#      new highlight candidates in their own right.
-#   3. Those new candidates get merged into the main `highlights` list
-#      *before* apply_emotion_scores_to_highlights() runs, so the existing
+#      sweeps the file for energetic/fast moments.
+#   2. Peaks not already close to an LLM-discovered candidate become new
+#      candidates in their own right.
+#   3. New candidates merge into `highlights` *before*
+#      apply_emotion_scores_to_highlights() runs, so the existing
 #      speech-emotion model scores them too automatically - no changes
-#      needed to that function, it just sees more timestamps.
-
+#      needed there, it just sees more timestamps.
 
 def _zscore(values):
     """Standardize a 1-D numpy array against its own mean/std. Thresholding
@@ -822,27 +779,22 @@ def _zscore(values):
         return np.zeros_like(values)
     return (values - values.mean()) / std
 
-
 def compute_audio_arousal_series(audio, sample_rate):
-    """Sweeps the whole track and returns, for each hop:
-      - times: seconds from the start of the file
+    """Sweeps the whole track, returning per hop:
+      - times: seconds from file start
       - composite: weighted loudness+rate z-score (the peak-picking signal)
       - loudness_z / rate_z: the two components, kept separate for scoring
 
-    Loudness comes from RMS energy. "Speech rate" has no ground truth here
-    (there's no word-level alignment available), so it's approximated with
-    how much the energy envelope fluctuates *within* each hop (split into
-    sub-frames) - a proxy for how fast/emphatic the audio is, not a precise
-    words-per-minute measurement.
+    Loudness is RMS energy. "Speech rate" has no ground truth here (no
+    word-level alignment), so it's approximated by how much the energy
+    envelope fluctuates *within* each hop (split into sub-frames) - a
+    fast/emphatic proxy, not a real words-per-minute measurement.
 
-    Processes the file one hop at a time rather than framing the whole
-    track into a single array. librosa.feature.rms / onset.onset_strength
-    materialize a dense (frame_length x n_frames) matrix internally - fine
-    for a few minutes of audio at ~2048-sample frames, but for a multi-hour
-    VOD at multi-second frames that matrix is gigabytes (this is what was
-    crashing). This uses O(hop_length) memory per step regardless of how
-    long the stream is, so a 10-hour VOD costs the same peak memory as a
-    10-minute one.
+    Processes one hop at a time instead of framing the whole track into one
+    array: librosa.feature.rms / onset.onset_strength build a dense
+    (frame_length x n_frames) matrix internally, which is gigabytes for a
+    multi-hour VOD at multi-second frames (this was crashing). Per-hop
+    processing uses O(hop_length) memory regardless of stream length.
     """
     import numpy as np
 
@@ -878,7 +830,6 @@ def compute_audio_arousal_series(audio, sample_rate):
 
     return times, composite, loudness_z, rate_z
 
-
 def pick_energy_peaks(times, composite, min_zscore, min_separation_seconds, max_candidates):
     """Greedy non-max suppression: take the highest-scoring hop, reject
     anything within min_separation_seconds of an already-picked peak, repeat.
@@ -903,7 +854,6 @@ def pick_energy_peaks(times, composite, min_zscore, min_separation_seconds, max_
     chosen_indices.sort(key=lambda i: times[i])
     return chosen_indices
 
-
 def build_part_time_ranges(transcript_blocks_by_part):
     """For each transcript_partN.txt, the (min, max) timestamp actually
     observed in its blocks - used to map an audio-scan timestamp (which has
@@ -918,7 +868,6 @@ def build_part_time_ranges(transcript_blocks_by_part):
     ranges.sort(key=lambda r: r[1])
     return ranges
 
-
 def part_for_timestamp(seconds, part_ranges):
     """Which transcript part a given absolute timestamp falls into."""
     if not part_ranges:
@@ -927,7 +876,6 @@ def part_for_timestamp(seconds, part_ranges):
         if start - 30 <= seconds <= end + 30:
             return part
     return min(part_ranges, key=lambda r: min(abs(seconds - r[1]), abs(seconds - r[2])))[0]
-
 
 def flatten_transcript_blocks(transcript_blocks_by_part):
     """All parsed (start_seconds, text) blocks across every part, sorted -
@@ -938,7 +886,6 @@ def flatten_transcript_blocks(transcript_blocks_by_part):
         all_blocks.extend(blocks)
     all_blocks.sort(key=lambda b: b[0])
     return all_blocks
-
 
 def audio_candidate_base_score(loudness_z, rate_z):
     """Initial 1-10 score before emotion boost/judging. These candidates
@@ -954,7 +901,6 @@ def audio_candidate_base_score(loudness_z, rate_z):
         base += 1
     return min(base, 7)
 
-
 def describe_audio_signal(loudness_z, rate_z):
     """Qualitative tiers for the titling prompt - easier for the model to
     reason about than raw z-scores."""
@@ -965,7 +911,6 @@ def describe_audio_signal(loudness_z, rate_z):
             return "high"
         return "elevated"
     return f"loudness: {tier(loudness_z)} for this stream, speech-rate proxy: {tier(rate_z)} for this stream"
-
 
 def title_audio_candidates(raw_candidates, all_blocks, stream_folder):
     """Generates a Title/Reason for each audio-scan peak, batched through
@@ -1017,15 +962,13 @@ STRICT OUTPUT FORMAT:
             signal_desc = describe_audio_signal(c["LoudnessZ"], c["RateZ"])
             prompt += f"{i}. Signal: {signal_desc} | Transcript: {snippet_text}\n"
 
-        # /api/chat + top-level think:false, not /api/generate + a "/no_think"
-        # string in the prompt: qwen3.5 handles thinking through Ollama's own
-        # renderer/parser rather than the classic template, and /api/generate
-        # ignores think:false outright for it (confirmed Ollama bug -
-        # ollama/ollama#14793) - the model just thinks until num_predict runs
-        # out and "response" comes back empty, which is exactly the "0/10
-        # titles parsed" failure this used to produce for every batch.
-        # /api/chat with think:false as a top-level field is the combination
-        # Ollama confirms actually disables it.
+        # /api/chat + top-level think:false, not /api/generate + "/no_think"
+        # in the prompt: qwen3.5 handles thinking via Ollama's own renderer/
+        # parser, and /api/generate ignores think:false outright for it
+        # (confirmed Ollama bug ollama/ollama#14793) - it just thinks until
+        # num_predict runs out and "response" comes back empty (the "0/10
+        # titles parsed" failure this used to produce for every batch).
+        # /api/chat + think:false is the combination Ollama confirms works.
         payload = {
             "model": JUDGE_MODEL,
             "messages": [{"role": "user", "content": prompt}],
@@ -1093,7 +1036,6 @@ STRICT OUTPUT FORMAT:
                 print(f"     [!] 0/{len(batch)} titles parsed for this batch, and failed to save debug dump: {exc}")
 
     return titled
-
 
 def find_audio_scan_candidates(stream_folder, highlights, transcript_blocks_by_part):
     """Orchestrates the full-file audio scan: cheap DSP sweep -> peak-pick ->
@@ -1173,7 +1115,6 @@ def find_audio_scan_candidates(stream_folder, highlights, transcript_blocks_by_p
     print(f"[audio-scan] {len(titled)} candidate(s) added from audio scan")
     return titled
 
-
 def is_low_content_title(title):
     """Hard filter for junk titles the model is supposed to exclude via
     prompting but sometimes scores highly anyway: single words, repeated
@@ -1224,12 +1165,10 @@ def is_low_content_title(title):
             if len(chunks) >= 2 and len(set(chunks)) == 1:
                 return True
 
-    # Title is nothing but a stack of repeated interjections, e.g.
-    # "dude dude dude what what" (two different words, each repeated
-    # back-to-back, with no other content). The phrase-chunk check above
-    # only catches ONE phrase repeated uniformly throughout; this catches
-    # multiple different repeated runs concatenated together, as long as
-    # every word in the title belongs to some run of length >= 2.
+    # Catches a title that's a stack of repeated interjections, e.g. "dude
+    # dude dude what what" (two words, each repeated back-to-back) - unlike
+    # the phrase-chunk check above (one phrase repeated uniformly), this
+    # allows multiple different runs, as long as every word is in a run >= 2.
     runs = []
     for w in words:
         if runs and runs[-1][0] == w:
@@ -1240,7 +1179,6 @@ def is_low_content_title(title):
         return True
 
     return False
-
 
 # --- Stage 5: Discovery --------------------------------------------------
 
@@ -1322,10 +1260,9 @@ def run_discovery(stream_folder, parts, prompts):
                         pieces = line.split(",", 3)
 
                     # Fallback: model sometimes puts a space instead of a
-                    # comma between the timestamp and score, e.g.
-                    # "[03:17:37] 9, ..." which merges the first two fields
-                    # into one (3 fields total instead of 4). Detect and
-                    # split that case.
+                    # comma between timestamp and score, e.g. "[03:17:37] 9,
+                    # ..." (merges the first two fields into one - 3 fields
+                    # instead of 4). Detect and split that case.
                     if len(pieces) == 3 and re.match(
                         r'^\s*[\[]?\d{2}:\d{2}:\d{2}[\]]?\s+\d+\s*$', pieces[0]
                     ):
@@ -1412,11 +1349,10 @@ def run_discovery(stream_folder, parts, prompts):
             unique[key] = h
     highlights = list(unique.values())
 
-    # Hard filter: drop junk titles regardless of what score the model gave
-    # them - enforced in code because smaller models don't reliably apply
-    # exclusion rules from the prompt alone. (Discovery already skips these
-    # per-line above; this catches anything the per-line check missed after
-    # dedup picked a different-but-still-junk winner.)
+    # Hard filter: drop junk titles regardless of model score - enforced in
+    # code since smaller models don't reliably apply exclusion rules from
+    # the prompt alone. (Discovery already skips these per-line; this
+    # catches what slipped through after dedup picked a still-junk winner.)
     before_filter_count = len(highlights)
     highlights = [h for h in highlights if not is_low_content_title(h["Title"])]
     filtered_count = before_filter_count - len(highlights)
@@ -1455,20 +1391,15 @@ def verify_candidates(highlights, transcript_blocks_by_part, verify_prompt_heade
         batch = highlights[batch_start:batch_start + batch_size]
         total_items += len(batch)
 
-        # Thinking must be OFF here: JUDGE_MODEL is a thinking-capable model,
-        # and without that it can burn the whole num_predict budget below
-        # on an internal reasoning trace before ever emitting the actual
-        # ItemNumber,VERDICT lines - which looks like every batch silently
-        # returning 0 parsed verdicts. This used to be done by putting
-        # "/no_think" in the prompt text sent to /api/generate, which qwen3
-        # honored - but qwen3.5 handles thinking via Ollama's own
-        # renderer/parser instead of that template convention, and
-        # /api/generate ignores an explicit think:false for it entirely
-        # (confirmed Ollama bug - ollama/ollama#14793): the model just
-        # thinks until num_predict runs out and "response" comes back
-        # empty, no matter how large num_predict is. /api/chat with
-        # think:false as a top-level field is the combination Ollama
-        # confirms actually disables it, so that's what's used below.
+        # Thinking must be OFF here: JUDGE_MODEL is thinking-capable, and
+        # without this it can burn the whole num_predict budget on an
+        # internal reasoning trace before emitting ItemNumber,VERDICT lines
+        # - every batch silently returning 0 parsed verdicts. qwen3.5
+        # handles thinking via Ollama's own renderer/parser, not the old
+        # "/no_think"-in-prompt convention, and /api/generate ignores
+        # think:false for it entirely (confirmed Ollama bug
+        # ollama/ollama#14793) - only /api/chat + top-level think:false
+        # actually disables it, so that's what's used below.
         verify_prompt = verify_prompt_header
         for i, h in enumerate(batch, start=1):
             blocks = transcript_blocks_by_part.get(h.get("SourcePart"), [])
@@ -1620,7 +1551,6 @@ def run_judge_batch(pool, keep_n, judge_instructions):
 
     return ranked
 
-
 def run_judge_tournament(judge_pool, judge_instructions, top_n, judge_batch_size=None):
     """Ranks judge_pool down to top_n. For pools bigger than one batch,
     judges in batches first (keeping the best half of each), then does a
@@ -1687,7 +1617,6 @@ def final_score_cap_for_rank(rank: int) -> int:
         return 6
     return 5
 
-
 def calibrate_final_scores_by_rank(highlights):
     """Prevent score inflation: final scores are rank-calibrated for output."""
     for rank, highlight in enumerate(highlights, start=1):
@@ -1696,7 +1625,6 @@ def calibrate_final_scores_by_rank(highlights):
         highlight["RawScore"] = raw_score
         highlight["ScoreCap"] = cap
         highlight["Score"] = min(raw_score, cap)
-
 
 def score_to_resolve_color(score):
     """Maps a highlight's score to a DaVinci Resolve marker color name.
@@ -1709,7 +1637,6 @@ def score_to_resolve_color(score):
     else:
         return "Blue"
 
-
 def sanitize_marker_text(text):
     """Resolve's marker EDL parser uses '|' as a field separator and
     ignores note text starting with a digit, so strip pipes and guard
@@ -1718,7 +1645,6 @@ def sanitize_marker_text(text):
     if cleaned and cleaned[0].isdigit():
         cleaned = "_" + cleaned
     return cleaned
-
 
 def write_highlights_csv(stream_folder, final_highlights, top_n):
     csv_path = os.path.join(stream_folder, f"top{top_n}_highlights.csv")
@@ -1747,7 +1673,6 @@ def write_highlights_csv(stream_folder, final_highlights, top_n):
                 h.get("Category", "")
             ])
     return csv_path
-
 
 def write_highlights_edl(stream_folder, final_highlights, top_n):
     edl_path = os.path.join(stream_folder, f"top{top_n}_markers.edl")
@@ -1782,7 +1707,6 @@ def write_highlights_edl(stream_folder, final_highlights, top_n):
 
     return edl_path
 
-
 def write_run_info(stream_folder, final_highlights):
     """Snapshots the models/settings used and the accumulated pipeline
     stats (Ollama calls, per-stage timing) into run_info.json."""
@@ -1816,7 +1740,6 @@ def write_run_info(stream_folder, final_highlights):
     except Exception as exc:
         print(f"[!] Could not write run metadata: {exc}")
     return run_info
-
 
 def record_pipeline_run_history(stream_folder):
     """Appends one row to pipeline_run_history.csv, kept next to this
@@ -2156,27 +2079,23 @@ Where VERDICT is either PASS or FAIL. Do not add any other text.
 # ============================================================================
 # Judge prompt
 # ============================================================================
-# Deliberately no attempt to disable thinking here, unlike every other
-# JUDGE_MODEL prompt in this file (verify, audio-scan titling). Judge is
-# the one task that's actually comparative - weighing multiple candidates
-# against a 5-factor priority order and deciding relative ranking - rather
-# than a single lookup/classification per item, so letting qwen3.5 think
-# through that tradeoff before committing to an answer is more likely to
-# help than waste time. num_predict is sized (3000) to give a reasoning
-# trace real room before the actual CSV rows.
+# Deliberately doesn't disable thinking, unlike every other JUDGE_MODEL
+# prompt here (verify, audio-scan titling): judge is comparative - weighing
+# candidates against a 5-factor priority order - not a single lookup/
+# classification, so letting qwen3.5 think through the tradeoff helps more
+# than it costs. num_predict=3000 gives a reasoning trace room before the
+# actual CSV rows.
 #
-# This is also why run_judge_batch() below is fine staying on
-# OLLAMA_URL (/api/generate) rather than moving to the OLLAMA_CHAT_URL fix
-# used for verify/titling: the qwen3.5 /api/generate bug
-# (ollama/ollama#14793) is specifically that think:false is ignored -
-# a call that never tries to turn thinking off in the first place doesn't
-# hit it. If judging ever needs thinking turned off too, it should get the
-# same OLLAMA_CHAT_URL + think:false treatment as verify/titling.
+# Also why run_judge_batch() below stays on OLLAMA_URL (/api/generate)
+# instead of the OLLAMA_CHAT_URL fix used for verify/titling: the qwen3.5
+# bug (ollama/ollama#14793) is specifically that think:false is ignored - a
+# call that never tries to disable thinking doesn't hit it. If judging ever
+# needs thinking off, give it the same OLLAMA_CHAT_URL + think:false
+# treatment as verify/titling.
 #
-# If judging ever comes up short on parsed items, run_judge_tournament()
-# backfills by score rather than losing candidates - unlike verify, which
-# has no equivalent fallback and is exactly why it can't afford the same
-# tradeoff.
+# If judging comes up short on parsed items, run_judge_tournament() backfills
+# by score rather than losing candidates - verify has no equivalent
+# fallback, which is why it can't afford the same tradeoff.
 JUDGE_INSTRUCTIONS = """You are ranking these candidates as if selecting clips for a TikTok/Reels/
 Shorts account with no prior audience and no subscribers.
 
@@ -2213,13 +2132,11 @@ Rank,Score,Timestamp,Title
 
 """
 
-
 # ============================================================================
-# Per-stage runners - each is: load its checkpoint input (if any), do the
-# work inside stage_log() so it's captured to a persistent per-stage log
-# file, save its checkpoint output, record timing/stats, mark itself as the
-# last-completed stage. Kept thin on purpose; the actual logic lives in the
-# functions above.
+# Per-stage runners - each: loads its checkpoint input (if any), does the
+# work inside stage_log() (captured to a persistent per-stage log file),
+# saves its checkpoint output, records timing/stats, marks itself as the
+# last-completed stage. Kept thin; actual logic lives in the functions above.
 # ============================================================================
 
 def run_stage_discovery(stream_folder):
@@ -2256,7 +2173,6 @@ def run_stage_discovery(stream_folder):
         record_stage_stats(stream_folder, stage, time.time() - stage_start)
         print(f"Saved {len(highlights)} candidate(s)")
 
-
 def run_stage_audioscan(stream_folder):
     stage = "audioscan"
     with stage_log(stream_folder, stage):
@@ -2268,13 +2184,12 @@ def run_stage_audioscan(stream_folder):
         audio_candidates = find_audio_scan_candidates(stream_folder, highlights, transcript_blocks_by_part)
 
         # AUDIO_SCAN_STATS["candidates_kept"] is set by find_audio_scan_candidates()
-        # on every path that actually reaches the titling step (it's 0 if audio
-        # scan is disabled, no mic wav was found, librosa is missing, or no DSP
-        # peaks were found - all legitimate, non-error outcomes). candidates_kept
-        # > 0 with zero titled results back is the one combination that isn't
-        # legitimate: real candidates were found and sent to the model, and it
-        # produced nothing usable for every single one - see the field-count bug
-        # this originally caught in title_audio_candidates().
+        # whenever titling is reached (0 if audio scan is disabled, no mic
+        # wav, no librosa, or no DSP peaks - all legitimate). candidates_kept
+        # > 0 with zero titled results is the one non-legitimate case: real
+        # candidates went to the model and it produced nothing usable for
+        # any of them - the field-count bug this originally caught in
+        # title_audio_candidates().
         candidates_kept = AUDIO_SCAN_STATS.get("candidates_kept", 0)
         if candidates_kept > 0 and not audio_candidates:
             print(
@@ -2309,7 +2224,6 @@ def run_stage_audioscan(stream_folder):
         record_stage_stats(stream_folder, stage, time.time() - stage_start)
         print(f"Saved {len(highlights)} candidate(s)")
 
-
 def run_stage_emotion(stream_folder):
     stage = "emotion"
     with stage_log(stream_folder, stage):
@@ -2323,7 +2237,6 @@ def run_stage_emotion(stream_folder):
         save_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES[stage], highlights)
         record_stage_stats(stream_folder, stage, time.time() - stage_start)
         print(f"Saved {len(highlights)} candidate(s)")
-
 
 def run_stage_verify(stream_folder):
     stage = "verify"
@@ -2362,7 +2275,6 @@ def run_stage_verify(stream_folder):
         record_stage_stats(stream_folder, stage, time.time() - stage_start)
         print(f"Saved {len(verified)} candidate(s)")
 
-
 def run_stage_judge(stream_folder):
     stage = "judge"
     with stage_log(stream_folder, stage):
@@ -2387,7 +2299,6 @@ def run_stage_judge(stream_folder):
         save_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES[stage], final_highlights)
         record_stage_stats(stream_folder, stage, time.time() - stage_start)
         print(f"Saved {len(final_highlights)} final candidate(s)")
-
 
 def run_stage_export(stream_folder):
     stage = "export"
@@ -2424,7 +2335,6 @@ def run_stage_export(stream_folder):
         for s, seconds in stats.get("stage_seconds", {}).items():
             print(f"  {s}: {seconds / 60:.1f} min")
 
-
 STAGE_FUNCS = {
     "discovery": run_stage_discovery,
     "audioscan": run_stage_audioscan,
@@ -2434,7 +2344,6 @@ STAGE_FUNCS = {
     "export": run_stage_export,
 }
 
-
 def stage_is_done(stream_folder, stage):
     """export has no checkpoint of its own (see STAGE_CHECKPOINT_NAMES) and
     always re-runs, so it's never considered 'done' for skip purposes."""
@@ -2442,7 +2351,6 @@ def stage_is_done(stream_folder, stage):
     if name is None:
         return False
     return checkpoint_exists(stream_folder, name)
-
 
 def run_all_remaining_stages(stream_folder):
     """Default mode (no --stage flag): walk every stage in order, skipping
@@ -2469,7 +2377,6 @@ def run_all_remaining_stages(stream_folder):
 
     record_pipeline_run_history(stream_folder)
 
-
 def run_single_stage_forced(stream_folder, stage):
     """Debug mode (--stage flag, used by the 5a-5f debug bats): force this
     ONE stage to run even if its checkpoint already exists, invalidate
@@ -2480,7 +2387,6 @@ def run_single_stage_forced(stream_folder, stage):
     invalidate_downstream(stream_folder, stage)
     print(f"=== Force-running {STAGE_LABELS[stage]} (debug mode - downstream checkpoints cleared) ===")
     STAGE_FUNCS[stage](stream_folder)
-
 
 # ============================================================================
 # Entry point
@@ -2516,7 +2422,6 @@ def main():
         run_single_stage_forced(stream_folder, args.stage)
     else:
         run_all_remaining_stages(stream_folder)
-
 
 if __name__ == "__main__":
     main()
