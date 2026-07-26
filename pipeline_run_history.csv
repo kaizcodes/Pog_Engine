@@ -1,2 +1,0 @@
-run_timestamp,stream_folder,discovery_seconds,audioscan_seconds,emotion_seconds,verify_seconds,judge_seconds,export_seconds,total_seconds,ollama_calls,ollama_seconds,ollama_retries,final_highlight_count
-2026-07-25T21:03:37,F:\OBS VOD\2026-07-24 12-28-21,1095.6,48.1,45.2,18.8,214.5,0.0,1422.2,153,1806.1,0,50
