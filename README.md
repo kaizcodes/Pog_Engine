@@ -16,20 +16,27 @@ Designed to eliminate hours of manually scrubbing through VODs.
 
 ## OBS setup Requirement
 
-This project **only supports locally recorded OBS VODs**.
+This project **only supports locally recorded OBS VODs FOR NOW**.
 
-To work correctly, your OBS recording **must match the required configuration exactly**, including:
-
-- Audio track layout
-- Separate microphone track
-  
-See the examples below before using the pipeline.
+To work correctly, your OBS recording **must match the required configuration exactly**:
 
 > 📷 **Required OBS Recording Settings**
 >
 > <img width="1920" height="1080" alt="pog" src="https://github.com/user-attachments/assets/cd133146-dd73-4d05-af08-5431ae676620" />
 
 ## Installation:
+
+Install [Ollama](https://ollama.com/download/windows)
+
+Open Command Prompt and type
+
+```ollama run qwen3:8b ```
+
+To download qwen3:8b
+
+```ollama run qwen3.5:9b-q4_K_M```
+
+To download qwen3.5:9b-q4_K_M
 
 Pick a safe location on your PC and create a folder name "Pog_Engine"
 
