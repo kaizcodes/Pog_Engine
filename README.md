@@ -14,7 +14,7 @@ Designed to eliminate hours of manually scrubbing through VODs.
 - 🎬 DaVinci Resolve EDL/CSV export
 - ♻️ Resume interrupted runs with checkpoints
 
-## Requirements
+## OBS setup Requirement
 
 This project **only supports locally recorded OBS VODs**.
 
@@ -51,6 +51,14 @@ Inside said folder create a folder called ```models```, download and put these f
 Folder should look like this:
 <img width="895" height="203" alt="{99BD0930-C0B9-42DC-ACFE-4DC138D151DD}" src="https://github.com/user-attachments/assets/5e2ec62a-8243-4de1-90a4-0958cd3b57a3" />
 
+Return to ```Pog_Engine``` folder
+Download and unzip
+
+[Whisper cubLAS 12.4.0](https://github.com/ggml-org/whisper.cpp/releases)
+
+Now there should be 2 folders in your ```Pog_Engine``` folder
+
+<img width="262" height="198" alt="{4B5A1942-E102-4BBC-BD9E-0B2F492DA4DE}" src="https://github.com/user-attachments/assets/e48f8adb-061c-4480-8f91-9d6dae5538f6" />
 
 
 ## Setup:
