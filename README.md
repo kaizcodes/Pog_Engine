@@ -36,7 +36,7 @@ Things to download: Save these in a single folder somewhere safe on your PC
 >Download: ggml-large-v3.bin
 
 [Whisper Voice Activity Detection (VAD)](https://huggingface.co/ggml-org/whisper-vad/tree/main)
->Download: gml-silero-v6.2.0.bin
+>Download: ggml-silero-v6.2.0.bin
 
 [Speech Emotion Recognition with Whisper](https://huggingface.co/firdhokk/speech-emotion-recognition-with-openai-whisper-large-v3)
 
