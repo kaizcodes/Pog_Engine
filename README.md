@@ -30,7 +30,9 @@ See the examples below before using the pipeline.
 > <img width="1920" height="1080" alt="pog" src="https://github.com/user-attachments/assets/cd133146-dd73-4d05-af08-5431ae676620" />
 
 ## Installation:
-Things to download: Save these in a single folder somewhere safe on your PC
+
+Pick a safe location on your PC and create a folder name "Pog_Engine"
+Create a folder called ```models``` download and put these items in there:
 
 [Whisper Large V3 for whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)
 >Download: ggml-large-v3.bin
@@ -40,13 +42,14 @@ Things to download: Save these in a single folder somewhere safe on your PC
 
 [Speech Emotion Recognition with Whisper](https://huggingface.co/firdhokk/speech-emotion-recognition-with-openai-whisper-large-v3)
 
->You will need to download:
+>Download:
 >- model.safetensor (RENAME TO: ```speech-emotion-recognition-with-openai-whisper-large-v3.safetensors``` )
 >- config.json
 >- preprocessor_config.json
 
-Folder should look like this **SAVE IT IN A SAFEPLACE**:
-<img width="798" height="228" alt="{648815AD-B343-4676-AC2A-91386056531E}" src="https://github.com/user-attachments/assets/69daba88-a443-4784-add3-20a785bb6230" />
+Folder should look like this:
+<img width="895" height="203" alt="{99BD0930-C0B9-42DC-ACFE-4DC138D151DD}" src="https://github.com/user-attachments/assets/5e2ec62a-8243-4de1-90a4-0958cd3b57a3" />
+
 
 
 ## Setup:
