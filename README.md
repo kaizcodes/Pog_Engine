@@ -66,7 +66,7 @@ Using:
 2. Then run **6_RunAllSteps.bat**
 3. Watch it works
 
-Companion tools:
+## Companion tools (RECOMMENDED):
 [1 click script to import](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/1%20Click%20Import%20%2B%20Timeline%20%2B%20SRT%20%2B%20Marker%20into%20Timeline) 
 >import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
 
