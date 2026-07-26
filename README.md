@@ -75,8 +75,8 @@ Now there should be 2 folders in your ```Pog_Engine``` folder
 
 Download ZIP
 
-2. Extract and store the files in a safe location on your system
-3. Run first_run.py
+2. Extract and store the files in ```Pog_Engine``` folder
+3. Run installation.bat
 4. Create shortcut from OrganizeVODAndFixSRT_py.bat (Right click -> Create shortcut)
 5. Put this shortcut in your VOD folder
 
