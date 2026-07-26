@@ -71,18 +71,20 @@ Now there should be 2 folders in your ```Pog_Engine``` folder
 
 
 ## Pog_Engine Installation:
-1.
  
 <img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BdfdfDDEDDC}" src="https://github.com/udfdfser-attachments/assets/23095123-e483-407fgfg5-b655-a7499036f2ea" />
 
 Download ZIP
 
-2. Extract and store the files in ```Pog_Engine``` folder
-3. Run installation.bat
-4. Create shortcut from OrganizeVODAndFixSRT_py.bat (Right click -> Create shortcut)
-5. Put this shortcut in your VOD folder
+1. Extract ZIP and store the files in ```Pog_Engine``` folder
+2. Run installation.bat
+3. Create shortcut from OrganizeVODAndFixSRT_py.bat (Right click -> Create shortcut)
+4. Put this shortcut in your VOD folder
 
-Using:
+## How to use:
+
+If you have followed step by step, at this point everything SHOULD work.
+
 1. Drop your VOD.mp4 onto the shortcut
 2. Then run **6_RunAllSteps.bat**
 3. Watch it works
