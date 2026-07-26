@@ -24,7 +24,7 @@ To work correctly, your OBS recording **must match the required configuration ex
 >
 > <img width="1920" height="1080" alt="pog" src="https://github.com/user-attachments/assets/cd133146-dd73-4d05-af08-5431ae676620" />
 
-## Installation:
+## Installating Ollama:
 
 Install [Ollama](https://ollama.com/download/windows)
 
@@ -37,6 +37,8 @@ To download qwen3:8b
 ```ollama run qwen3.5:9b-q4_K_M```
 
 To download qwen3.5:9b-q4_K_M
+
+## Setting up Pog_Engine
 
 Pick a safe location on your PC and create a folder name "Pog_Engine"
 
@@ -68,10 +70,10 @@ Now there should be 2 folders in your ```Pog_Engine``` folder
 <img width="262" height="198" alt="{4B5A1942-E102-4BBC-BD9E-0B2F492DA4DE}" src="https://github.com/user-attachments/assets/e48f8adb-061c-4480-8f91-9d6dae5538f6" />
 
 
-## Setup:
+## Pog_Engine Installation:
 1.
  
-<img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BDDEDDC}" src="https://github.com/user-attachments/assets/23095123-e483-4075-b655-a7499036f2ea" />
+<img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BdfdfDDEDDC}" src="https://github.com/udfdfser-attachments/assets/23095123-e483-407fgfg5-b655-a7499036f2ea" />
 
 Download ZIP
 
