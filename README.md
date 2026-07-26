@@ -49,7 +49,7 @@ Folder should look like this **SAVE IT IN A SAFEPLACE**:
 <img width="798" height="228" alt="{648815AD-B343-4676-AC2A-91386056531E}" src="https://github.com/user-attachments/assets/69daba88-a443-4784-add3-20a785bb6230" />
 
 
-Setup:
+## Setup:
 1.
  
 <img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BDDEDDC}" src="https://github.com/user-attachments/assets/23095123-e483-4075-b655-a7499036f2ea" />
@@ -66,10 +66,15 @@ Using:
 2. Then run **6_RunAllSteps.bat**
 3. Watch it works
 
-Finished:
-1. Use my [1 click script to import](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/1%20Click%20Import%20%2B%20Timeline%20%2B%20SRT%20%2B%20Marker%20into%20Timeline) to import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
-2. Use [Highlight Marker Tracker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Marker%20Tracker%20Ordered%20by%20Score) to view them in score order
-3. Use [Subtitle to Marker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Subtitle%20to%20Marker) to find when you say a keyword that could lead to hype viral moments
+Companion tools:
+[1 click script to import](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/1%20Click%20Import%20%2B%20Timeline%20%2B%20SRT%20%2B%20Marker%20into%20Timeline) 
+>import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
+
+[Highlight Marker Tracker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Marker%20Tracker%20Ordered%20by%20Score)
+>view your markers in score order
+
+[Subtitle to Marker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Subtitle%20to%20Marker) 
+>find turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
 
 ## Tech Stack
 
