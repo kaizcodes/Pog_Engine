@@ -50,8 +50,13 @@ Folder should look like this **SAVE IT IN A SAFEPLACE**:
 
 
 Setup:
-1. Just download all files 
-2. Store the project in a safe location on your system
+1.
+ 
+<img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BDDEDDC}" src="https://github.com/user-attachments/assets/23095123-e483-4075-b655-a7499036f2ea" />
+
+Download ZIP
+
+2. Extract and store the files in a safe location on your system
 3. Run first_run.py
 4. Create shortcut from OrganizeVODAndFixSRT_py.bat (Right click -> Create shortcut)
 5. Put this shortcut in your VOD folder
