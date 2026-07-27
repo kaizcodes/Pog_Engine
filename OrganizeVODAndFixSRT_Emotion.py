@@ -33,13 +33,13 @@ TRANSCRIPT_MERGE_TARGET_WORDS = 30
 TRANSCRIPT_MERGE_MAX_GAP_MS = 2500
 SCRIPT_DIR = Path(__file__).resolve().parent
 ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
-GALLERY_DIR = Path(r"D:\MOOSHIEUI AI\gallery\best of")
+GALLERY_DIR = Path(r"G:\Pog_Engine\gallery\best of")
 GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 # Edit these if your whisper.cpp install moves.
-WHISPER_CLI = r"G:\whisper-cublas-12.4.0-bin-x64\Release\whisper-cli.exe"
-WHISPER_MODEL = r"G:\whisper-cublas-12.4.0-bin-x64\models\ggml-large-v3.bin"
-WHISPER_VAD = r"G:\whisper-cublas-12.4.0-bin-x64\models\ggml-silero-v6.2.0.bin"
+WHISPER_CLI = r"G:\Pog_Engine\whisper-cublas-12.4.0-bin-x64\Release\whisper-cli.exe"
+WHISPER_MODEL = r"G:\Pog_Engine\models\ggml-large-v3.bin"
+WHISPER_VAD = r"G:\Pog_Engine\models\ggml-silero-v6.2.0.bin"
 
 # Noise gate before loudnorm: pushes down quiet background noise (keyboard,
 # game bleed, room tone) instead of letting it get amplified into something
