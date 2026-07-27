@@ -6,16 +6,6 @@ Designed to eliminate hours of manually scrubbing through VODs.
 
 Finish stream, Click Run, and come back to your PC with a list of potential viral moments!
 
-## Features
-
-- 🎤 Whisper.cpp transcription
-- 🧠 Multi-stage AI highlight detection
-- 😊 Speech emotion scoring
-- 🔊 Audio-based highlight discovery
-- ✅ AI verification & ranking
-- 🎬 DaVinci Resolve EDL/CSV export
-- ♻️ Resume interrupted runs with checkpoints
-
 ## PC Requirement
 
 - NVIDIA GPU
