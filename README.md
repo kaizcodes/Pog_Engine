@@ -10,7 +10,7 @@ Finish stream, Click Run, and come back to your PC with a list of potential vira
 - With more than 8GB VRAM (10GB Recommended) 
 - Must be able to run CUDA 12.4 (GTX 1080 TI-> RTX 5090)
 - Will not work with AMD GPU (maybe someone can write a conversion script, I don't own an AMD GPU)
-- 30m-1hr of your time (on 3080)
+- 30m-1hr of your time (on 3080 for 4-5hrs stream)
 
 I wrote this project to work with my RTX 3080 10GB VRAM
 
@@ -81,10 +81,7 @@ Code -> Download ZIP
 2. Run Install_PogEngine.bat
 3. Copy the path to ```Pog_Engine``` folder
 4. Everything has to say ```OK```
-5. If something is missing you need to follow each step again carefully
-6. Create shortcut from OrganizeVODAndFixSRT_Emotion.bat (Right click -> Create shortcut)
-7. Put this shortcut in your VOD folder
-
+5. 
 Your final result should look like this
 
 <img width="833" height="683" alt="{D3F7F48C-B080-4423-9907-96503B98168F}" src="https://github.com/user-attachments/assets/2a339fdc-9839-4494-9cad-100632833451" />
@@ -95,10 +92,12 @@ Your final result should look like this
 
 If you have followed step by step correctly, at this point everything SHOULD work.
 
-1. Drop your VOD.mp4 onto the shortcut
-2. Go to the created folder
-3. Then run **6_RunAllSteps.bat**
-4. Watch it works
+1. Create shortcut from OrganizeVODAndFixSRT_Emotion.bat (Right click -> Create shortcut)
+2. Place this shortcut in your VOD folder
+3. Drop your VOD.mp4 onto the shortcut
+4. Go to the created folder
+5. Open **6_RunAllSteps.bat**
+6. Watch it works
 
 ## Companion tools (RECOMMENDED):
 [1 click script to import](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/1%20Click%20Import%20%2B%20Timeline%20%2B%20SRT%20%2B%20Marker%20into%20Timeline) 
