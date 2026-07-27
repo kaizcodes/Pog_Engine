@@ -22,10 +22,8 @@ IF you have more VRAM you can explore bigger parameter models, I specifically ch
 
 This project **only supports locally recorded OBS VODs FOR NOW**.
 
-To work correctly, your OBS recording **must match the required configuration exactly**:
+Your OBS recording **must match the required configuration exactly**:
 
-> 📷 **Required OBS Recording Settings**
->
 > <img width="1920" height="1404" alt="pog" src="https://github.com/user-attachments/assets/78af85a5-0b44-4fd7-8151-d6033ab1d802" />
 
 
