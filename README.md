@@ -79,9 +79,8 @@ Code -> Download ZIP
 
 1. Extract ZIP and store the files in ```Pog_Engine``` folder
 2. Run Install_PogEngine.bat
-3. Copy the path to ```Pog_Engine``` folder
-4. Everything has to say ```OK```
-5. 
+3. Click browse and select ```Pog_Engine``` folder
+
 Your final result should look like this
 
 <img width="833" height="683" alt="{D3F7F48C-B080-4423-9907-96503B98168F}" src="https://github.com/user-attachments/assets/2a339fdc-9839-4494-9cad-100632833451" />
