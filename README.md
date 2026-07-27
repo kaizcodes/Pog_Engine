@@ -96,13 +96,13 @@ If you have followed step by step correctly, at this point everything SHOULD wor
 
 ## Companion tools (RECOMMENDED):
 [1 click script to import](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/1%20Click%20Import%20%2B%20Timeline%20%2B%20SRT%20%2B%20Marker%20into%20Timeline) 
->import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
+>Import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
 
 [Highlight Marker Tracker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Marker%20Tracker%20Ordered%20by%20Score)
->view your markers in score order
+>View your markers in score order
 
 [Subtitle to Marker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Subtitle%20to%20Marker) 
->find turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
+>Find turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
 
 
 ## Tech Stack
