@@ -62,9 +62,6 @@ Inside said folder create a folder called ```models```, download and put these f
 >- config.json
 >- preprocessor_config.json
 
-Folder should look like this:
-<img width="895" height="203" alt="{99BD0930-C0B9-42DC-ACFE-4DC138D151DD}" src="https://github.com/user-attachments/assets/5e2ec62a-8243-4de1-90a4-0958cd3b57a3" />
-
 Return to ```Pog_Engine``` folder
 
 Download and unzip
