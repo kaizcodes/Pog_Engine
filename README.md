@@ -78,6 +78,7 @@ Folder should look like this:
 <img width="895" height="203" alt="{99BD0930-C0B9-42DC-ACFE-4DC138D151DD}" src="https://github.com/user-attachments/assets/5e2ec62a-8243-4de1-90a4-0958cd3b57a3" />
 
 Return to ```Pog_Engine``` folder
+
 Download and unzip
 
 [Whisper cubLAS 12.4.0](https://github.com/ggml-org/whisper.cpp/releases)
@@ -88,10 +89,10 @@ Now there should be 2 folders in your ```Pog_Engine``` folder
 
 
 ## Pog_Engine Installation:
- 
-<img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BdfdfDDEDDC}" src="https://github.com/udfdfser-attachments/assets/23095123-e483-407fgfg5-b655-a7499036f2ea" />
 
-Download ZIP
+<img width="916" height="401" alt="{B07D9456-F90D-4832-BBBF-039A72DAFAAB}" src="https://github.com/user-attachments/assets/381e916a-d8f8-4c61-9d0b-93625fa20813" />
+ 
+Code -> Download ZIP
 
 1. Extract ZIP and store the files in ```Pog_Engine``` folder
 2. Run Install_PogEngine.bat
@@ -105,14 +106,16 @@ Your final result should look like this
 
 <img width="833" height="683" alt="{D3F7F48C-B080-4423-9907-96503B98168F}" src="https://github.com/user-attachments/assets/2a339fdc-9839-4494-9cad-100632833451" />
 
+*Side note: You can put whatever you want in gallery, I added this so I could use my fanart as wallpaper while waiting for it to finish.
 
 ## How to use:
 
-If you have followed step by step, at this point everything SHOULD work.
+If you have followed step by step correctly, at this point everything SHOULD work.
 
 1. Drop your VOD.mp4 onto the shortcut
-2. Then run **6_RunAllSteps.bat**
-3. Watch it works
+2. Go to the created folder
+3. Then run **6_RunAllSteps.bat**
+4. Watch it works
 
 ## Companion tools (RECOMMENDED):
 [1 click script to import](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/1%20Click%20Import%20%2B%20Timeline%20%2B%20SRT%20%2B%20Marker%20into%20Timeline) 
