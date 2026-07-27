@@ -4,6 +4,8 @@
 
 Designed to eliminate hours of manually scrubbing through VODs.
 
+Finish stream, Click Run, and come back to your PC with a list of potential viral moments!
+
 ## Features
 
 - 🎤 Whisper.cpp transcription
@@ -14,22 +16,46 @@ Designed to eliminate hours of manually scrubbing through VODs.
 - 🎬 DaVinci Resolve EDL/CSV export
 - ♻️ Resume interrupted runs with checkpoints
 
-## OBS setup Requirement
+## PC Requirement
 
-This project **only supports locally recorded OBS VODs**.
+- NVIDIA GPU
+- With more than 8GB VRAM (10GB Recommended) 
+- Must be able to run CUDA 12.4 (GTX 1080 TI-> RTX 5090)
+- Will not work with AMD GPU (maybe someone can write a conversion script, I don't own an AMD GPU)
+- 30m-1hr of your time (on 3080)
 
-To work correctly, your OBS recording **must match the required configuration exactly**, including:
+I wrote this project to work with my RTX 3080 10GB VRAM
 
-- Audio track layout
-- Separate microphone track
-  
-See the examples below before using the pipeline.
+You'll need to be able to fit qwen3.5:9b with quantization(q4_K_M in this case)
+
+IF you have more VRAM you can explore bigger parameter models, I specifically chose this model because it's the best model I can fit on my PC that gives me good result. and I've done a lot of research and result comparing, I found that qwen usually return the better results. Feel free to recommend if you find better result on other models.
+
+## OBS Setup Requirement
+
+This project **only supports locally recorded OBS VODs FOR NOW**.
+
+To work correctly, your OBS recording **must match the required configuration exactly**:
 
 > 📷 **Required OBS Recording Settings**
 >
-> <img width="1920" height="1080" alt="pog" src="https://github.com/user-attachments/assets/cd133146-dd73-4d05-af08-5431ae676620" />
+> <img width="1920" height="1404" alt="pog" src="https://github.com/user-attachments/assets/78af85a5-0b44-4fd7-8151-d6033ab1d802" />
 
-## Installation:
+
+## 1. Installating Ollama:
+
+Install [Ollama](https://ollama.com/download/windows)
+
+Open Command Prompt and type
+
+```ollama run qwen3:8b ```
+
+To download qwen3:8b
+
+```ollama run qwen3.5:9b-q4_K_M```
+
+To download qwen3.5:9b-q4_K_M
+
+## 2. Setting up Pog_Engine
 
 Pick a safe location on your PC and create a folder name "Pog_Engine"
 
@@ -61,19 +87,29 @@ Now there should be 2 folders in your ```Pog_Engine``` folder
 <img width="262" height="198" alt="{4B5A1942-E102-4BBC-BD9E-0B2F492DA4DE}" src="https://github.com/user-attachments/assets/e48f8adb-061c-4480-8f91-9d6dae5538f6" />
 
 
-## Setup:
-1.
+## Pog_Engine Installation:
  
-<img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BDDEDDC}" src="https://github.com/user-attachments/assets/23095123-e483-4075-b655-a7499036f2ea" />
+<img width="928" height="402" alt="{158D0DD9-B9C9-45C4-88EB-D38A4BdfdfDDEDDC}" src="https://github.com/udfdfser-attachments/assets/23095123-e483-407fgfg5-b655-a7499036f2ea" />
 
 Download ZIP
 
-2. Extract and store the files in a safe location on your system
-3. Run first_run.py
-4. Create shortcut from OrganizeVODAndFixSRT_py.bat (Right click -> Create shortcut)
-5. Put this shortcut in your VOD folder
+1. Extract ZIP and store the files in ```Pog_Engine``` folder
+2. Run Install_PogEngine.bat
+3. Copy the path to ```Pog_Engine``` folder
+4. Everything has to say ```OK```
+5. If something is missing you need to follow each step again carefully
+6. Create shortcut from OrganizeVODAndFixSRT_Emotion.bat (Right click -> Create shortcut)
+7. Put this shortcut in your VOD folder
 
-Using:
+Your final result should look like this
+
+<img width="833" height="683" alt="{D3F7F48C-B080-4423-9907-96503B98168F}" src="https://github.com/user-attachments/assets/2a339fdc-9839-4494-9cad-100632833451" />
+
+
+## How to use:
+
+If you have followed step by step, at this point everything SHOULD work.
+
 1. Drop your VOD.mp4 onto the shortcut
 2. Then run **6_RunAllSteps.bat**
 3. Watch it works
@@ -87,6 +123,7 @@ Using:
 
 [Subtitle to Marker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Subtitle%20to%20Marker) 
 >find turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
+
 
 ## Tech Stack
 
