@@ -2,8 +2,6 @@
 
 **Pog Engine** is an AI-powered local VOD processing pipeline for streamers. It automatically transcribes your recordings, detects potential viral moments using LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights and DaVinci Resolve timeline markers.
 
-Designed to eliminate hours of manually scrubbing through VODs.
-
 Finish stream, Click Run, and come back to your PC with a list of potential viral moments!
 
 ## PC Requirement
