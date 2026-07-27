@@ -4,6 +4,8 @@
 
 Designed to eliminate hours of manually scrubbing through VODs.
 
+Finish stream, Click Run, and come back to your PC with a list of potential viral moments!
+
 ## Features
 
 - 🎤 Whisper.cpp transcription
@@ -13,6 +15,20 @@ Designed to eliminate hours of manually scrubbing through VODs.
 - ✅ AI verification & ranking
 - 🎬 DaVinci Resolve EDL/CSV export
 - ♻️ Resume interrupted runs with checkpoints
+
+## PC Requirement
+
+- NVIDIA GPU
+- >8GB VRAM
+- Must be able to run CUDA 12.4 (GTX 1080 TI-> RTX 5090)
+- Will not work with AMD GPU (maybe someone can write a conversion script, I don't own an AMD GPU)
+- 30-1hr of your time (on 3080)
+
+I wrote this project to work with my RTX 3080 10GB VRAM
+
+You'll need to be able to fit qwen3.5:9b with quantization(q4_K_M in this case)
+
+IF you have more VRAM you can explore bigger parameter models, I specifically chose this model because it's the best model I can fit on my PC that gives me good result. and I've done a lot of research and result comparing, I found that qwen usually return the better results. Feel free to recommend if you find better result on other models.
 
 ## OBS setup Requirement
 
@@ -98,6 +114,7 @@ If you have followed step by step, at this point everything SHOULD work.
 
 [Subtitle to Marker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Subtitle%20to%20Marker) 
 >find turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
+
 
 ## Tech Stack
 
