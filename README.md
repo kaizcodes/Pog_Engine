@@ -1,22 +1,18 @@
 # Pog Engine
 
-**Pog Engine** is an AI-powered local VOD processing pipeline for streamers. It automatically transcribes your recordings, detects potential viral moments using LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights and DaVinci Resolve timeline markers.
+**Pog Engine** is an AI-powered pipeline for processing **locally recorded OBS VODs**. It transcribes your recordings, detects potential viral moments using LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights and DaVinci Resolve timeline markers. Designed to save hours of manually scrubbing through VODs. 
 
-Finish stream, Click Run, and come back to your PC with a list of potential viral moments!
+Finish stream, Run, and come back to your PC with a list of potential viral moments!
 
 ## PC Requirement
 
-- NVIDIA GPU
-- With more than 8GB VRAM (10GB Recommended) 
-- Must be able to run CUDA 12.4 (GTX 1080 TI-> RTX 5090)
-- Will not work with AMD GPU (maybe someone can write a conversion script, I don't own an AMD GPU)
-- 30m-1hr of your time (on 3080 for 4-5hrs stream)
+- NVIDIA GPU (8GB+ VRAM, 10GB recommended)
+- CUDA 12.4 compatible
+- Ollama capable of running:
+  - `qwen3:8b`
+  - `qwen3.5:9b-q4_K_M`
 
-I wrote this project to work with my RTX 3080 10GB VRAM
-
-You'll need to be able to fit qwen3.5:9b with quantization(q4_K_M in this case)
-
-IF you have more VRAM you can explore bigger parameter models, I specifically chose this model because it's the best model I can fit on my PC that gives me good result. and I've done a lot of research and result comparing, I found that qwen usually return the better results. Feel free to recommend if you find better result on other models.
+Built around an RTX 3080 (10GB VRAM) using `qwen3.5:9b-q4_K_M`. Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
 
 ## OBS Setup Requirement
 
