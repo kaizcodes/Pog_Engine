@@ -12,7 +12,7 @@ Finish stream, Run, and come back to your PC with a list of potential viral mome
   - `qwen3:8b`
   - `qwen3.5:9b-q4_K_M`
 
-Built around an RTX 3080 (10GB VRAM) using `qwen3.5:9b-q4_K_M`. Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
+Built around an RTX 3080 (10GB VRAM). Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
 
 ## OBS Setup Requirement
 
