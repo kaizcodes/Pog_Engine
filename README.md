@@ -39,34 +39,6 @@ To download qwen3.5:9b-q4_K_M
 
 ## 2. Setting up Pog_Engine
 
-Pick a safe location on your PC and create a folder name "Pog_Engine"
-
-Inside said folder create a folder called ```models```, download and put these files in ```models```:
-
-[Whisper Large V3 for whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)
->Download: ggml-large-v3.bin
-
-[Whisper Voice Activity Detection (VAD)](https://huggingface.co/ggml-org/whisper-vad/tree/main)
->Download: ggml-silero-v6.2.0.bin
-
-[Speech Emotion Recognition with Whisper](https://huggingface.co/firdhokk/speech-emotion-recognition-with-openai-whisper-large-v3)
-
->Download:
->- model.safetensor (RENAME TO: ```speech-emotion-recognition-with-openai-whisper-large-v3.safetensors``` )
->- config.json
->- preprocessor_config.json
-
-Return to ```Pog_Engine``` folder
-
-Download and unzip
-
-[Whisper cubLAS 12.4.0](https://github.com/ggml-org/whisper.cpp/releases)
-
-Now there should be 2 folders in your ```Pog_Engine``` folder
-
-<img width="262" height="198" alt="{4B5A1942-E102-4BBC-BD9E-0B2F492DA4DE}" src="https://github.com/user-attachments/assets/e48f8adb-061c-4480-8f91-9d6dae5538f6" />
-
-
 ## Pog_Engine Installation:
 
 <img width="916" height="401" alt="{B07D9456-F90D-4832-BBBF-039A72DAFAAB}" src="https://github.com/user-attachments/assets/381e916a-d8f8-4c61-9d0b-93625fa20813" />
