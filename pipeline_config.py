@@ -1,10 +1,11 @@
 """Shared tunables for the VOD highlight pipeline.
 
-Imported by analyze_highlights_emotion.py. Machine-specific paths (whisper.cpp
-install, emotion-model dir, gallery folder) are NOT here - they stay hardcoded
-in the scripts that use them, since they're tied to this machine, not tunable
-per-run. Everything below can still be overridden per-run via env var without
-editing this file (same os.environ.get pattern the original script used).
+Imported by analyze_highlights_emotion.py, OrganizeVODAndFixSRT_Emotion.py, and
+isolate_vocals.py. Machine-specific paths (whisper.cpp install, emotion-model
+dir, gallery folder) are NOT here - they stay hardcoded in the scripts that
+use them, since they're tied to this machine, not tunable per-run. Everything
+below can still be overridden per-run via env var without editing this file
+(same os.environ.get pattern the original script used).
 """
 
 import os
@@ -75,6 +76,29 @@ JUDGE_BATCH_SIZE = _env_int("HIGHLIGHT_JUDGE_BATCH_SIZE", 20)
 # Max seconds between a candidate's claimed timestamp and the nearest one
 # actually in the transcript; beyond this it's treated as hallucinated.
 TIMESTAMP_TOLERANCE_SECONDS = _env_int("HIGHLIGHT_TIMESTAMP_TOLERANCE_SECONDS", 15)
+
+# --- Vocal isolation (single merged-track VODs, e.g. downloaded Twitch VODs) -
+# A locally recorded OBS VOD has separate game/mic audio tracks, so step 1
+# just extracts track index 1 directly (unchanged, see
+# make_extract_mic_bat_multitrack() in OrganizeVODAndFixSRT_Emotion.py). A
+# downloaded Twitch VOD has everything - game audio, music, alerts, mic -
+# flattened into one track, so there's nothing to "extract"; instead
+# isolate_vocals.py runs a Demucs source-separation pass on the full mix to
+# pull the streamer's voice back out before the rest of the pipeline (which
+# never needs to know which path produced its *_mic.wav) sees it.
+# OrganizeVODAndFixSRT_Emotion.py picks between the two paths automatically
+# via count_audio_streams() (ffprobe) when a video is first dropped/organized.
+VOCAL_ISOLATION_MODEL = os.environ.get("VOCAL_ISOLATION_MODEL", "htdemucs")
+# "auto" picks CUDA if available (same as the emotion model), else CPU - see
+# detect_device() in isolate_vocals.py. CPU works but is much slower on a
+# multi-hour VOD.
+VOCAL_ISOLATION_DEVICE = os.environ.get("VOCAL_ISOLATION_DEVICE", "auto")
+# Unset by default (demucs' own default chunking behavior). Demucs processes
+# audio in windows this many seconds long rather than the whole file at once;
+# if a run dies with a CUDA out-of-memory error on a very long VOD, set this
+# (e.g. 20) via env var to trade a little separation quality at chunk
+# boundaries for bounded memory use.
+VOCAL_ISOLATION_SEGMENT_SECONDS = os.environ.get("VOCAL_ISOLATION_SEGMENT_SECONDS") or None
 
 # --- Speech-emotion sidecar (existing signal, unchanged) ---------------------
 # EMOTION_LOCAL_MODEL_DIR / _FILE stay in analyze_highlights_emotion.py

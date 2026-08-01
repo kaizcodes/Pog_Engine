@@ -33,13 +33,16 @@ TRANSCRIPT_MERGE_TARGET_WORDS = 30
 TRANSCRIPT_MERGE_MAX_GAP_MS = 2500
 SCRIPT_DIR = Path(__file__).resolve().parent
 ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
-GALLERY_DIR = Path(r"G:\Pog_Engine\gallery\best of")
+# Used only when count_audio_streams() below detects a single-track (Twitch-
+# style) VOD - see make_extract_mic_bat_singletrack().
+ISOLATE_VOCALS_SCRIPT = SCRIPT_DIR / "isolate_vocals.py"
+GALLERY_DIR = Path(r"E:\VIAL\Pog_Engine_dev\gallery\best of")
 GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 # Edit these if your whisper.cpp install moves.
-WHISPER_CLI = r"G:\Pog_Engine\whisper-cublas-12.4.0-bin-x64\Release\whisper-cli.exe"
-WHISPER_MODEL = r"G:\Pog_Engine\models\ggml-large-v3.bin"
-WHISPER_VAD = r"G:\Pog_Engine\models\ggml-silero-v6.2.0.bin"
+WHISPER_CLI = r"E:\VIAL\Pog_Engine_dev\models\Release\whisper-cli.exe"
+WHISPER_MODEL = r"E:\VIAL\Pog_Engine_dev\models\ggml-large-v3.bin"
+WHISPER_VAD = r"E:\VIAL\Pog_Engine_dev\models\ggml-silero-v6.2.0.bin"
 
 # Noise gate before loudnorm: pushes down quiet background noise (keyboard,
 # game bleed, room tone) instead of letting it get amplified into something
@@ -452,9 +455,40 @@ def split_srt_into_chunks(input_path: Path, chunk_minutes: int = DEFAULT_CHUNK_M
 def batch_quote(path: Path | str) -> str:
     return str(path).replace('"', '""')
 
-def make_extract_mic_bat(target_folder: Path, base_name: str) -> str:
+def count_audio_streams(video_path: Path) -> int | None:
+    """How many audio streams video_path has, via ffprobe. Returns None if
+    ffprobe isn't available or the probe fails, so callers can fall back to
+    the safer assumption (a locally recorded VOD with separate game/mic
+    tracks) instead of silently guessing this is a single-track Twitch-style
+    VOD - see organize_video()."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "json",
+                str(video_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return len(json.loads(result.stdout).get("streams", []))
+    except (ValueError, AttributeError):
+        return None
+
+def make_extract_mic_bat_multitrack(target_folder: Path, base_name: str, video_suffix: str) -> str:
+    """A locally recorded OBS VOD: desktop/game audio and mic are already on
+    separate tracks, so this just pulls track index 1 (mic) straight out -
+    unchanged from the original single-track-unaware version of this
+    function, just parametrized on the real file extension instead of a
+    hardcoded .mp4."""
     mic_wav_name = f"{base_name}_mic.wav"
-    video_path = target_folder / f"{base_name}.mp4"
+    video_path = target_folder / f"{base_name}{video_suffix}"
     wav_path = target_folder / mic_wav_name
     audio_filters = (
         f"agate=threshold={NOISE_GATE_THRESHOLD_DB}dB:"
@@ -464,12 +498,13 @@ def make_extract_mic_bat(target_folder: Path, base_name: str) -> str:
         #"loudnorm=I=-16:TP=-1.5:LRA=11"
     )
     return f'''@echo off
-echo Extracting and gating/normalizing mic audio from {base_name}.mp4 ...
+echo This VOD has separate game/mic audio tracks - extracting and gating/
+echo normalizing the mic track (track index 1) from {base_name}{video_suffix} ...
 ffmpeg -i "{batch_quote(video_path)}" -map 0:a:1 -ar 16000 -ac 1 -af "{audio_filters}" "{batch_quote(wav_path)}"
 if errorlevel 1 (
     echo.
     echo ERROR: ffmpeg failed. Make sure ffmpeg is installed and on your PATH,
-    echo and that the mp4 is in this folder.
+    echo and that the video is in this folder.
     if not "%RUN_ALL%"=="1" pause
     exit /b 1
 )
@@ -479,6 +514,69 @@ echo You can now drag {mic_wav_name} onto 2_TranscribeAudio.bat
 if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
+
+def make_extract_mic_bat_singletrack(target_folder: Path, base_name: str, video_suffix: str,
+                                      isolate_script: Path) -> str:
+    """A downloaded Twitch-style VOD: game audio, music, alerts, and mic are
+    all flattened into one track, so there's no track to just pull out.
+    Instead: extract the full mix at a Demucs-friendly rate (44.1kHz
+    stereo - downsampling before separation would hurt separation quality),
+    then hand off to isolate_vocals.py, which runs the actual voice
+    isolation and finishes the result into the same 16kHz mono + noise-gated
+    format make_extract_mic_bat_multitrack() produces directly. Everything
+    downstream only ever looks for *_mic.wav (see find_mic_wav() /
+    find_run_all_file()'s "mic_wav" kind in analyze_highlights_emotion.py /
+    this file), so it never needs to know which path produced it."""
+    mic_wav_name = f"{base_name}_mic.wav"
+    mixed_wav_name = f"{base_name}_mixed_full.wav"
+    video_path = target_folder / f"{base_name}{video_suffix}"
+    mixed_wav_path = target_folder / mixed_wav_name
+    mic_wav_path = target_folder / mic_wav_name
+    return f'''@echo off
+echo This VOD has one merged audio track (Twitch-style) - extracting the full
+echo mix first, then isolating the streamer's voice from game audio, music,
+echo and alerts. This takes longer than a normal extraction and, on the
+echo very first run, downloads a small separation model (~80MB, needs
+echo internet once).
+echo.
+echo Step 1/2: extracting full mix from {base_name}{video_suffix} ...
+ffmpeg -y -i "{batch_quote(video_path)}" -map 0:a:0 -ar 44100 -ac 2 "{batch_quote(mixed_wav_path)}"
+if errorlevel 1 (
+    echo.
+    echo ERROR: ffmpeg failed to extract the mixed audio track. Make sure
+    echo ffmpeg is installed and on your PATH, and that the video is in this
+    echo folder.
+    if not "%RUN_ALL%"=="1" pause
+    exit /b 1
+)
+echo.
+echo Step 2/2: isolating vocals (this can take a while on a long VOD)...
+python "{batch_quote(isolate_script)}" "{batch_quote(mixed_wav_path)}" "{batch_quote(mic_wav_path)}"
+if errorlevel 1 (
+    echo.
+    echo ERROR: vocal isolation failed. See the output above - common causes
+    echo are the demucs package not being installed (re-run
+    echo Install_PogEngine.bat) or running out of GPU memory on a very long
+    echo VOD (try setting the VOCAL_ISOLATION_SEGMENT_SECONDS environment
+    echo variable - see pipeline_config.py).
+    if not "%RUN_ALL%"=="1" pause
+    exit /b 1
+)
+del "{batch_quote(mixed_wav_path)}" >nul 2>nul
+echo.
+echo Done! Isolated voice saved as: {mic_wav_name}
+echo You can now drag {mic_wav_name} onto 2_TranscribeAudio.bat
+if not "%RUN_ALL%"=="1" pause
+exit /b 0
+'''
+
+def make_extract_mic_bat(target_folder: Path, base_name: str, video_suffix: str, is_single_track: bool) -> str:
+    """Dispatches to the multi-track (separate game/mic tracks) or
+    single-track (Twitch-style merged track, needs vocal isolation) variant
+    based on what count_audio_streams() found in organize_video()."""
+    if is_single_track:
+        return make_extract_mic_bat_singletrack(target_folder, base_name, video_suffix, ISOLATE_VOCALS_SCRIPT)
+    return make_extract_mic_bat_multitrack(target_folder, base_name, video_suffix)
 
 def make_transcribe_bat() -> str:
     return f'''@echo off
@@ -1162,9 +1260,44 @@ def organize_video(video_file: Path) -> Path:
     moved_count = move_related_files(video_file, target_folder)
     print(f"Moved {moved_count} file(s) to '{target_folder}'")
 
+    video_suffix = video_file.suffix or ".mp4"
+    moved_video_path = target_folder / video_file.name
+    stream_count = count_audio_streams(moved_video_path)
+
+    if stream_count is None:
+        is_single_track = False
+        detection_note = "ffprobe unavailable or probe failed - assumed multi-track"
+        print("[!] Could not detect audio track count (ffprobe missing, or the probe failed).")
+        print("    Assuming a locally recorded VOD with separate game/mic tracks (2+).")
+        print("    If this is actually a single-track Twitch VOD, install ffprobe (it ships")
+        print("    with ffmpeg) and re-run, or edit 1_ExtractMicAudio.bat by hand.")
+    elif stream_count <= 1:
+        is_single_track = True
+        detection_note = f"{stream_count} audio stream(s) detected"
+        print(f"Detected {stream_count} audio track in {moved_video_path.name} - this looks like a")
+        print("Twitch-style VOD with everything mixed into one track. 1_ExtractMicAudio.bat will")
+        print("isolate the streamer's voice from game audio/music/alerts automatically.")
+    else:
+        is_single_track = False
+        detection_note = f"{stream_count} audio stream(s) detected"
+        print(f"Detected {stream_count} audio tracks in {moved_video_path.name} - treating this as a")
+        print("locally recorded VOD with a separate mic track (track index 1).")
+
+    try:
+        with open(target_folder / "vod_audio_info.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "source_video": moved_video_path.name,
+                "audio_stream_count": stream_count,
+                "single_track_mode": is_single_track,
+                "detection_note": detection_note,
+                "detected_at": datetime.now().isoformat(timespec="seconds"),
+            }, f, indent=2)
+    except OSError as exc:
+        print(f"[!] Could not write vod_audio_info.json: {exc}")
+
     script_path = Path(__file__).resolve()
     bat_files = {
-        "1_ExtractMicAudio.bat": make_extract_mic_bat(target_folder, base_name),
+        "1_ExtractMicAudio.bat": make_extract_mic_bat(target_folder, base_name, video_suffix, is_single_track),
         "2_TranscribeAudio.bat": make_transcribe_bat(),
         "3_FixSRT.bat": make_fix_srt_bat(script_path),
         "4_SplitSRT.bat": make_split_srt_bat(script_path),
@@ -1185,7 +1318,12 @@ def organize_video(video_file: Path) -> Path:
         write_text_crlf(target_folder / name, content, encoding="ascii")
 
     print(f"Created helper scripts in '{target_folder}':")
-    print("   1_ExtractMicAudio.bat   <- double-click to extract mic track from mp4")
+    if is_single_track:
+        print("   1_ExtractMicAudio.bat   <- double-click to isolate the streamer's voice")
+        print("                              (single-track Twitch-style VOD)")
+    else:
+        print("   1_ExtractMicAudio.bat   <- double-click to extract the mic track")
+        print("                              (separate-track local recording)")
     print("   2_TranscribeAudio.bat   <- drag _mic.wav onto this to transcribe")
     print("   3_FixSRT.bat            <- drag whisper .srt onto this to fix repeats/timestamps")
     print("   4_SplitSRT.bat          <- drag *_fixed.srt onto this to create transcript_part files")

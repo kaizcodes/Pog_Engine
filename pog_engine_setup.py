@@ -3,16 +3,22 @@
 Not meant to be run directly - Install_PogEngine.bat calls this after making
 sure some version of Python exists. It:
 
-  1. Checks the Pog_Engine folder for the 5 pipeline scripts, the 5 required
-     files in the models folder, and a whisper-cli.exe (whisper.cpp CUDA build).
+  1. Checks the Pog_Engine folder for the 6 pipeline scripts, the 5 required
+     files in the models folder, a whisper-cli.exe (whisper.cpp CUDA build),
+     and ffmpeg/ffprobe on PATH.
   2. Patches the machine-specific path constants (WHISPER_CLI, WHISPER_MODEL,
      WHISPER_VAD, GALLERY_DIR, EMOTION_LOCAL_MODEL_DIR/FILE) in the two
      pipeline scripts to point at THIS machine's Pog_Engine folder, instead
      of whatever machine they were last edited on.
   3. Installs the Python packages the pipeline actually imports (requests,
-     numpy, torch, transformers, librosa, soundfile, safetensors, Pillow),
-     skipping anything already present - and picks a CUDA build of torch
-     over a CPU-only one whenever an NVIDIA GPU is detected.
+     numpy, torch, demucs, transformers, librosa, soundfile, safetensors,
+     Pillow), skipping anything already present - and picks a CUDA build of
+     torch over a CPU-only one whenever an NVIDIA GPU is detected. demucs
+     (used by isolate_vocals.py to separate a streamer's voice out of a
+     single-track/Twitch-style VOD's merged audio) is installed after torch
+     so it picks up that same build; its own audio I/O goes through
+     ffmpeg/ffprobe directly rather than torchaudio, which is why those are
+     checked separately below.
   4. Checks (does not install) Ollama and the qwen models pipeline_config.py
      expects - installing those is left to you, same as before.
 
@@ -35,20 +41,28 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import queue
 import re
+import requests
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.request
+import wave
+import zipfile
 from pathlib import Path
-
 REQUIRED_SCRIPTS = [
     "analyze_highlights_emotion.py",
     "OrganizeVODAndFixSRT_Emotion.py",
     "OrganizeVODAndFixSRT_Emotion.bat",
     "pipeline_config.py",
+    # Vocal isolation for single-track (Twitch-style) VODs - see
+    # count_audio_streams() / make_extract_mic_bat_singletrack() in
+    # OrganizeVODAndFixSRT_Emotion.py.
+    "isolate_vocals.py",
 ]
 
 REQUIRED_MODEL_FILES = [
@@ -81,7 +95,7 @@ CUDA_WHEEL_TAGS = [
     (11, 8, "cu118"),
 ]
 
-TOTAL_SECTIONS = 6  # scripts, models, whisper, configuration, packages, ollama
+TOTAL_SECTIONS = 7  # scripts, models, whisper, ffmpeg, configuration, packages, ollama
 
 
 def mark(ok: bool) -> str:
@@ -139,14 +153,16 @@ def check_scripts(pog_dir: Path, reporter: Reporter) -> list[str]:
     return missing
 
 
-def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str]]:
+def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str], Path | None]:
     reporter.section("Checking models folder")
     models_dir = pog_dir / "models"
     if not models_dir.is_dir():
         reporter.log("  [MISSING] models folder does not exist yet")
         for name in REQUIRED_MODEL_FILES:
             reporter.status(name, "Missing")
-        return models_dir, list(REQUIRED_MODEL_FILES)
+        # Also check for whisper-cli.exe in models/Release/
+        reporter.status("whisper-cli.exe", "Missing")
+        return models_dir, list(REQUIRED_MODEL_FILES) + ["whisper-cli.exe"], None
 
     missing = []
     for name in REQUIRED_MODEL_FILES:
@@ -155,7 +171,149 @@ def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str]]:
         reporter.status(name, "OK" if ok else "Missing")
         if not ok:
             missing.append(name)
-    return models_dir, missing
+    # Check for whisper-cli.exe in models/Release/
+    whisper_cli_path = models_dir / "Release" / "whisper-cli.exe"
+    whisper_cli_ok = whisper_cli_path.is_file()
+    reporter.log(f"  {mark(whisper_cli_ok)} models\\Release\\whisper-cli.exe")
+    reporter.status("whisper-cli.exe", "OK" if whisper_cli_ok else "Missing")
+    if not whisper_cli_ok:
+        missing.append("whisper-cli.exe")
+        whisper_cli_path = None
+    return models_dir, missing, whisper_cli_path
+
+
+def download_file(url: str, dest_path: Path, reporter: Reporter, description: str) -> bool:
+    """Stream download with progress, skip-if-exists, atomic rename via temp file."""
+    if dest_path.is_file():
+        reporter.log(f"  [OK]     {description} already exists at {dest_path}")
+        reporter.status(description, "Already downloaded")
+        return True
+
+    reporter.log(f"  [INFO]   Downloading {description}...")
+    reporter.status(description, "Downloading...")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+    try:
+        with requests.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            total = int(r.headers.get('content-length', 0))
+            downloaded = 0
+            with open(tmp_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = downloaded * 100 // total
+                            if pct % 10 == 0:
+                                reporter.log(f"    {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+        tmp_path.replace(dest_path)
+        reporter.log(f"  [OK]     {description} downloaded to {dest_path}")
+        reporter.status(description, "Downloaded")
+        return True
+    except Exception as exc:
+        reporter.log(f"  [WARN] {description} download failed: {exc}")
+        reporter.status(description, "Failed")
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        return False
+
+
+def download_whisper_model(models_dir: Path, reporter: Reporter) -> bool:
+    return download_file(
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+        models_dir / "ggml-large-v3.bin",
+        reporter,
+        "whisper.cpp model (ggml-large-v3.bin)"
+    )
+
+
+def download_whisper_vad(models_dir: Path, reporter: Reporter) -> bool:
+    return download_file(
+        "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin",
+        models_dir / "ggml-silero-v6.2.0.bin",
+        reporter,
+        "Whisper VAD (ggml-silero-v6.2.0.bin)"
+    )
+
+
+def download_emotion_model_files(models_dir: Path, reporter: Reporter) -> bool:
+    base = "https://huggingface.co/firdhokk/speech-emotion-recognition-with-openai-whisper-large-v3/resolve/main/"
+    ok = True
+    ok &= download_file(base + "model.safetensors", 
+        models_dir / "speech-emotion-recognition-with-openai-whisper-large-v3.safetensors", 
+        reporter, "Emotion model (safetensors)")
+    ok &= download_file(base + "config.json",
+        models_dir / "config.json",
+        reporter, "Emotion model config.json")
+    ok &= download_file(base + "preprocessor_config.json",
+        models_dir / "preprocessor_config.json",
+        reporter, "Emotion model preprocessor_config.json")
+    return ok
+
+
+def download_whisper_cpp_cublas(models_dir: Path, reporter: Reporter) -> bool:
+    """Download whisper.cpp cublas release ZIP and extract whisper-cli.exe to models/Release/"""
+    dest_exe = models_dir / "Release" / "whisper-cli.exe"
+    if dest_exe.is_file():
+        reporter.log(f"  [OK]     whisper-cli.exe already exists at {dest_exe}")
+        reporter.status("whisper-cli.exe", "Already downloaded")
+        return True
+
+    reporter.log(f"  [INFO]   Downloading whisper.cpp cublas release...")
+    reporter.status("whisper.cpp cublas", "Downloading...")
+    dest_exe.parent.mkdir(parents=True, exist_ok=True)
+    url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip"
+    tmp_zip = models_dir / "whisper-cublas.zip.tmp"
+    try:
+        with requests.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            total = int(r.headers.get('content-length', 0))
+            downloaded = 0
+            with open(tmp_zip, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = downloaded * 100 // total
+                            if pct % 10 == 0:
+                                reporter.log(f"    {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+
+        reporter.log(f"  [INFO]   Extracting whisper.cpp release...")
+        import shutil
+        tmp_extract = models_dir / "whisper-cublas-extract.tmp"
+        with zipfile.ZipFile(tmp_zip, 'r') as z:
+            z.extractall(tmp_extract)
+        # The ZIP contains a top-level Release/ folder; move its contents to models/Release/
+        inner_release = tmp_extract / "Release"
+        if inner_release.is_dir():
+            for item in inner_release.iterdir():
+                shutil.move(str(item), str(dest_exe.parent / item.name))
+            reporter.log(f"  [OK]     Extracted whisper.cpp release to {dest_exe.parent}")
+            reporter.status("whisper.cpp cublas", "Downloaded")
+            tmp_zip.unlink(missing_ok=True)
+            shutil.rmtree(tmp_extract, ignore_errors=True)
+            return True
+        else:
+            reporter.log(f"  [WARN] Release folder not found in ZIP")
+            reporter.status("whisper.cpp cublas", "Failed")
+            return False
+    except Exception as exc:
+        reporter.log(f"  [WARN] whisper.cpp cublas download/extract failed: {exc}")
+        reporter.status("whisper.cpp cublas", "Failed")
+        if tmp_zip.exists():
+            tmp_zip.unlink(missing_ok=True)
+        return False
+
+
+def download_all_models(models_dir: Path, reporter: Reporter) -> None:
+    reporter.section("Downloading model files (skip-if-exists)")
+    download_whisper_model(models_dir, reporter)
+    download_whisper_vad(models_dir, reporter)
+    download_emotion_model_files(models_dir, reporter)
+    download_whisper_cpp_cublas(models_dir, reporter)
 
 
 def find_whisper_cli(pog_dir: Path, reporter: Reporter) -> Path | None:
@@ -169,6 +327,29 @@ def find_whisper_cli(pog_dir: Path, reporter: Reporter) -> Path | None:
     reporter.log("         releases page, unzip it, and place the folder inside Pog_Engine.")
     reporter.status("whisper-cli.exe", "Missing")
     return None
+
+
+def check_ffmpeg(reporter: Reporter) -> bool:
+    """ffmpeg is used throughout (mic extraction, transcode, preview clips)
+    and was never explicitly checked before - now that ffprobe also drives
+    the single-track-vs-multi-track VOD detection (see count_audio_streams()
+    in OrganizeVODAndFixSRT_Emotion.py), a missing install silently falls
+    back to "assume multi-track" instead of failing loudly, so it's worth
+    surfacing here."""
+    reporter.section("Checking for ffmpeg / ffprobe")
+    ffmpeg_ok = shutil.which("ffmpeg") is not None
+    ffprobe_ok = shutil.which("ffprobe") is not None
+    reporter.log(f"  {mark(ffmpeg_ok)} ffmpeg on PATH")
+    reporter.status("ffmpeg", "OK" if ffmpeg_ok else "Missing")
+    reporter.log(f"  {mark(ffprobe_ok)} ffprobe on PATH")
+    reporter.status("ffprobe", "OK" if ffprobe_ok else "Missing")
+    if not (ffmpeg_ok and ffprobe_ok):
+        reporter.log("      -> both ship together: install ffmpeg (https://ffmpeg.org/download.html)")
+        reporter.log("         and add its bin folder to PATH. ffprobe is what auto-detects whether a")
+        reporter.log("         dropped VOD is a single-track Twitch-style file or a locally recorded")
+        reporter.log("         file with separate game/mic tracks - without it, every VOD is assumed")
+        reporter.log("         to have separate tracks (safe, but wrong for a Twitch VOD).")
+    return ffmpeg_ok and ffprobe_ok
 
 
 # ============================================================================
@@ -246,6 +427,10 @@ def patch_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None,
             str(models_dir / "speech-emotion-recognition-with-openai-whisper-large-v3.safetensors"),
             False, reporter,
         )
+
+    isolate_vocals_py = pog_dir / "isolate_vocals.py"
+    if isolate_vocals_py.is_file():
+        patch_raw_string_constant(isolate_vocals_py, "TORCH_CACHE_DIR", str(models_dir / "torch_cache"), False, reporter)
 
 
 # ============================================================================
@@ -348,6 +533,127 @@ def ensure_torch(reporter: Reporter) -> None:
         reporter.status("torch", "Done" if final["cuda"] or driver_version is None else "Done (CPU only)")
 
 
+def ensure_demucs(reporter: Reporter) -> None:
+    """demucs (vocal isolation for single-track/Twitch-style VODs - see
+    isolate_vocals.py). Installed after ensure_torch() so it picks up the
+    CUDA build already installed there rather than pip resolving its own;
+    demucs's separate CLI shells out to ffmpeg/ffprobe directly for audio
+    I/O (see demucs/audio.py's AudioFile), not torchaudio, so there's no
+    separate CUDA-wheel-matching needed the way there is for torch itself -
+    see check_ffmpeg() for the ffmpeg/ffprobe check this depends on.
+    """
+    reporter.log("  demucs (vocal isolation, for single-track/Twitch-style VODs)")
+    reporter.status("demucs", "Checking...")
+
+    if is_importable("demucs"):
+        reporter.log("    [OK]     demucs already installed - skipping.")
+        reporter.status("demucs", "Already installed")
+        return
+
+    reporter.status("demucs", "Installing...")
+    reporter.log("    installing demucs ...")
+    if pip_install(reporter, "demucs"):
+        reporter.log("    [OK]     demucs installed.")
+        reporter.status("demucs", "Done")
+    else:
+        reporter.log("    [WARN] demucs failed to install - check the log above.")
+        reporter.status("demucs", "Failed")
+
+
+def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
+    """Triggers Demucs' one-time ~80MB separation-model download now, during
+    setup, instead of leaving it for whenever the first single-track/
+    Twitch-style VOD gets processed. Runs demucs against a 1-second silent
+    wav purely to make it load (and therefore download/cache) the model -
+    the separation result itself is discarded.
+
+    Downloads into models_dir/torch_cache (via TORCH_HOME) and models_dir/hf_cache
+    (via HF_HOME), matching TORCH_CACHE_DIR in isolate_vocals.py (patched to the
+    same path in patch_paths() above), so the model ends up in the same place
+    isolate_vocals.py will look for it later instead of two different caches
+    existing side by side.
+    """
+    reporter.log("  demucs separation model (~80MB, one-time download)")
+    reporter.status("demucs model", "Checking...")
+
+    if not is_importable("demucs"):
+        reporter.log("    [WARN] demucs isn't installed - skipping model pre-download.")
+        reporter.log("           It will be downloaded automatically the first time a single-track")
+        reporter.log("           VOD is processed instead (needs internet then).")
+        reporter.status("demucs model", "Skipped")
+        return
+
+    torch_cache_dir = models_dir / "torch_cache"
+    hf_cache_dir = models_dir / "hf_cache"
+    # Also check default HF cache location since isolate_vocals.py only sets TORCH_HOME
+    default_hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    # Check all cache locations
+    already_cached = False
+    for cache_dir in [torch_cache_dir, hf_cache_dir, default_hf_cache]:
+        if cache_dir.exists():
+            for root, dirs, files in os.walk(cache_dir):
+                for f in files:
+                    if f.endswith('.th') or f.endswith('.bin') or f.endswith('.safetensors'):
+                        already_cached = True
+                        break
+                if already_cached:
+                    break
+        if already_cached:
+            break
+    if already_cached:
+        reporter.log(f"    [OK]     already cached (found in local or default cache) - skipping.")
+        reporter.status("demucs model", "Already downloaded")
+        return
+
+    reporter.status("demucs model", "Downloading...")
+    torch_cache_dir.mkdir(parents=True, exist_ok=True)
+    hf_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pog_demucs_predownload_"))
+    try:
+        silent_wav = tmp_dir / "silence.wav"
+        with wave.open(str(silent_wav), "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(8000)
+            wf.writeframes(b"\x00\x00" * 8000)  # 1 second of silence, just enough to make demucs load the model
+
+        env = os.environ.copy()
+        env["TORCH_HOME"] = str(torch_cache_dir)
+        env["HF_HOME"] = str(hf_cache_dir)
+        cmd = [
+            sys.executable, "-m", "demucs",
+            "-n", "htdemucs", "--two-stems", "vocals",
+            "--device", "cpu",
+            "-o", str(tmp_dir / "out"),
+            str(silent_wav),
+        ]
+        reporter.log(f"    $ {' '.join(cmd)}")
+        process = subprocess.Popen(
+            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            reporter.log("    " + line.rstrip("\n"))
+        return_code = process.wait()
+
+        if return_code == 0:
+            reporter.log(f"    [OK]     separation model downloaded and cached in {torch_cache_dir} / {hf_cache_dir}")
+            reporter.status("demucs model", "Downloaded")
+        else:
+            reporter.log(f"    [WARN] model pre-download exited with code {return_code}. It will be")
+            reporter.log("           retried automatically the first time a single-track VOD actually")
+            reporter.log("           needs it (needs internet then).")
+            reporter.status("demucs model", "Failed")
+    except Exception as exc:
+        reporter.log(f"    [WARN] model pre-download failed: {exc}")
+        reporter.log("           It will be retried automatically the first time a single-track VOD")
+        reporter.log("           actually needs it (needs internet then).")
+        reporter.status("demucs model", "Failed")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 def ensure_simple_packages(reporter: Reporter) -> None:
     for module_name, pip_name in SIMPLE_PACKAGES.items():
         reporter.status(pip_name, "Checking...")
@@ -364,9 +670,11 @@ def ensure_simple_packages(reporter: Reporter) -> None:
                 reporter.status(pip_name, "Failed")
 
 
-def install_dependencies(reporter: Reporter) -> None:
+def install_dependencies(reporter: Reporter, models_dir: Path) -> None:
     reporter.section("Installing Python packages (skipping anything already present)")
     ensure_torch(reporter)
+    ensure_demucs(reporter)
+    predownload_demucs_model(models_dir, reporter)
     ensure_simple_packages(reporter)
 
 
@@ -374,8 +682,9 @@ def install_dependencies(reporter: Reporter) -> None:
 # 4. Ollama + model check (verify only - installing Ollama itself is on you)
 # ============================================================================
 
-def check_ollama(pog_dir: Path, reporter: Reporter) -> None:
+def check_ollama(pog_dir: Path, reporter: Reporter) -> bool:
     reporter.section("Checking Ollama + models")
+    all_ok = True
 
     model_name = judge_model_name = None
     try:
@@ -395,6 +704,7 @@ def check_ollama(pog_dir: Path, reporter: Reporter) -> None:
     if not ollama_found:
         reporter.log("      -> install it yourself from https://ollama.com/download, pull the")
         reporter.log("         models pipeline_config.py expects, then re-run this installer.")
+        all_ok = False
     else:
         try:
             listing = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=15)
@@ -406,8 +716,10 @@ def check_ollama(pog_dir: Path, reporter: Reporter) -> None:
                 reporter.status(name, "OK" if got else "Missing")
                 if not got:
                     reporter.log(f"      -> run: ollama pull {name}")
+                    all_ok = False
         except Exception as exc:
             reporter.log(f"  [WARN] couldn't run `ollama list`: {exc}")
+            all_ok = False
 
     reporter.status("Ollama server", "Checking...")
     host_root = ollama_url.split("/api/")[0] if ollama_url else "http://localhost:11434"
@@ -420,13 +732,138 @@ def check_ollama(pog_dir: Path, reporter: Reporter) -> None:
         reporter.log("           That's fine if it's just not running yet - the Ollama app or")
         reporter.log("           `ollama serve` starts it.")
         reporter.status("Ollama server", "Not running")
+        all_ok = False
+
+    return all_ok
 
 
-# ============================================================================
-# Orchestration shared by both --cli and the GUI
-# ============================================================================
+def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None,
+                        reporter: Reporter) -> bool:
+    """Check if all machine-specific paths in scripts are correctly patched."""
+    reporter.section("Checking configuration (machine-specific paths)")
+    all_ok = True
+    
+    organize_py = pog_dir / "OrganizeVODAndFixSRT_Emotion.py"
+    analyze_py = pog_dir / "analyze_highlights_emotion.py"
+    isolate_vocals_py = pog_dir / "isolate_vocals.py"
+    
+    # Resolve expected paths to absolute
+    if whisper_cli is not None:
+        expected_whisper_cli = str(whisper_cli.resolve())
+    else:
+        expected_whisper_cli = str((pog_dir / "whisper cublas 12.4.0" / "Release" / "whisper-cli.exe").resolve())
+    expected_whisper_model = str((models_dir / "ggml-large-v3.bin").resolve())
+    expected_whisper_vad = str((models_dir / "ggml-silero-v6.2.0.bin").resolve())
+    expected_gallery_dir = str((pog_dir / "gallery" / "best of").resolve())
+    expected_emotion_model_dir = str(models_dir.resolve())
+    expected_emotion_model_file = str((models_dir / "speech-emotion-recognition-with-openai-whisper-large-v3.safetensors").resolve())
+    expected_torch_cache = str((models_dir / "torch_cache").resolve())
+    
+    def check_var(content: str, var_name: str, expected: str) -> bool:
+        # Check for both raw string and regular string formats
+        patterns = [
+            f'{var_name} = r"{expected}"',
+            f'{var_name} = "{expected}"',
+            f'{var_name} = Path(r"{expected}")',
+        ]
+        return any(p in content for p in patterns)
+    
+    if organize_py.is_file():
+        content = organize_py.read_text(encoding="utf-8")
+        
+        for var_name, expected in [
+            ("WHISPER_CLI", expected_whisper_cli),
+            ("WHISPER_MODEL", expected_whisper_model),
+            ("WHISPER_VAD", expected_whisper_vad),
+            ("GALLERY_DIR", expected_gallery_dir),
+        ]:
+            if check_var(content, var_name, expected):
+                reporter.log(f"  [OK]     {organize_py.name}: {var_name} already correct")
+                reporter.status(var_name, "OK")
+            else:
+                reporter.log(f"  [WARN] {organize_py.name}: {var_name} needs patching")
+                reporter.status(var_name, "Warn")
+                all_ok = False
+    
+    if analyze_py.is_file():
+        content = analyze_py.read_text(encoding="utf-8")
+        
+        for var_name, expected in [
+            ("EMOTION_LOCAL_MODEL_DIR", expected_emotion_model_dir),
+            ("EMOTION_LOCAL_MODEL_FILE", expected_emotion_model_file),
+        ]:
+            if check_var(content, var_name, expected):
+                reporter.log(f"  [OK]     {analyze_py.name}: {var_name} already correct")
+                reporter.status(var_name, "OK")
+            else:
+                reporter.log(f"  [WARN] {analyze_py.name}: {var_name} needs patching")
+                reporter.status(var_name, "Warn")
+                all_ok = False
+    
+    if isolate_vocals_py.is_file():
+        content = isolate_vocals_py.read_text(encoding="utf-8")
+        
+        if check_var(content, "TORCH_CACHE_DIR", expected_torch_cache):
+            reporter.log(f"  [OK]     {isolate_vocals_py.name}: TORCH_CACHE_DIR already correct")
+            reporter.status("TORCH_CACHE_DIR", "OK")
+        else:
+            reporter.log(f"  [WARN] {isolate_vocals_py.name}: TORCH_CACHE_DIR needs patching")
+            reporter.status("TORCH_CACHE_DIR", "Warn")
+            all_ok = False
+    
+    return all_ok
 
-def run_all_checks(pog_dir: Path, reporter: Reporter) -> bool:
+
+def check_python_packages(models_dir: Path, reporter: Reporter, install: bool) -> bool:
+    """Check if all Python packages are installed. Install if install=True."""
+    if install:
+        install_dependencies(reporter, models_dir)
+        return True  # install_dependencies handles its own reporting
+    
+    # Check-only mode
+    reporter.section("Checking Python packages")
+    all_ok = True
+    
+    # Check torch
+    reporter.log("  torch (PyTorch - needed for the speech-emotion model)")
+    reporter.status("torch", "Checking...")
+    if is_importable("torch"):
+        import torch
+        cuda_available = torch.cuda.is_available()
+        reporter.log(f"    [OK]     already installed: torch {torch.__version__} (CUDA available: {cuda_available})")
+        reporter.status("torch", "Already installed")
+    else:
+        reporter.log("    [MISSING] torch not installed")
+        reporter.status("torch", "Missing")
+        all_ok = False
+    
+    # Check demucs
+    reporter.log("  demucs (vocal isolation, for single-track/Twitch-style VODs)")
+    reporter.status("demucs", "Checking...")
+    if is_importable("demucs"):
+        reporter.log("    [OK]     demucs already installed")
+        reporter.status("demucs", "Already installed")
+    else:
+        reporter.log("    [MISSING] demucs not installed")
+        reporter.status("demucs", "Missing")
+        all_ok = False
+    
+    # Check demucs model
+    predownload_demucs_model(models_dir, reporter)  # This does its own check/reporting
+    
+    # Check simple packages
+    for module_name, pip_name in SIMPLE_PACKAGES.items():
+        reporter.status(pip_name, "Checking...")
+        if is_importable(module_name):
+            reporter.log(f"  [OK]     {pip_name} already installed")
+            reporter.status(pip_name, "Already installed")
+        else:
+            reporter.log(f"  [MISSING] {pip_name} not installed")
+            reporter.status(pip_name, "Missing")
+            all_ok = False
+    
+    return all_ok
+def run_all_checks(pog_dir: Path, reporter: Reporter, install: bool = True) -> bool:
     reporter.log(f"Pog_Engine folder: {pog_dir}")
     reporter.log(f"Python: {sys.version.split()[0]} ({sys.executable})")
     if sys.version_info < (3, 10):
@@ -434,15 +871,28 @@ def run_all_checks(pog_dir: Path, reporter: Reporter) -> bool:
         reporter.log("       Consider installing a newer Python and re-running this installer.")
 
     missing_scripts = check_scripts(pog_dir, reporter)
-    models_dir, missing_models = check_models(pog_dir, reporter)
-    whisper_cli = find_whisper_cli(pog_dir, reporter)
+    models_dir, missing_models, whisper_cli = check_models(pog_dir, reporter)
+    
+    if install:
+        download_all_models(models_dir, reporter)
+        # Re-check models after downloads so summary is accurate
+        _, missing_models, whisper_cli = check_models(pog_dir, reporter)
+    
+    ffmpeg_ok = check_ffmpeg(reporter)
 
-    patch_paths(pog_dir, models_dir, whisper_cli, reporter)
-    install_dependencies(reporter)
-    check_ollama(pog_dir, reporter)
+    # Check config paths (always check, patch only if install)
+    config_ok = check_config_paths(pog_dir, models_dir, whisper_cli, reporter)
+    
+    # Check Python packages (always check, install only if install)
+    packages_ok = check_python_packages(models_dir, reporter, install)
+    
+    # Check Ollama (always check)
+    ollama_ok = check_ollama(pog_dir, reporter)
 
     reporter.section("Summary")
-    all_good = not missing_scripts and not missing_models and whisper_cli is not None
+    all_good = (not missing_scripts and not missing_models and 
+                whisper_cli is not None and ffmpeg_ok and 
+                config_ok and packages_ok and ollama_ok)
     if all_good:
         reporter.log("  Everything needed is in place. You're ready to run the pipeline.")
     else:
@@ -452,7 +902,15 @@ def run_all_checks(pog_dir: Path, reporter: Reporter) -> bool:
         for name in missing_models:
             reporter.log(f"    - models\\{name}")
         if whisper_cli is None:
-            reporter.log("    - whisper.cpp CUDA/cublas build (whisper-cli.exe)")
+            reporter.log("    - whisper.cpp CUDA/cublas build (whisper-cli.exe in models\\Release\\)")
+        if not ffmpeg_ok:
+            reporter.log("    - ffmpeg/ffprobe on PATH")
+        if not config_ok:
+            reporter.log("    - configuration paths need patching (run Start Setup)")
+        if not packages_ok:
+            reporter.log("    - Python packages missing (run Start Setup)")
+        if not ollama_ok:
+            reporter.log("    - Ollama models/server not ready (run Start Setup)")
     reporter.log("")
     reporter.log("  Re-run this installer any time after adding files - it only")
     reporter.log("  installs/fixes what's still missing.")
@@ -509,6 +967,7 @@ def run_gui(default_dir_str: str) -> int:
         "Done": "#4caf50",
         "Done (CPU only)": "#8bc34a",
         "Already installed": "#4caf50",
+        "Already downloaded": "#4caf50",
         "Missing": "#e05252",
         "Failed": "#e05252",
         "Warn": "#e0a852",
@@ -594,17 +1053,21 @@ def run_gui(default_dir_str: str) -> int:
     models_frame = make_section("models", "Model Files (in models\\)")
     for name in REQUIRED_MODEL_FILES:
         add_row_widget("models", name, name)
+    add_row_widget("models", "whisper-cli.exe", "whisper-cli.exe (in models\\Release\\)")
 
-    whisper_frame = make_section("whisper", "Whisper.cpp (CUDA / cublas build)")
-    add_row_widget("whisper", "whisper-cli.exe", "whisper-cli.exe")
+    ffmpeg_frame = make_section("ffmpeg", "ffmpeg / ffprobe")
+    add_row_widget("ffmpeg", "ffmpeg", "ffmpeg on PATH")
+    add_row_widget("ffmpeg", "ffprobe", "ffprobe on PATH (VOD track-count detection)")
 
     config_frame = make_section("config", "Configuration (machine-specific paths)")
     for var_name in ["WHISPER_CLI", "WHISPER_MODEL", "WHISPER_VAD", "GALLERY_DIR",
-                     "EMOTION_LOCAL_MODEL_DIR", "EMOTION_LOCAL_MODEL_FILE"]:
+                     "EMOTION_LOCAL_MODEL_DIR", "EMOTION_LOCAL_MODEL_FILE", "TORCH_CACHE_DIR"]:
         add_row_widget("config", var_name, var_name)
 
     packages_frame = make_section("packages", "Python Packages")
     add_row_widget("packages", "torch", "torch (PyTorch, GPU if available)")
+    add_row_widget("packages", "demucs", "demucs (vocal isolation, single-track VODs)")
+    add_row_widget("packages", "demucs model", "demucs separation model (~80MB)")
     for pip_name in SIMPLE_PACKAGES.values():
         add_row_widget("packages", pip_name, pip_name)
 
@@ -656,6 +1119,19 @@ def run_gui(default_dir_str: str) -> int:
             event_queue.put(("log", title))
             event_queue.put(("log", "=" * 60))
 
+    def check_only_worker(pog_dir_str: str) -> None:
+        try:
+            pog_dir = Path(pog_dir_str).expanduser().resolve()
+            if not pog_dir.is_dir():
+                event_queue.put(("log", f"ERROR: '{pog_dir}' is not a folder that exists."))
+                event_queue.put(("check_finished", False))
+                return
+            ok = run_all_checks(pog_dir, GuiReporter(), install=False)
+            event_queue.put(("check_finished", ok))
+        except Exception as exc:
+            event_queue.put(("log", f"ERROR: unexpected failure: {exc}"))
+            event_queue.put(("check_finished", False))
+
     def worker(pog_dir_str: str) -> None:
         try:
             pog_dir = Path(pog_dir_str).expanduser().resolve()
@@ -663,7 +1139,7 @@ def run_gui(default_dir_str: str) -> int:
                 event_queue.put(("log", f"ERROR: '{pog_dir}' is not a folder that exists."))
                 event_queue.put(("finished", False))
                 return
-            ok = run_all_checks(pog_dir, GuiReporter())
+            ok = run_all_checks(pog_dir, GuiReporter(), install=True)
             event_queue.put(("finished", ok))
         except Exception as exc:
             event_queue.put(("log", f"ERROR: unexpected failure: {exc}"))
@@ -675,6 +1151,44 @@ def run_gui(default_dir_str: str) -> int:
         browse_button.configure(state="normal")
         status_var.set("Finished - everything needed is in place." if all_good
                         else "Finished - see the checklist above for what's still missing.")
+
+    def on_check_finished(all_good: bool) -> None:
+        start_button.configure(state="normal", text="Start Setup")
+        folder_entry.configure(state="normal")
+        browse_button.configure(state="normal")
+        status_var.set("Check complete. Click Start Setup to install missing components." if not all_good
+                        else "Everything needed is in place. You're ready to run the pipeline.")
+
+    def start_setup() -> None:
+        pog_dir_str = folder_var.get().strip()
+        if not pog_dir_str:
+            messagebox.showerror("Pog_Engine Installer", "Enter or browse to your Pog_Engine folder first.")
+            return
+        if not Path(pog_dir_str).expanduser().is_dir():
+            messagebox.showerror("Pog_Engine Installer", f"'{pog_dir_str}' is not a folder that exists.")
+            return
+
+        btn_text = start_button.cget("text")
+        if btn_text == "Re-check":
+            # Run check-only
+            start_button.configure(state="disabled", text="Checking...")
+            folder_entry.configure(state="disabled")
+            browse_button.configure(state="disabled")
+            status_var.set("Re-checking...")
+            progress_var.set(0)
+            section_progress["value"] = 0
+            threading.Thread(target=check_only_worker, args=(pog_dir_str,), daemon=True).start()
+        else:
+            # Run full install
+            start_button.configure(state="disabled", text="Running...")
+            folder_entry.configure(state="disabled")
+            browse_button.configure(state="disabled")
+            status_var.set("Running - this can take a while the first time (PyTorch is a big download).")
+            progress_var.set(0)
+            section_progress["value"] = 0
+            threading.Thread(target=worker, args=(pog_dir_str,), daemon=True).start()
+
+    start_button.configure(command=start_setup)
 
     def drain_events() -> None:
         if not root.winfo_exists():
@@ -697,25 +1211,12 @@ def run_gui(default_dir_str: str) -> int:
                 progress_var.set(payload)
             elif kind == "finished":
                 on_finished(bool(payload))
+            elif kind == "check_finished":
+                on_check_finished(bool(payload))
         root.after(100, drain_events)
 
-    def start_setup() -> None:
-        pog_dir_str = folder_var.get().strip()
-        if not pog_dir_str:
-            messagebox.showerror("Pog_Engine Installer", "Enter or browse to your Pog_Engine folder first.")
-            return
-        if not Path(pog_dir_str).expanduser().is_dir():
-            messagebox.showerror("Pog_Engine Installer", f"'{pog_dir_str}' is not a folder that exists.")
-            return
-        start_button.configure(state="disabled", text="Running...")
-        folder_entry.configure(state="disabled")
-        browse_button.configure(state="disabled")
-        status_var.set("Running - this can take a while the first time (PyTorch is a big download).")
-        progress_var.set(0)
-        section_progress["value"] = 0
-        threading.Thread(target=worker, args=(pog_dir_str,), daemon=True).start()
-
-    start_button.configure(command=start_setup)
+    # Auto-check on startup
+    threading.Thread(target=check_only_worker, args=(default_dir_str,), daemon=True).start()
 
     root.after(100, drain_events)
     root.mainloop()

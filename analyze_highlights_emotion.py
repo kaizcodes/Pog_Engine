@@ -93,8 +93,8 @@ EMOTION_HALF_WINDOW_SECONDS = EMOTION_WINDOW_SECONDS / 2
 
 # Machine-specific paths - deliberately kept hardcoded here rather than in
 # pipeline_config.py. Edit these directly if your whisper-cublas install moves.
-EMOTION_LOCAL_MODEL_DIR = r"G:\Pog_Engine\models"
-EMOTION_LOCAL_MODEL_FILE = r"G:\Pog_Engine\models\speech-emotion-recognition-with-openai-whisper-large-v3.safetensors"
+EMOTION_LOCAL_MODEL_DIR = r"E:\VIAL\Pog_Engine_dev\models"
+EMOTION_LOCAL_MODEL_FILE = r"E:\VIAL\Pog_Engine_dev\models\speech-emotion-recognition-with-openai-whisper-large-v3.safetensors"
 
 # Running totals for THIS PROCESS's Ollama usage (see ollama_generate()
 # below). Each stage merges its own contribution into the persistent
