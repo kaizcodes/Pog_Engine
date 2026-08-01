@@ -39,8 +39,6 @@ To download qwen3.5:9b-q4_K_M
 
 ## 2. Setting up Pog_Engine
 
-## Pog_Engine Installation:
-
 <img width="916" height="401" alt="{B07D9456-F90D-4832-BBBF-039A72DAFAAB}" src="https://github.com/user-attachments/assets/381e916a-d8f8-4c61-9d0b-93625fa20813" />
  
 Code -> Download ZIP
