@@ -4,7 +4,7 @@
 
 Finish stream, Run, and come back to your PC with a list of potential viral moments!
 
-This pipeline works best with local recorded VOD with separated mic track.
+**This pipeline works best with local recorded VOD with separated mic track.**
 
 
 ## PC Requirement
