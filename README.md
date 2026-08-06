@@ -1,10 +1,12 @@
 # Pog Engine
 
-**Pog Engine** is an AI-powered pipeline for processing **locally recorded OBS VODs** & **Twitch VODs**. It transcribes your VODs, detects potential viral moments using LLMs, speech emotion recognition, and audio analysis, then create ranked highlights into DaVinci Resolve timeline markers for ease of editing. Designed to save hours of manually scrubbing through VODs. 
+**Pog Engine** is an AI-powered pipeline for analyzing locally recorded OBS VODs and stream VODs. It automatically transcribes your content, detects potential viral moments using fully offline LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights as DaVinci Resolve timeline markers.
 
-Finish stream, Run, and come back to your PC with a list of potential viral moments!
+Finish your stream, run Pog Engine, and come back to a list of your best moments instead of scrubbing through hours of footage.
 
-**This pipeline works best with local recorded VOD with separated mic track.**
+For the best results, use locally recorded OBS VODs with a separate microphone track.
+
+**Offline-first by design. Your data never leave your PC—everything runs locally using offline AI models.**
 
 
 ## PC Requirement
@@ -45,7 +47,7 @@ To download qwen3.5:9b-q4_K_M
 Code -> Download ZIP
 
 1. Extract ZIP and store the files in ```Pog_Engine``` folder
-2. Run Install_PogEngine.bat
+2. Run **Install_PogEngine.bat**
 3. Click browse and select ```Pog_Engine``` folder
 
 Your final result should look like this
@@ -56,8 +58,6 @@ Your final result should look like this
 
 ## How to use:
 
-If you have followed step by step correctly, at this point everything SHOULD work.
-
 1. Place **Drag MP4 on me** shortcut in your VOD folder
 3. Drop your VOD.mp4 onto the shortcut
 4. Go to the created folder
@@ -66,11 +66,11 @@ If you have followed step by step correctly, at this point everything SHOULD wor
 
 Files you'll need for davinci resolve:
 VOD.mp4
-**VOD_fixed.srt** (must have fixed in name)
+VOD**fixed**.srt (must have fixed in name)
 highlights.edl (your highlight markers)
 
 ## Companion tools ($5.99): 
-These are scripts that I wrote to speed up your editing process, you can buy them here:
+These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
 
 1-Click Import 
 >Import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
