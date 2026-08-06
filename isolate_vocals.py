@@ -56,7 +56,8 @@ from pipeline_config import (
 # creates its own checkpoints\ subdirectory structure there that shouldn't
 # mix with the flat model files check_models() in pog_engine_setup.py
 # expects to see.
-TORCH_CACHE_DIR = r"E:\VIAL\Pog_Engine_dev\models\torch_cache"
+TORCH_CACHE_DIR = r"G:\pog_dev\models\torch_cache"
+HF_CACHE_DIR = r"G:\pog_dev\models\hf_cache"
 
 # Same noise gate the multi-track path applies in
 # make_extract_mic_bat_multitrack() (OrganizeVODAndFixSRT_Emotion.py) -
@@ -72,17 +73,35 @@ NOISE_GATE_RELEASE_MS = 200
 
 
 def use_local_torch_cache() -> None:
-    """Points torch's hub cache (and therefore demucs' model download) at
-    TORCH_CACHE_DIR instead of the default user-profile location. Best
-    effort: if the folder can't be created (permissions, drive not present),
-    falls back silently to torch's own default rather than blocking
-    separation over a cosmetic cache-location preference."""
+    """Points torch's hub cache AND huggingface_hub's snapshot cache at this
+    script's Pog_Engine folder instead of the default user-profile location,
+    so the separation model lives alongside whisper.cpp's and the emotion
+    model's files rather than scattered in the user profile.
+
+    Sets both the broad *_HOME vars AND the precise *_HUB_CACHE / TORCH_HUB_CACHE
+    overrides: newer torch (>=2.4) and huggingface_hub honor the precise ones
+    over the *_HOME vars, and on some installs HF_HOME alone silently fails to
+    redirect the snapshot dir. Without HF_HUB_CACHE here, demucs >=4 fetches
+    into ~/.cache/huggingface instead of the redirect - so the runtime and the
+    setup's predownload_demucs_model() must set the same vars or they read and
+    write different caches. Best effort: any OSError creating the folder falls
+    back silently to torch's/HF's own defaults rather than block separation.
+    """
     try:
         Path(TORCH_CACHE_DIR).mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("TORCH_HOME", TORCH_CACHE_DIR)
+        os.environ.setdefault("TORCH_HUB_CACHE", str(Path(TORCH_CACHE_DIR) / "hub"))
     except OSError as exc:
         print(f"[isolate-vocals] [!] Could not create TORCH_CACHE_DIR ({TORCH_CACHE_DIR}): {exc}")
         print("[isolate-vocals]     Falling back to torch's default cache location.")
+
+    try:
+        Path(HF_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", HF_CACHE_DIR)
+        os.environ.setdefault("HF_HUB_CACHE", str(Path(HF_CACHE_DIR) / "huggingface" / "hub"))
+    except OSError as exc:
+        print(f"[isolate-vocals] [!] Could not create HF_CACHE_DIR ({HF_CACHE_DIR}): {exc}")
+        print("[isolate-vocals]     Falling back to HuggingFace's default cache location.")
 
 
 def detect_device() -> str:

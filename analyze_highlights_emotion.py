@@ -61,12 +61,15 @@ import bisect
 import difflib
 import io
 import argparse
+from urllib.parse import urlparse
 from datetime import datetime
 from pathlib import Path
 
 from pipeline_config import (
     MODEL, JUDGE_MODEL, NUM_CTX, OLLAMA_URL, OLLAMA_CHAT_URL,
     OLLAMA_RETRIES, OLLAMA_RETRY_BACKOFF_SECONDS,
+    OLLAMA_SERVE, OLLAMA_START_ON_CONNECTION_ERROR,
+    OLLAMA_SERVE_READY_TIMEOUT_SECONDS,
     TOP_N, JUDGE_POOL_SIZE, VERIFY_POOL_SIZE, VERIFY_BATCH_SIZE, VERIFY_MIN_COVERAGE_RATIO,
     VERIFY_NUM_PREDICT, JUDGE_BATCH_SIZE,
     TIMESTAMP_TOLERANCE_SECONDS,
@@ -93,8 +96,8 @@ EMOTION_HALF_WINDOW_SECONDS = EMOTION_WINDOW_SECONDS / 2
 
 # Machine-specific paths - deliberately kept hardcoded here rather than in
 # pipeline_config.py. Edit these directly if your whisper-cublas install moves.
-EMOTION_LOCAL_MODEL_DIR = r"E:\VIAL\Pog_Engine_dev\models"
-EMOTION_LOCAL_MODEL_FILE = r"E:\VIAL\Pog_Engine_dev\models\speech-emotion-recognition-with-openai-whisper-large-v3.safetensors"
+EMOTION_LOCAL_MODEL_DIR = r"G:\pog_dev\models"
+EMOTION_LOCAL_MODEL_FILE = r"G:\pog_dev\models\speech-emotion-recognition-with-openai-whisper-large-v3.safetensors"
 
 # Running totals for THIS PROCESS's Ollama usage (see ollama_generate()
 # below). Each stage merges its own contribution into the persistent
@@ -102,6 +105,11 @@ EMOTION_LOCAL_MODEL_FILE = r"E:\VIAL\Pog_Engine_dev\models\speech-emotion-recogn
 CALL_STATS = {"ollama_calls": 0, "ollama_seconds": 0.0, "ollama_retries": 0}
 AUDIO_SCAN_STATS = {"candidates_found": 0, "candidates_kept": 0}
 PROCESS_START_TIME = time.time()
+
+# Handle of the last `ollama serve` this process spawned via
+# ensure_ollama_running(); used to avoid double-starting and to detect that
+# a spawned server died before becoming ready.
+_OLLAMA_SERVE_PROC = None
 
 # --- Checkpoint I/O -----------------------------------------------------
 # Makes each stage resumable: every stage function checks checkpoint_exists()
@@ -216,7 +224,7 @@ def save_pipeline_stats(stream_folder, stats):
 
 def record_stage_stats(stream_folder, stage_name, stage_seconds):
     """Call at the end of every stage that finishes successfully: folds this
-    process's Ollama call stats and wall-clock time into the shared
+    stage's Ollama call stats and wall-clock time into the shared
     pipeline_stats.json, and marks this stage as the last one to fully
     complete. Only ever called after a stage's checkpoint has already been
     written, so last_completed_stage is always trustworthy - if the process
@@ -230,6 +238,15 @@ def record_stage_stats(stream_folder, stage_name, stage_seconds):
     if AUDIO_SCAN_STATS.get("candidates_found"):
         stats["audio_scan_candidates_found"] += AUDIO_SCAN_STATS["candidates_found"]
         stats["audio_scan_candidates_kept"] += AUDIO_SCAN_STATS["candidates_kept"]
+    # CALL_STATS/AUDIO_SCAN_STATS are process-wide running totals; reset them
+    # after folding so a later stage in the SAME process (the normal
+    # RunAll/5_AnalyzeHighlights flow) doesn't re-add this stage's counts.
+    # Each call therefore records only the delta since the last successful
+    # stage end - without this, single-process runs inflated the persisted
+    # totals at every stage boundary (e.g. audioscan 7/4 recorded as 35/20,
+    # 31 Ollama calls recorded for 7 actual).
+    CALL_STATS.update(ollama_calls=0, ollama_seconds=0.0, ollama_retries=0)
+    AUDIO_SCAN_STATS.update(candidates_found=0, candidates_kept=0)
     stats.setdefault("stage_seconds", {})[stage_name] = round(stage_seconds, 1)
     stats["last_completed_stage"] = stage_name
     stats["last_completed_at"] = datetime.now().isoformat(timespec="seconds")
@@ -299,6 +316,81 @@ def build_transcript_blocks_by_part(stream_folder):
         blocks_by_part[part] = parse_srt_blocks(transcript)
     return blocks_by_part
 
+def _ollama_base_url(url):
+    """Strip the /api/... path off an Ollama endpoint to get the server
+    base (http://host:port) used for health checks."""
+    return url.split("/api/", 1)[0]
+
+
+def ollama_is_reachable(base_url, timeout=3):
+    """True if an Ollama server answers /api/version at base_url. Any HTTP
+    response counts (a busy server is still up); only connection-level
+    failures mean there is no server there."""
+    try:
+        requests.get(base_url.rstrip("/") + "/api/version", timeout=timeout)
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+def ensure_ollama_running(url):
+    """If no Ollama server is answering at url, start one (`ollama serve`,
+    detached so it outlives this process) and wait until it accepts
+    connections. Keeps a pipeline run from dying because the user forgot to
+    launch Ollama first.
+
+    Only auto-starts for a local server (localhost/127.0.0.1/::1) - a remote
+    OLLAMA_URL can't be fixed by spawning a process here. Keeps at most one
+    spawned server alive per process; re-spawns only if a previous one
+    exited, and reports if that one dies before becoming ready.
+    """
+    base_url = _ollama_base_url(url)
+    if ollama_is_reachable(base_url):
+        return True
+    if not OLLAMA_START_ON_CONNECTION_ERROR:
+        return False
+    host = urlparse(url).hostname
+    if host not in ("localhost", "127.0.0.1", "::1"):
+        print(f"     [!] Ollama not reachable at {base_url} and host {host!r} is not local - not auto-starting.")
+        return False
+
+    global _OLLAMA_SERVE_PROC
+    if _OLLAMA_SERVE_PROC is not None and _OLLAMA_SERVE_PROC.poll() is None:
+        # We already launched one and it is still alive; it just isn't
+        # answering yet (or just went down). Wait on it, don't re-spawn.
+        pass
+    else:
+        print(f"     [!] Ollama is not running; starting it ({OLLAMA_SERVE} serve)...")
+        try:
+            flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            _OLLAMA_SERVE_PROC = subprocess.Popen(
+                [OLLAMA_SERVE, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                close_fds=True,
+            )
+        except Exception as exc:
+            print(f"     [WARN] Could not launch {OLLAMA_SERVE!r} serve: {exc}")
+            return False
+
+    deadline = time.time() + OLLAMA_SERVE_READY_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if ollama_is_reachable(base_url):
+            print(f"     [OK] Ollama is up at {base_url}.")
+            return True
+        if _OLLAMA_SERVE_PROC is not None and _OLLAMA_SERVE_PROC.poll() is not None:
+            print(f"     [WARN] {OLLAMA_SERVE!r} serve exited with code {_OLLAMA_SERVE_PROC.returncode} before becoming ready.")
+            return False
+        time.sleep(0.5)
+    print(f"     [WARN] Ollama still not answering at {base_url} after {OLLAMA_SERVE_READY_TIMEOUT_SECONDS:.0f}s.")
+    return False
+
+
 def ollama_generate(payload, timeout, url=None):
     """POST to an Ollama endpoint (default /api/generate) with a couple of
     retries.
@@ -328,6 +420,8 @@ def ollama_generate(payload, timeout, url=None):
             return response
         except Exception as exc:
             last_exc = exc
+            if isinstance(exc, requests.exceptions.ConnectionError):
+                ensure_ollama_running(url)
             if attempt < OLLAMA_RETRIES:
                 CALL_STATS["ollama_retries"] += 1
                 print(f"     [!] Ollama call failed ({exc}); retrying in {OLLAMA_RETRY_BACKOFF_SECONDS:.0f}s...")
@@ -1482,6 +1576,13 @@ def run_judge_batch(pool, keep_n, judge_instructions):
     """Sends a batch of candidates to the judge model and returns the
     ranked subset (as highlight dicts), preserving model-assigned order.
     judge_instructions must contain a {keep_n} placeholder.
+
+    Uses /api/chat + think:false, like verify and audio-scan titling. The
+    judge originally ran on /api/generate with thinking enabled, but newer
+    Ollama (>= 0.3.x) counts the reasoning against num_predict and returns
+    it in a separate `thinking` JSON field instead of inline in `response` -
+    the model burns the whole budget mid-thought and the CSV rows never
+    appear, silently reducing judging to a score sort.
     """
     prompt = judge_instructions.format(keep_n=keep_n)
 
@@ -1498,7 +1599,8 @@ def run_judge_batch(pool, keep_n, judge_instructions):
 
     payload = {
         "model": JUDGE_MODEL,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
+        "think": False,
         "stream": False,
         "options": {
             "temperature": 0,
@@ -1507,8 +1609,8 @@ def run_judge_batch(pool, keep_n, judge_instructions):
         }
     }
 
-    response = ollama_generate(payload, timeout=900)
-    result = response.json().get("response", "")
+    response = ollama_generate(payload, timeout=900, url=OLLAMA_CHAT_URL)
+    result = response.json().get("message", {}).get("content", "")
 
     ranked = []
     seen_timestamps = set()
@@ -1528,13 +1630,19 @@ def run_judge_batch(pool, keep_n, judge_instructions):
             continue
 
         rank, score, timestamp, title = pieces
+        timestamp = timestamp.strip().strip('"')
+        # The model sometimes quotes fields ("00:03:28") and/or emits decimal
+        # scores (7.5). Strip quotes; round decimals rather than mangling
+        # them to "75". An unparseable score keeps the row but leaves
+        # JudgeScore unset (backfill-by-score then applies).
         try:
-            judge_score = int(re.sub(r"[^\d-]", "", str(score)))
-            judge_score = min(max(judge_score, 1), 10)
+            score_text = re.sub(r"[^\d.]", "", str(score))
+            if score_text:
+                judge_score = min(max(round(float(score_text)), 1), 10)
+            else:
+                judge_score = None
         except Exception:
             judge_score = None
-
-        timestamp = timestamp.strip()
 
         if timestamp in seen_timestamps:
             continue
@@ -1548,6 +1656,15 @@ def run_judge_batch(pool, keep_n, judge_instructions):
                 ranked.append(ranked_highlight)
                 seen_timestamps.add(timestamp)
                 break
+
+    if not ranked:
+        # Total parse failure: surface it instead of silently degrading to a
+        # score sort. This used to happen on every run with newer Ollama,
+        # where /api/generate with thinking enabled returned an empty
+        # response (the whole output budget went into a separate `thinking`
+        # field) - see the JUDGE_INSTRUCTIONS comment above.
+        print(f"     [!] Judge returned no parseable CSV rows for {len(pool)} candidate(s) - falling back to score order")
+        print(f"     [!] Raw response: {result[:400]!r}")
 
     return ranked
 
@@ -2079,19 +2196,19 @@ Where VERDICT is either PASS or FAIL. Do not add any other text.
 # ============================================================================
 # Judge prompt
 # ============================================================================
-# Deliberately doesn't disable thinking, unlike every other JUDGE_MODEL
-# prompt here (verify, audio-scan titling): judge is comparative - weighing
-# candidates against a 5-factor priority order - not a single lookup/
-# classification, so letting qwen3.5 think through the tradeoff helps more
-# than it costs. num_predict=3000 gives a reasoning trace room before the
-# actual CSV rows.
+# Originally this was the only JUDGE_MODEL prompt that deliberately kept
+# thinking ENABLED - judge is comparative (weighing candidates against a
+# 5-factor priority order), which reasoning was supposed to help - and it
+# ran on /api/generate, skipping the OLLAMA_CHAT_URL + think:false treatment
+# used by verify/titling.
 #
-# Also why run_judge_batch() below stays on OLLAMA_URL (/api/generate)
-# instead of the OLLAMA_CHAT_URL fix used for verify/titling: the qwen3.5
-# bug (ollama/ollama#14793) is specifically that think:false is ignored - a
-# call that never tries to disable thinking doesn't hit it. If judging ever
-# needs thinking off, give it the same OLLAMA_CHAT_URL + think:false
-# treatment as verify/titling.
+# That no longer works on current Ollama (>= 0.3.x): qwen3.5's reasoning is
+# emitted into a separate `thinking` JSON field that counts against
+# num_predict, so the model spends the whole 3000-token budget mid-thought
+# and "response" comes back empty - the CSV rows never appear and judging
+# silently degrades to a score sort. run_judge_batch() therefore uses the
+# same /api/chat + think:false path as verify/titling (the qwen3.5
+# think:false bug ollama/ollama#14793 only affects /api/generate).
 #
 # If judging comes up short on parsed items, run_judge_tournament() backfills
 # by score rather than losing candidates - verify has no equivalent
@@ -2129,6 +2246,10 @@ Do not give the same top score to many items.
 Return ONLY the top {keep_n} ranked as CSV, no more:
 
 Rank,Score,Timestamp,Title
+
+One row per line, plain values only: rank as an integer, Score as a single
+integer 1-10, Timestamp exactly as given (HH:MM:SS), Title as given. No
+quotes around fields, no decimals, no extra columns or commentary.
 
 """
 

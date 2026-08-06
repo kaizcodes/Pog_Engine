@@ -36,13 +36,13 @@ ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
 # Used only when count_audio_streams() below detects a single-track (Twitch-
 # style) VOD - see make_extract_mic_bat_singletrack().
 ISOLATE_VOCALS_SCRIPT = SCRIPT_DIR / "isolate_vocals.py"
-GALLERY_DIR = Path(r"E:\VIAL\Pog_Engine_dev\gallery\best of")
+GALLERY_DIR = Path(r"G:\pog_dev\gallery\best of")
 GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 # Edit these if your whisper.cpp install moves.
-WHISPER_CLI = r"E:\VIAL\Pog_Engine_dev\models\Release\whisper-cli.exe"
-WHISPER_MODEL = r"E:\VIAL\Pog_Engine_dev\models\ggml-large-v3.bin"
-WHISPER_VAD = r"E:\VIAL\Pog_Engine_dev\models\ggml-silero-v6.2.0.bin"
+WHISPER_CLI = r"G:\pog_dev\models\Release\whisper-cli.exe"
+WHISPER_MODEL = r"G:\pog_dev\models\ggml-large-v3.bin"
+WHISPER_VAD = r"G:\pog_dev\models\ggml-silero-v6.2.0.bin"
 
 # Noise gate before loudnorm: pushes down quiet background noise (keyboard,
 # game bleed, room tone) instead of letting it get amplified into something
@@ -520,15 +520,22 @@ def make_extract_mic_bat_singletrack(target_folder: Path, base_name: str, video_
     """A downloaded Twitch-style VOD: game audio, music, alerts, and mic are
     all flattened into one track, so there's no track to just pull out.
     Instead: extract the full mix at a Demucs-friendly rate (44.1kHz
-    stereo - downsampling before separation would hurt separation quality),
-    then hand off to isolate_vocals.py, which runs the actual voice
-    isolation and finishes the result into the same 16kHz mono + noise-gated
-    format make_extract_mic_bat_multitrack() produces directly. Everything
-    downstream only ever looks for *_mic.wav (see find_mic_wav() /
-    find_run_all_file()'s "mic_wav" kind in analyze_highlights_emotion.py /
-    this file), so it never needs to know which path produced it."""
+    stereo - downsampling before separation would hurt separation quality)
+    to Wave64 (.w64), then hand off to isolate_vocals.py, which runs the
+    actual voice isolation and finishes the result into the same 16kHz
+    mono + noise-gated format make_extract_mic_bat_multitrack() produces
+    directly. Everything downstream only ever looks for *_mic.wav (see
+    find_mic_wav() / find_run_all_file()'s "mic_wav" kind in
+    analyze_highlights_emotion.py / this file), so it never needs to know
+    which path produced it.
+
+    .w64 not .wav here: standard RIFF/WAV caps data size at 4GB (32-bit
+    size field), which a long Twitch VOD's stereo PCM mix blows past -
+    ffmpeg then writes a structurally-broken file Demucs can't load.
+    Wave64 uses a 64-bit size field, same signed 16-bit PCM payload Demucs
+    (via soundfile/libsndfile) reads without any backend change."""
     mic_wav_name = f"{base_name}_mic.wav"
-    mixed_wav_name = f"{base_name}_mixed_full.wav"
+    mixed_wav_name = f"{base_name}_mixed_full.w64"
     video_path = target_folder / f"{base_name}{video_suffix}"
     mixed_wav_path = target_folder / mixed_wav_name
     mic_wav_path = target_folder / mic_wav_name
@@ -540,7 +547,7 @@ echo very first run, downloads a small separation model (~80MB, needs
 echo internet once).
 echo.
 echo Step 1/2: extracting full mix from {base_name}{video_suffix} ...
-ffmpeg -y -i "{batch_quote(video_path)}" -map 0:a:0 -ar 44100 -ac 2 "{batch_quote(mixed_wav_path)}"
+ffmpeg -y -i "{batch_quote(video_path)}" -map 0:a:0 -ar 44100 -ac 2 -f w64 "{batch_quote(mixed_wav_path)}"
 if errorlevel 1 (
     echo.
     echo ERROR: ffmpeg failed to extract the mixed audio track. Make sure
@@ -555,10 +562,10 @@ python "{batch_quote(isolate_script)}" "{batch_quote(mixed_wav_path)}" "{batch_q
 if errorlevel 1 (
     echo.
     echo ERROR: vocal isolation failed. See the output above - common causes
-    echo are the demucs package not being installed (re-run
-    echo Install_PogEngine.bat) or running out of GPU memory on a very long
-    echo VOD (try setting the VOCAL_ISOLATION_SEGMENT_SECONDS environment
-    echo variable - see pipeline_config.py).
+    echo are the demucs package not being installed ^(re-run
+    echo Install_PogEngine.bat^) or running out of GPU memory on a very long
+    echo VOD ^(try setting the VOCAL_ISOLATION_SEGMENT_SECONDS environment
+    echo variable - see pipeline_config.py^).
     if not "%RUN_ALL%"=="1" pause
     exit /b 1
 )

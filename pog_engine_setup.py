@@ -95,8 +95,6 @@ CUDA_WHEEL_TAGS = [
     (11, 8, "cu118"),
 ]
 
-TOTAL_SECTIONS = 7  # scripts, models, whisper, ffmpeg, configuration, packages, ollama
-
 
 def mark(ok: bool) -> str:
     return "[OK]     " if ok else "[MISSING]"
@@ -400,11 +398,14 @@ def patch_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None,
         if organize_py.is_file():
             patch_raw_string_constant(organize_py, "WHISPER_CLI", str(whisper_cli), False, reporter)
     else:
-        # Best-guess default matching the folder name from the setup instructions,
-        # so the constant at least points somewhere sensible once you add it.
-        guess = pog_dir / "whisper cublas 12.4.0" / "Release" / "whisper-cli.exe"
+        # Falls back to where download_whisper_cpp_cublas() extracts the exe
+        # (models\Release\whisper-cli.exe) so the patched constant lands on a
+        # path the installer can actually populate. Once you run Start Setup
+        # again with the exe present, find_whisper_cli() locates it via rglob
+        # and patch_paths rewrites the constant to that discovered path.
+        guess = models_dir / "Release" / "whisper-cli.exe"
         reporter.log(f"  [WARN] whisper-cli.exe not found - guessing WHISPER_CLI = {guess}")
-        reporter.log("         (fix this by hand later if your folder is named differently)")
+        reporter.log("         (run Start Setup again after the cublas download places it there)")
         if organize_py.is_file():
             patch_raw_string_constant(organize_py, "WHISPER_CLI", str(guess), False, reporter)
         reporter.status("WHISPER_CLI", "Warn")
@@ -431,6 +432,7 @@ def patch_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None,
     isolate_vocals_py = pog_dir / "isolate_vocals.py"
     if isolate_vocals_py.is_file():
         patch_raw_string_constant(isolate_vocals_py, "TORCH_CACHE_DIR", str(models_dir / "torch_cache"), False, reporter)
+        patch_raw_string_constant(isolate_vocals_py, "HF_CACHE_DIR", str(models_dir / "hf_cache"), False, reporter)
 
 
 # ============================================================================
@@ -560,6 +562,61 @@ def ensure_demucs(reporter: Reporter) -> None:
         reporter.status("demucs", "Failed")
 
 
+def _demucs_repo_dir(hub_root: Path) -> Path | None:
+    """Returns the HF-Hub repo dir for adefossez/HTDemucs if present under
+    hub_root, else None. Demucs >=4 fetches the htdemucs weights from this
+    single HF repo (models--adefossez--HTDemucs), so its existence is a
+    reliable 'already downloaded' signal - unlike matching by file extension,
+    which would falsely match any other .safetensors/.bin in the cache
+    (Ollama GGUF pulls, transformers weights, etc.).
+
+    Older Demucs fetched a torch-hub bundle (htdemucs.th) instead, so also
+    accept a .th under hub_root/torch/hub/checkpoints/ for back-compat.
+    """
+    hf_repo = hub_root / "huggingface" / "hub" / "models--adefossez--HTDemucs"
+    if (hf_repo / "refs" / "main").exists():
+        return hf_repo
+    # Demucs' default htdemucs is HF-only on modern installs, but the original
+    # torch-hub bundle (htdemucs.th) still works if a user has it from before.
+    legacy = hub_root / "torch" / "hub" / "checkpoints"
+    if legacy.exists():
+        for f in legacy.iterdir():
+            if f.suffix == ".th" and "htdemucs" in f.name.lower():
+                return f
+    return None
+
+
+def _migrate_default_hf_htdemucs(dst_hub_root: Path, reporter: Reporter) -> bool:
+    """If a previous broken run left the HTDemucs weights in the user's
+    default HF cache (~/.cache/huggingface) instead of the redirect - which
+    happened whenever HF_HOME silently failed to override the default cache on
+    older huggingface_hub - move that repo dir into dst_hub_root/huggingface/hub
+    so future installs and runs all read from one place, as originally
+    intended (see the comment on TORCH_CACHE_DIR in isolate_vocals.py).
+
+    Moves (not copies) to avoid duplicating ~80MB. Returns True if a
+    migration happened, False if nothing was found to move (the usual case
+    on a clean install). A leftover empty/partial models--adefossez--HTDemucs
+    dir without refs/main is treated as 'not found' - predownload will
+    re-download it cleanly rather than trust a truncated cache.
+    """
+    src = _demucs_repo_dir(Path.home() / ".cache")
+    if src is None:
+        return False
+    try:
+        dst = dst_hub_root / "huggingface" / "hub" / "models--adefossez--HTDemucs"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        reporter.log(f"    [OK]     moved existing HTDemucs cache from default location to {dst}")
+        return True
+    except (OSError, shutil.Error) as exc:
+        reporter.log(f"    [WARN] could not move existing HTDemucs cache into the redirect ({exc}).")
+        reporter.log(f"           The model stays usable from its original location; only the")
+        reporter.log(f"           redirect layout remains empty. Re-run after closing any program")
+        reporter.log(f"           that may hold the cache open (e.g. another demucs process).")
+        return False
+
+
 def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
     """Triggers Demucs' one-time ~80MB separation-model download now, during
     setup, instead of leaving it for whenever the first single-track/
@@ -567,11 +624,22 @@ def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
     wav purely to make it load (and therefore download/cache) the model -
     the separation result itself is discarded.
 
-    Downloads into models_dir/torch_cache (via TORCH_HOME) and models_dir/hf_cache
-    (via HF_HOME), matching TORCH_CACHE_DIR in isolate_vocals.py (patched to the
-    same path in patch_paths() above), so the model ends up in the same place
-    isolate_vocals.py will look for it later instead of two different caches
-    existing side by side.
+    Downloads into models_dir/torch_cache (TORCH_HUB_CACHE + TORCH_HOME) and
+    models_dir/hf_cache (HF_HUB_CACHE + HF_HOME), matching TORCH_CACHE_DIR in
+    isolate_vocals.py (patched to the same path in patch_paths() above), so
+    the model ends up in the same place isolate_vocals.py will look for it
+    later instead of two different caches existing side by side.
+
+    Two bugs this replaces:
+      1) The old presence check matched ANY .safetensors/.bin/.th in any
+         cache dir, so unrelated repos (Ollama GGUF pulls, transformers
+         weights) in the default HF cache made it falsely report 'already
+         downloaded' and skip - even when HTDemucs itself was absent.
+      2) HF_HOME alone doesn't reliably redirect huggingface_hub's snapshot
+         dir on newer versions (HF_HUB_CACHE takes precedence), so the
+         download silently wrote to ~/.cache/huggingface instead of the
+         redirect and the success log lied about the location. Setting
+         HF_HUB_CACHE explicitly fixes the redirect for real.
     """
     reporter.log("  demucs separation model (~80MB, one-time download)")
     reporter.status("demucs model", "Checking...")
@@ -585,29 +653,33 @@ def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
 
     torch_cache_dir = models_dir / "torch_cache"
     hf_cache_dir = models_dir / "hf_cache"
-    # Also check default HF cache location since isolate_vocals.py only sets TORCH_HOME
-    default_hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
-    # Check all cache locations
-    already_cached = False
-    for cache_dir in [torch_cache_dir, hf_cache_dir, default_hf_cache]:
-        if cache_dir.exists():
-            for root, dirs, files in os.walk(cache_dir):
-                for f in files:
-                    if f.endswith('.th') or f.endswith('.bin') or f.endswith('.safetensors'):
-                        already_cached = True
-                        break
-                if already_cached:
-                    break
-        if already_cached:
-            break
-    if already_cached:
-        reporter.log(f"    [OK]     already cached (found in local or default cache) - skipping.")
+    hf_hub_cache_dir = hf_cache_dir / "huggingface" / "hub"
+    default_hub_root = Path.home() / ".cache"
+
+    # Presence check is now anchored on the *actual* repo, not on a loose
+    # file extension that any other model in the cache would satisfy.
+    already_in_redirect = _demucs_repo_dir(hf_cache_dir) is not None
+    already_in_default = _demucs_repo_dir(default_hub_root) is not None
+
+    if already_in_redirect:
+        reporter.log(f"    [OK]     already cached in redirect ({hf_cache_dir}) - skipping.")
         reporter.status("demucs model", "Already downloaded")
         return
 
+    if already_in_default:
+        reporter.log("    Found HTDemucs in the default user cache (left there by a previous")
+        reporter.log("    install whose HF redirect didn't take). Moving it into the redirect...")
+        if _migrate_default_hf_htdemucs(hf_cache_dir, reporter):
+            reporter.status("demucs model", "Already downloaded")
+            return
+        # Migration failed (e.g. cache locked) - leave it; the pipeline still
+        # works from the default location at runtime. Fall through to attempt
+        # a fresh download into the redirect anyway, since the redirect being
+        # empty means a future clean run is still wrong.
+
     reporter.status("demucs model", "Downloading...")
     torch_cache_dir.mkdir(parents=True, exist_ok=True)
-    hf_cache_dir.mkdir(parents=True, exist_ok=True)
+    hf_hub_cache_dir.mkdir(parents=True, exist_ok=True)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pog_demucs_predownload_"))
     try:
@@ -620,7 +692,9 @@ def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
 
         env = os.environ.copy()
         env["TORCH_HOME"] = str(torch_cache_dir)
+        env["TORCH_HUB_CACHE"] = str(torch_cache_dir / "hub")  # torch >=2.4 honors this for the checkpoints dir
         env["HF_HOME"] = str(hf_cache_dir)
+        env["HF_HUB_CACHE"] = str(hf_hub_cache_dir)  # huggingface_hub honors this over HF_HOME
         cmd = [
             sys.executable, "-m", "demucs",
             "-n", "htdemucs", "--two-stems", "vocals",
@@ -629,6 +703,7 @@ def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
             str(silent_wav),
         ]
         reporter.log(f"    $ {' '.join(cmd)}")
+        reporter.log(f"    (TORCH_HUB_CACHE={env['TORCH_HUB_CACHE']}  HF_HUB_CACHE={env['HF_HUB_CACHE']})")
         process = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -638,9 +713,26 @@ def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
             reporter.log("    " + line.rstrip("\n"))
         return_code = process.wait()
 
-        if return_code == 0:
-            reporter.log(f"    [OK]     separation model downloaded and cached in {torch_cache_dir} / {hf_cache_dir}")
+        if return_code == 0 and _demucs_repo_dir(hf_cache_dir) is not None:
+            reporter.log(f"    [OK]     separation model downloaded and cached in {hf_cache_dir}")
             reporter.status("demucs model", "Downloaded")
+        elif return_code == 0:
+            # Demucs exited clean but, heartbreakingly, didn't land in the
+            # redirect we just set. This is the regression the env-var fix
+            # above is meant to prevent; if it still happens, demucs likely
+            # resolved the repo from elsewhere (HF_HUB_CACHE not honored by
+            # this huggingface_hub build). Surface it as a hard failure
+            # rather than silently lie, then check the default cache so the
+            # user at least knows where it ended up.
+            if _demucs_repo_dir(default_hub_root) is not None:
+                reporter.log(f"    [WARN] demucs exited OK but HTDemucs is NOT in the redirect")
+                reporter.log(f"           ({hf_cache_dir}); a newer huggingface_hub ignored HF_HUB_CACHE.")
+                reporter.log(f"           Found it in the default cache instead - the pipeline still")
+                reporter.log(f"           works at runtime, but the redirect stayed empty.")
+            else:
+                reporter.log(f"    [WARN] demucs exited OK but no HTDemucs cache was created anywhere")
+                reporter.log(f"           we can find. The pipeline will re-download on first use.")
+            reporter.status("demucs model", "Failed")
         else:
             reporter.log(f"    [WARN] model pre-download exited with code {return_code}. It will be")
             reporter.log("           retried automatically the first time a single-track VOD actually")
@@ -751,7 +843,12 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
     if whisper_cli is not None:
         expected_whisper_cli = str(whisper_cli.resolve())
     else:
-        expected_whisper_cli = str((pog_dir / "whisper cublas 12.4.0" / "Release" / "whisper-cli.exe").resolve())
+        # Matches where download_whisper_cpp_cublas() actually extracts the
+        # exe (models\Release\whisper-cli.exe, see download_whisper_cpp_cublas
+        # and check_models). The old guess pointed at a side folder named
+        # "whisper cublas 12.4.0\Release\" - the installer never writes there,
+        # so the constant could never match even after a successful download.
+        expected_whisper_cli = str((models_dir / "Release" / "whisper-cli.exe").resolve())
     expected_whisper_model = str((models_dir / "ggml-large-v3.bin").resolve())
     expected_whisper_vad = str((models_dir / "ggml-silero-v6.2.0.bin").resolve())
     expected_gallery_dir = str((pog_dir / "gallery" / "best of").resolve())
@@ -814,55 +911,132 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
     return all_ok
 
 
-def check_python_packages(models_dir: Path, reporter: Reporter, install: bool) -> bool:
-    """Check if all Python packages are installed. Install if install=True."""
-    if install:
-        install_dependencies(reporter, models_dir)
-        return True  # install_dependencies handles its own reporting
-    
-    # Check-only mode
-    reporter.section("Checking Python packages")
+def _verify_python_packages(models_dir: Path, reporter: Reporter,
+                            installed_label: str = "installed") -> bool:
+    """Re-import every required package and report its real status.
+
+    The old install branch of check_python_packages returned True
+    unconditionally after install_dependencies(), so the Summary could claim
+    "everything ready" - and create the drag-and-drop shortcut - even when
+    torch or demucs had silently failed to install. Both install and
+    check-only modes now route through this single verifier so they can never
+    disagree about what's actually importable. `installed_label` only changes
+    the OK status word shown in the GUI ("OK" vs "Already installed").
+    """
     all_ok = True
-    
-    # Check torch
+
     reporter.log("  torch (PyTorch - needed for the speech-emotion model)")
     reporter.status("torch", "Checking...")
     if is_importable("torch"):
         import torch
         cuda_available = torch.cuda.is_available()
-        reporter.log(f"    [OK]     already installed: torch {torch.__version__} (CUDA available: {cuda_available})")
-        reporter.status("torch", "Already installed")
+        reporter.log(f"    [OK]     {installed_label}: torch {torch.__version__} (CUDA available: {cuda_available})")
+        reporter.status("torch", "Already installed" if installed_label.startswith("already") else "OK")
     else:
         reporter.log("    [MISSING] torch not installed")
         reporter.status("torch", "Missing")
         all_ok = False
-    
-    # Check demucs
+
     reporter.log("  demucs (vocal isolation, for single-track/Twitch-style VODs)")
     reporter.status("demucs", "Checking...")
     if is_importable("demucs"):
-        reporter.log("    [OK]     demucs already installed")
-        reporter.status("demucs", "Already installed")
+        reporter.log(f"    [OK]     demucs {installed_label}")
+        reporter.status("demucs", "Already installed" if installed_label.startswith("already") else "OK")
     else:
         reporter.log("    [MISSING] demucs not installed")
         reporter.status("demucs", "Missing")
         all_ok = False
-    
-    # Check demucs model
-    predownload_demucs_model(models_dir, reporter)  # This does its own check/reporting
-    
-    # Check simple packages
+
+    predownload_demucs_model(models_dir, reporter)  # own check/reporting
+
     for module_name, pip_name in SIMPLE_PACKAGES.items():
         reporter.status(pip_name, "Checking...")
         if is_importable(module_name):
-            reporter.log(f"  [OK]     {pip_name} already installed")
-            reporter.status(pip_name, "Already installed")
+            reporter.log(f"  [OK]     {pip_name} {installed_label}")
+            reporter.status(pip_name, "Already installed" if installed_label.startswith("already") else "OK")
         else:
             reporter.log(f"  [MISSING] {pip_name} not installed")
             reporter.status(pip_name, "Missing")
             all_ok = False
-    
+
     return all_ok
+
+
+def check_python_packages(models_dir: Path, reporter: Reporter, install: bool) -> bool:
+    """Install packages if install=True, then verify what's actually importable.
+
+    Verification runs in BOTH modes (previously install-mode returned True
+    unconditionally, masking failed installs). The install branch first runs
+    install_dependencies() - which emits its own "Installing..." section and
+    reports per-package failures - then calls _verify_python_packages() under
+    a "Verifying Python packages" section so the final per-row status reflects
+    the on-disk truth, not pip's exit code.
+    """
+    if install:
+        install_dependencies(reporter, models_dir)
+        reporter.section("Verifying Python packages")
+        return _verify_python_packages(models_dir, reporter, installed_label="installed")
+
+    reporter.section("Checking Python packages")
+    return _verify_python_packages(models_dir, reporter, installed_label="already installed")
+
+# ============================================================================
+# Drag-and-drop shortcut
+# ============================================================================
+
+def create_drag_shortcut(pog_dir: Path, reporter: Reporter) -> None:
+    """Create a Windows shortcut to OrganizeVODAndFixSRT_Emotion.bat named
+    "Drag MP4 on me.lnk" inside the Pog folder.
+
+    The shortcut is the user-facing entry point: copy it into a VOD folder
+    and drop any .mkv/mp4 onto it. Windows passes the dropped file as %1 to
+    the target .bat, which runs the full pipeline against that VOD. The .bat
+    uses %~dp0 (its own dir) to locate the .py alongside it, so the shortcut
+    works from anywhere - %~dp0 still resolves to the real Pog folder, not
+    the folder the .lnk was copied into.
+
+    Builds the .lnk via PowerShell New-Object -ComObject WScript.Shell, which
+    ships with every Windows install and avoids adding a pywin32 dependency.
+    Idempotent: re-running Start Setup overwrites the .lnk in place, so moving
+    the Pog folder and re-running Setup rewrites TargetPath to the new home.
+    """
+    reporter.section("Creating drag-and-drop shortcut")
+    bat = pog_dir / "OrganizeVODAndFixSRT_Emotion.bat"
+    if not bat.is_file():
+        reporter.log(f"  [WARN] OrganizeVODAndFixSRT_Emotion.bat not found in {pog_dir} - skipping shortcut")
+        reporter.status("Drag MP4 on me", "Warn")
+        return
+
+    lnk = pog_dir / "Drag MP4 on me.lnk"
+    # TargetPath/WorkingDirectory/Shortcut full path are absolute Windows paths
+    # inlined straight into the PowerShell string. WScript.Shell.CreateShortcut
+    # takes a single string (the .lnk path); we pass it literally to avoid
+    # PowerShell's space-sensitive parsing of Join-Path inside a method call.
+    ps = (
+        f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}') ;"
+        f"$s.TargetPath = '{bat}' ;"
+        f"$s.WorkingDirectory = '{pog_dir}' ;"
+        f"$s.Description = 'Drag an .mp4/.mkv onto me to run Pog_Engine' ;"
+        f"$s.IconLocation = '{bat},0' ;"
+        "$s.Save()"
+    )
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True, text=True,
+    )
+    if proc.returncode == 0 and lnk.is_file():
+        reporter.log(f"  [OK]     created {lnk.name} in the Pog folder")
+        reporter.log("           Copy it into your VOD folder and drag any video onto it.")
+        reporter.status("Drag MP4 on me", "OK")
+    else:
+        reporter.log(f"  [WARN] shortcut creation failed (exit {proc.returncode})")
+        if proc.stderr.strip():
+            reporter.log(f"           powershell: {proc.stderr.strip()}")
+        reporter.log("           You can still run the pipeline by dragging a video onto")
+        reporter.log(f"           {bat.name} directly.")
+        reporter.status("Drag MP4 on me", "Warn")
+
+
 def run_all_checks(pog_dir: Path, reporter: Reporter, install: bool = True) -> bool:
     reporter.log(f"Pog_Engine folder: {pog_dir}")
     reporter.log(f"Python: {sys.version.split()[0]} ({sys.executable})")
@@ -880,21 +1054,36 @@ def run_all_checks(pog_dir: Path, reporter: Reporter, install: bool = True) -> b
     
     ffmpeg_ok = check_ffmpeg(reporter)
 
-    # Check config paths (always check, patch only if install)
+    # Repoint the machine-specific path constants in the three pipeline scripts
+    # to THIS machine's pog_dir / models_dir. check_config_paths below then
+    # verifies the patched result. Previously patch_paths() was defined but
+    # never called - so Start Setup downloaded models and installed packages
+    # but left WHISPER_CLI / WHISPER_MODEL / GALLERY_DIR / etc. pointing at
+    # wherever the repo was copied from, and the config check warned forever.
+    # Skipped in check-only mode so a read-only Re-check never rewrites source.
+    if install:
+        patch_paths(pog_dir, models_dir, whisper_cli, reporter)
+
     config_ok = check_config_paths(pog_dir, models_dir, whisper_cli, reporter)
-    
-    # Check Python packages (always check, install only if install)
+
     packages_ok = check_python_packages(models_dir, reporter, install)
-    
-    # Check Ollama (always check)
+
     ollama_ok = check_ollama(pog_dir, reporter)
 
     reporter.section("Summary")
-    all_good = (not missing_scripts and not missing_models and 
-                whisper_cli is not None and ffmpeg_ok and 
+    all_good = (not missing_scripts and not missing_models and
+                whisper_cli is not None and ffmpeg_ok and
                 config_ok and packages_ok and ollama_ok)
     if all_good:
         reporter.log("  Everything needed is in place. You're ready to run the pipeline.")
+        if install:
+            # Drop a drag-and-drop shortcut in the Pog folder so the user never
+            # has to touch code again: copy "Drag MP4 on me.lnk" into a VOD
+            # folder and drop any .mp4 on it. The shortcut targets the real
+            # OrganizeVODAndFixSRT_Emotion.bat, so %~dp0 inside it still resolves
+            # to this Pog folder and %~1 receives the dropped file. Only created
+            # on a fully-green install, never during check-only or a failed run.
+            create_drag_shortcut(pog_dir, reporter)
     else:
         reporter.log("  Still needed before the pipeline will run end-to-end:")
         for name in missing_scripts:
@@ -953,11 +1142,6 @@ def run_gui(default_dir_str: str) -> int:
     style.configure("TButton", background="#242424", foreground="#f2f2f2", bordercolor="#3a3a3a")
     style.map("TButton", background=[("active", "#333333")], foreground=[("disabled", "#666666")])
     style.configure("TEntry", fieldbackground="#1e1e1e", foreground="#f2f2f2")
-    style.configure(
-        "Orange.Horizontal.TProgressbar",
-        troughcolor="#2a2a2a", background="#ff8c00", lightcolor="#ff8c00",
-        darkcolor="#ff8c00", bordercolor="#2a2a2a",
-    )
 
     STATUS_COLORS = {
         "Waiting": "#777777",
@@ -1000,10 +1184,6 @@ def run_gui(default_dir_str: str) -> int:
 
     status_var = tk.StringVar(value="Ready to start.")
     ttk.Label(top_frame, textvariable=status_var).pack(anchor="w", pady=(8, 0))
-    progress_var = tk.DoubleVar(value=0)
-    progress = ttk.Progressbar(top_frame, variable=progress_var, maximum=TOTAL_SECTIONS,
-                                style="Orange.Horizontal.TProgressbar")
-    progress.pack(fill="x", pady=(4, 0))
 
     # ---- middle: scrollable checklist --------------------------------------
     middle_container = ttk.Frame(root, padding=(12, 6))
@@ -1099,7 +1279,6 @@ def run_gui(default_dir_str: str) -> int:
 
     # ---- worker thread + queue -------------------------------------------------
     event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-    section_progress = {"value": 0}
 
     class GuiReporter(Reporter):
         def log(self, msg: str = "") -> None:
@@ -1112,8 +1291,6 @@ def run_gui(default_dir_str: str) -> int:
             event_queue.put(("add_row", (section, key, label)))
 
         def section(self, title: str) -> None:
-            section_progress["value"] += 1
-            event_queue.put(("progress", section_progress["value"]))
             event_queue.put(("log", ""))
             event_queue.put(("log", "=" * 60))
             event_queue.put(("log", title))
@@ -1175,8 +1352,6 @@ def run_gui(default_dir_str: str) -> int:
             folder_entry.configure(state="disabled")
             browse_button.configure(state="disabled")
             status_var.set("Re-checking...")
-            progress_var.set(0)
-            section_progress["value"] = 0
             threading.Thread(target=check_only_worker, args=(pog_dir_str,), daemon=True).start()
         else:
             # Run full install
@@ -1184,8 +1359,6 @@ def run_gui(default_dir_str: str) -> int:
             folder_entry.configure(state="disabled")
             browse_button.configure(state="disabled")
             status_var.set("Running - this can take a while the first time (PyTorch is a big download).")
-            progress_var.set(0)
-            section_progress["value"] = 0
             threading.Thread(target=worker, args=(pog_dir_str,), daemon=True).start()
 
     start_button.configure(command=start_setup)
@@ -1207,8 +1380,6 @@ def run_gui(default_dir_str: str) -> int:
                 section, key, label = payload  # type: ignore[misc]
                 if key not in row_widgets:
                     add_row_widget(section, key, label)
-            elif kind == "progress":
-                progress_var.set(payload)
             elif kind == "finished":
                 on_finished(bool(payload))
             elif kind == "check_finished":

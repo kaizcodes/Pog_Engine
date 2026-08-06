@@ -42,10 +42,26 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 # the model burns the whole num_predict budget on hidden reasoning and
 # "response" comes back empty. /api/chat with top-level think:false works.
 # Any JUDGE_MODEL call needing thinking OFF (title_audio_candidates,
-# verify_candidates) must use this URL - see ollama_generate(..., url=...).
+# verify_candidates, run_judge_batch) must use this URL - see
+# ollama_generate(..., url=...). run_judge_batch used to be the exception
+# (deliberately thinking ON for comparative ranking), but newer Ollama
+# returns qwen3.5's reasoning in a separate `thinking` field that eats the
+# whole num_predict budget, leaving "response" empty - so judging needs it
+# off too.
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 OLLAMA_RETRIES = _env_int("OLLAMA_RETRIES", 2)
 OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
+# Ollama is normally a user-launched tray app; when the user forgets to start
+# it, stage 5 used to die on the first ConnectionError with no recovery.
+# ensure_ollama_running() in analyze_highlights_emotion.py now boots it
+# automatically (ollama serve) when a call gets a connection-level failure,
+# then waits for /api/version to answer before retrying. Only fires for a
+# local server - a remote OLLAMA_URL can't be fixed by spawning a process.
+# OLLAMA_SERVE_READY_TIMEOUT_SECONDS bounds how long a stage waits for a
+# freshly started server to accept connections (cold start is ~1-3s).
+OLLAMA_SERVE = os.environ.get("OLLAMA_SERVE", "ollama")
+OLLAMA_START_ON_CONNECTION_ERROR = _env_bool("HIGHLIGHT_OLLAMA_START_ON_CONNECTION_ERROR", True)
+OLLAMA_SERVE_READY_TIMEOUT_SECONDS = _env_float("HIGHLIGHT_OLLAMA_SERVE_READY_TIMEOUT_SECONDS", 60)
 # Was 32768 everywhere; at Q4_K_M an 8-9B model's KV cache alone costs ~4-4.5GB
 # at that size - most of a 10GB card's headroom after weights. No prompt here
 # needs it (discovery, the biggest, is ~6-7K tokens; others 1-2K), so 8192
