@@ -1,6 +1,6 @@
 # Pog Engine
 
-**Pog Engine** is an AI-powered pipeline for analyzing locally recorded OBS VODs and stream VODs. It automatically transcribes your content, detects potential viral moments using fully offline LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights as DaVinci Resolve timeline markers.
+**Pog Engine** is an AI-powered pipeline for analyzing locally recorded and stream VODs. It automatically transcribes your content, detects potential viral moments using fully offline LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights as DaVinci Resolve timeline markers.
 
 Finish your stream, run Pog Engine, and come back to a list of your best moments instead of scrubbing through hours of footage.
 
