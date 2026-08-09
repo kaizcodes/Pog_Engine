@@ -1,8 +1,13 @@
 # Pog Engine
 
-**Pog Engine** is an AI-powered pipeline for processing **locally recorded OBS VODs**. It transcribes your recordings, detects potential viral moments using LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights and DaVinci Resolve timeline markers. Designed to save hours of manually scrubbing through VODs. 
+**Pog Engine** is an AI-powered pipeline for analyzing locally recorded and stream VODs. It automatically transcribes your content, detects potential viral moments using fully offline LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights as DaVinci Resolve timeline markers.
 
-Finish stream, Run, and come back to your PC with a list of potential viral moments!
+Finish your stream, run Pog Engine, and come back to a list of your best moments instead of scrubbing through hours of footage.
+
+For the best results, use locally recorded OBS VODs with a separate microphone track.
+
+**Offline-first by design. Your data never leave your PC—everything runs locally using offline AI models.**
+
 
 ## PC Requirement
 
@@ -14,9 +19,7 @@ Finish stream, Run, and come back to your PC with a list of potential viral mome
 
 Built around an RTX 3080 (10GB VRAM). Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
 
-## OBS Setup Requirement
-
-This project **only supports locally recorded OBS VODs FOR NOW**.
+## OBS Setup Requirement FOR LOCAL RECORDED VOD
 
 Your OBS recording **must match the required configuration exactly**:
 
@@ -44,7 +47,7 @@ To download qwen3.5:9b-q4_K_M
 Code -> Download ZIP
 
 1. Extract ZIP and store the files in ```Pog_Engine``` folder
-2. Run Install_PogEngine.bat
+2. Run **Install_PogEngine.bat**
 3. Click browse and select ```Pog_Engine``` folder
 
 Your final result should look like this
@@ -55,24 +58,29 @@ Your final result should look like this
 
 ## How to use:
 
-If you have followed step by step correctly, at this point everything SHOULD work.
-
-1. Create shortcut from OrganizeVODAndFixSRT_Emotion.bat (Right click -> Create shortcut)
-2. Place this shortcut in your VOD folder
+1. Place **Drag MP4 on me** shortcut in your VOD folder
 3. Drop your VOD.mp4 onto the shortcut
 4. Go to the created folder
 5. Open **6_RunAllSteps.bat**
 6. Watch it works
 
-## Companion tools (RECOMMENDED):
-[1 click script to import](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/1%20Click%20Import%20%2B%20Timeline%20%2B%20SRT%20%2B%20Marker%20into%20Timeline) 
+Files you'll need for davinci resolve:
+VOD.mp4
+VOD**fixed**.srt (must have fixed in name)
+highlights.edl (your highlight markers)
+
+## Companion tools ($5.99): 
+These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
+
+1-Click Import 
 >Import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
 
-[Highlight Marker Tracker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Marker%20Tracker%20Ordered%20by%20Score)
->View your markers in score order
+Marker Tracker
+>View your markers in order and categories
 
-[Subtitle to Marker](https://github.com/kaizcodes/davinci-resolve-20-auto-scripts/tree/main/Subtitle%20to%20Marker) 
->Find turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
+Subtitle to Marker 
+>Turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
+
 
 
 ## Tech Stack
