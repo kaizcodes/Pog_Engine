@@ -1,18 +1,15 @@
 # Pog Engine
 
-**Pog Engine** is an AI-powered pipeline for analyzing locally recorded and stream VODs. It automatically transcribes your content, detects potential viral moments using fully offline LLMs, speech emotion recognition, and audio analysis, then exports ranked highlights as DaVinci Resolve timeline markers.
+**Pog Engine** is an AI-powered pipeline for analyzing OBS and stream VODs. It transcribes your content, finds potential viral moments using **offline LLMs, speech emotion recognition, and audio analysis**, then exports ranked highlights as **DaVinci Resolve timeline markers**.
 
-Finish your stream, run Pog Engine, and come back to a list of your best moments instead of scrubbing through hours of footage.
+Finish your stream, run Pog Engine, and get your best moments without scrubbing through hours of footage.
 
-For the best results, use locally recorded OBS VODs with a separate microphone track.
+**100% offline. Your data never leave your PC and will not be used to train AI.**
 
-**Offline-first by design. Your data never leave your PC—everything runs locally using offline AI models.**
+Built for streamers who rely on **speech, reactions, and audio** to create viral moments.
 
-## Capability
+> **Note:** Pog Engine currently cannot detect purely visual moments like physical comedy or crazy gameplay.
 
-Because 99% of streamers are faceless and rely on speaking or insane gameplay to go viral, Pog Engine finds viral moments in the things you say on stream. 
-
-What it cannot do: detect physical comedy or crazy gameplay moments.
 
 
 ## PC Requirement
