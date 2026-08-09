@@ -9,9 +9,8 @@ For the best results, use locally recorded OBS VODs with a separate microphone t
 **Offline-first by design. Your data never leave your PC—everything runs locally using offline AI models.**
 
 ## Capability
-It transcribe your stream
 
-finds viral moments in the things you say on stream.
+Because 99% of streamers are faceless and rely on speaking or insane gameplay to go viral, Pog Engine finds viral moments in the things you say on stream. 
 
 What it cannot do: detect physical comedy or crazy gameplay moments.
 
