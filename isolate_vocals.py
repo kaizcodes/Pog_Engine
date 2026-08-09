@@ -42,7 +42,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_config import (
-    VOCAL_ISOLATION_MODEL, VOCAL_ISOLATION_DEVICE, VOCAL_ISOLATION_SEGMENT_SECONDS,
+    NOISE_GATE_ATTACK_MS,
+    NOISE_GATE_RATIO,
+    NOISE_GATE_RELEASE_MS,
+    NOISE_GATE_THRESHOLD_DB,
+    VOCAL_ISOLATION_DEVICE,
+    VOCAL_ISOLATION_MODEL,
+    VOCAL_ISOLATION_SEGMENT_SECONDS,
 )
 
 # Machine-specific path - deliberately kept hardcoded here (not in
@@ -59,17 +65,6 @@ from pipeline_config import (
 TORCH_CACHE_DIR = r"G:\pog_dev\models\torch_cache"
 HF_CACHE_DIR = r"G:\pog_dev\models\hf_cache"
 
-# Same noise gate the multi-track path applies in
-# make_extract_mic_bat_multitrack() (OrganizeVODAndFixSRT_Emotion.py) -
-# kept as a separate literal copy rather than importing it from there since
-# that file's constants aren't meant as a shared module surface (this script
-# is called as a subprocess, not imported). Demucs' vocal stem still carries
-# some separation bleed/artifacts in quiet sections, so gating helps the VAD
-# here the same way it helps on a clean recorded mic track.
-NOISE_GATE_THRESHOLD_DB = -35
-NOISE_GATE_RATIO = 8
-NOISE_GATE_ATTACK_MS = 10
-NOISE_GATE_RELEASE_MS = 200
 
 
 def use_local_torch_cache() -> None:

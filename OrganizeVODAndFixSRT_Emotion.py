@@ -17,7 +17,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from pipeline_config import MODEL, JUDGE_MODEL, OLLAMA_URL
+from pipeline_config import (
+    JUDGE_MODEL,
+    MODEL,
+    NOISE_GATE_ATTACK_MS,
+    NOISE_GATE_RATIO,
+    NOISE_GATE_RELEASE_MS,
+    NOISE_GATE_THRESHOLD_DB,
+    OLLAMA_URL,
+)
 
 DEFAULT_CHUNK_MINUTES = 25
 MIN_REPEAT_SENTENCE_WORDS = 3
@@ -44,17 +52,6 @@ WHISPER_CLI = r"G:\pog_dev\models\Release\whisper-cli.exe"
 WHISPER_MODEL = r"G:\pog_dev\models\ggml-large-v3.bin"
 WHISPER_VAD = r"G:\pog_dev\models\ggml-silero-v6.2.0.bin"
 
-# Noise gate before loudnorm: pushes down quiet background noise (keyboard,
-# game bleed, room tone) instead of letting it get amplified into something
-# the VAD mistakes for speech.
-#   threshold: below this = "silence", attenuated. Raise (e.g. -30) if noise
-#              leaks through; lower (e.g. -45) if quiet speech gets gated out.
-#   ratio:     how hard the gate closes below threshold (higher = harder).
-#   attack/release: ms for the gate to close/reopen.
-NOISE_GATE_THRESHOLD_DB = -35
-NOISE_GATE_RATIO = 8
-NOISE_GATE_ATTACK_MS = 10
-NOISE_GATE_RELEASE_MS = 200
 
 @dataclass(frozen=True)
 class SubtitleEntry:
@@ -525,7 +522,7 @@ def make_extract_mic_bat_singletrack(target_folder: Path, base_name: str, video_
     actual voice isolation and finishes the result into the same 16kHz
     mono + noise-gated format make_extract_mic_bat_multitrack() produces
     directly. Everything downstream only ever looks for *_mic.wav (see
-    find_mic_wav() / find_run_all_file()'s "mic_wav" kind in
+    find_mic_wav() / run_all_file_info()'s "mic_wav" kind in
     analyze_highlights_emotion.py / this file), so it never needs to know
     which path produced it.
 
@@ -662,64 +659,66 @@ if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
 
-def make_fix_srt_bat(script_path: Path) -> str:
+def _make_srt_step_bat(
+    script_path: Path,
+    *,
+    missing_message: str,
+    progress_message: str,
+    command: str,
+    error_label: str,
+    done_message: str,
+    next_message: str,
+) -> str:
     return f'''@echo off
 if "%~1"=="" (
-    echo Drag your .srt file onto this script.
+    echo {missing_message}
     if not "%RUN_ALL%"=="1" pause
     exit /b 1
 )
 
 set SRT=%~1
-set FOLDER=%~dp1
 
-echo Fixing SRT timestamps and adjacent repeats: %~nx1
+echo {progress_message}: %~nx1
 echo.
-python "{batch_quote(script_path)}" --fix-srt "%SRT%" --no-pause
+python "{batch_quote(script_path)}" {command} "%SRT%" --no-pause
 
 if errorlevel 1 (
     echo.
-    echo ERROR: SRT fix failed.
+    echo ERROR: {error_label} failed.
     if not "%RUN_ALL%"=="1" pause
     exit /b 1
 )
 
 echo.
-echo Done! Fixed SRT saved next to the original as *_fixed.srt.
-echo Next: drag the *_fixed.srt file onto 4_SplitSRT.bat
+echo {done_message}
+echo {next_message}
 if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
+
+
+def make_fix_srt_bat(script_path: Path) -> str:
+    return _make_srt_step_bat(
+        script_path,
+        missing_message="Drag your .srt file onto this script.",
+        progress_message="Fixing SRT timestamps and adjacent repeats",
+        command="--fix-srt",
+        error_label="SRT fix",
+        done_message="Done! Fixed SRT saved next to the original as *_fixed.srt.",
+        next_message="Next: drag the *_fixed.srt file onto 4_SplitSRT.bat",
+    )
+
 
 def make_split_srt_bat(script_path: Path) -> str:
-    return f'''@echo off
-if "%~1"=="" (
-    echo Drag your fixed .srt file onto this script.
-    if not "%RUN_ALL%"=="1" pause
-    exit /b 1
-)
-
-set SRT=%~1
-set FOLDER=%~dp1
-
-echo Splitting SRT into transcript_part files: %~nx1
-echo.
-python "{batch_quote(script_path)}" --split-srt "%SRT%" --no-pause
-
-if errorlevel 1 (
-    echo.
-    echo ERROR: SRT split failed.
-    if not "%RUN_ALL%"=="1" pause
-    exit /b 1
-)
-
-echo.
-echo Done! transcript_part files are ready in the folder.
-echo Double-click 5_AnalyzeHighlights.bat when you are ready to find highlights
-echo (or 6_RunAllSteps.bat to run steps 1 through 5 automatically).
-if not "%RUN_ALL%"=="1" pause
-exit /b 0
-'''
+    return _make_srt_step_bat(
+        script_path,
+        missing_message="Drag your fixed .srt file onto this script.",
+        progress_message="Splitting SRT into transcript_part files",
+        command="--split-srt",
+        error_label="SRT split",
+        done_message="Done! transcript_part files are ready in the folder.",
+        next_message="Double-click 5_AnalyzeHighlights.bat or 6_RunAllSteps.bat to find highlights.",
+    )
 
 def make_analyze_bat(target_folder: Path) -> str:
     """Step 5, the main entry point RunAll uses. Calls the merged analyzer
@@ -800,36 +799,35 @@ def newest_file(paths: Iterable[Path]) -> Path | None:
         return None
     return max(existing_paths, key=lambda path: path.stat().st_mtime)
 
-def find_run_all_file(target_folder: Path, base_name: str, kind: str) -> Path | None:
+def run_all_file_info(target_folder: Path, base_name: str, kind: str) -> tuple[Path | None, str]:
     if kind == "mic_wav":
         exact_path = target_folder / f"{base_name}_mic.wav"
-        return exact_path if exact_path.exists() else newest_file(target_folder.glob("*_mic.wav"))
-    if kind == "raw_srt":
+        candidates = target_folder.glob("*_mic.wav")
+        description = f"{exact_path} or newest *_mic.wav"
+    elif kind == "raw_srt":
         exact_path = target_folder / f"{base_name}_mic.srt"
-        candidates = [path for path in target_folder.glob("*.srt") if not path.stem.casefold().endswith("_fixed")]
-        return exact_path if exact_path.exists() else newest_file(candidates)
-    if kind == "fixed_srt":
+        candidates = (
+            path for path in target_folder.glob("*.srt")
+            if not path.stem.casefold().endswith("_fixed")
+        )
+        description = f"{exact_path} or newest non-fixed *.srt"
+    elif kind == "fixed_srt":
         exact_path = target_folder / f"{base_name}_mic_fixed.srt"
-        return exact_path if exact_path.exists() else newest_file(target_folder.glob("*_fixed.srt"))
-    if kind == "transcript_part":
+        candidates = target_folder.glob("*_fixed.srt")
+        description = f"{exact_path} or newest *_fixed.srt"
+    elif kind == "transcript_part":
         exact_path = target_folder / "transcript_part1.txt"
-        return exact_path if exact_path.exists() else newest_file(target_folder.glob("transcript_part*.txt"))
-    if kind == "highlights_csv":
-        return newest_file(target_folder.glob("top*_highlights.csv"))
-    raise ValueError(f"Unknown run-all file kind: {kind}")
+        candidates = target_folder.glob("transcript_part*.txt")
+        description = f"{exact_path} or newest transcript_part*.txt"
+    elif kind == "highlights_csv":
+        exact_path = None
+        candidates = target_folder.glob("top*_highlights.csv")
+        description = f"{target_folder} / top*_highlights.csv"
+    else:
+        raise ValueError(f"Unknown run-all file kind: {kind}")
 
-def describe_run_all_file(target_folder: Path, base_name: str, kind: str) -> str:
-    if kind == "mic_wav":
-        return f"{target_folder / f'{base_name}_mic.wav'} or newest *_mic.wav"
-    if kind == "raw_srt":
-        return f"{target_folder / f'{base_name}_mic.srt'} or newest non-fixed *.srt"
-    if kind == "fixed_srt":
-        return f"{target_folder / f'{base_name}_mic_fixed.srt'} or newest *_fixed.srt"
-    if kind == "transcript_part":
-        return f"{target_folder / 'transcript_part1.txt'} or newest transcript_part*.txt"
-    if kind == "highlights_csv":
-        return f"{target_folder} / top*_highlights.csv"
-    raise ValueError(f"Unknown run-all file kind: {kind}")
+    path = exact_path if exact_path is not None and exact_path.exists() else newest_file(candidates)
+    return path, description
 
 def gallery_image_paths(gallery_dir: Path = GALLERY_DIR) -> list[Path]:
     if not gallery_dir.exists():
@@ -1018,7 +1016,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             return False
 
         if step.expected_kind is not None:
-            existing_output = find_run_all_file(target_folder, base_name, step.expected_kind)
+            existing_output, _ = run_all_file_info(target_folder, base_name, step.expected_kind)
             if existing_output is not None:
                 events.put(("status", (index, "Skipped")))
                 events.put(("log", f"\n--- {step.label} ---\n"))
@@ -1031,10 +1029,10 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
 
         args: list[str] = []
         if step.input_kind is not None:
-            input_path = find_run_all_file(target_folder, base_name, step.input_kind)
+            input_path, input_description = run_all_file_info(target_folder, base_name, step.input_kind)
             if input_path is None:
                 events.put(("status", (index, "Failed")))
-                events.put(("failed", f"{step.label} could not find input file:\n{describe_run_all_file(target_folder, base_name, step.input_kind)}"))
+                events.put(("failed", f"{step.label} could not find input file:\n{input_description}"))
                 return False
             events.put(("log", f"Using input: {input_path}\n"))
             if step.pass_input:
@@ -1074,10 +1072,12 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             return False
 
         if step.expected_kind is not None:
-            expected_output = find_run_all_file(target_folder, base_name, step.expected_kind)
+            expected_output, expected_description = run_all_file_info(
+                target_folder, base_name, step.expected_kind
+            )
             if expected_output is None:
                 events.put(("status", (index, "Failed")))
-                events.put(("failed", f"{step.label} did not create expected file:\n{describe_run_all_file(target_folder, base_name, step.expected_kind)}"))
+                events.put(("failed", f"{step.label} did not create expected file:\n{expected_description}"))
                 return False
             events.put(("log", f"Found output: {expected_output}\n"))
 
@@ -1134,7 +1134,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         for step in steps:
             if step.expected_kind is None:
                 continue
-            if find_run_all_file(target_folder, base_name, step.expected_kind) is not None:
+            if run_all_file_info(target_folder, base_name, step.expected_kind)[0] is not None:
                 last_done_label = step.label
         return last_done_label
 
@@ -1360,6 +1360,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     action_group.add_argument("--fix-srt", metavar="SRT", help="Fix a Whisper .srt file without splitting it.")
     action_group.add_argument("--split-srt", metavar="SRT", help="Split a fixed .srt file into transcript_part files.")
     action_group.add_argument("--run-all-gui", metavar="FOLDER", help="Open the step 6 GUI runner for an organized VOD folder.")
+    action_group.add_argument("--config", action="store_true", help="Open the model-configuration GUI (configure_models.py) to pick AI models / presets and write them to pipeline_config.py. No video file needed.")
     parser.add_argument("--base-name", help="Video base name for --run-all-gui. Defaults to the folder name.")
     parser.add_argument("--chunk-minutes", type=int, default=DEFAULT_CHUNK_MINUTES, help="Transcript chunk length for --split-srt.")
     parser.add_argument("--no-pause", action="store_true", help="Do not wait for Enter before exiting.")
@@ -1390,6 +1391,12 @@ def main(argv: list[str] | None = None) -> int:
             base_name = args.base_name or target_folder.name
             return run_all_gui(target_folder, base_name)
 
+        if args.config:
+            # Import lazily so a config edit never loads the heavyweight
+            # pipeline imports (requests, the analyze_highlights module,
+            # etc.) - configure_models.py only needs pipeline_config + tkinter.
+            import configure_models
+            return configure_models.run_gui()
         if not args.video_file:
             print("No input file provided. Drag a video file onto this script or pass the path as an argument.")
             return 1

@@ -9,6 +9,9 @@ below can still be overridden per-run via env var without editing this file
 """
 
 import os
+import re
+import subprocess
+from pathlib import Path
 
 
 def _env_int(name, default):
@@ -30,9 +33,9 @@ def _env_bool(name, default):
 # JUDGE_MODEL is separate from MODEL: discovery just reads a transcript chunk
 # and proposes candidates; verify/judge/titling need more careful structured
 # reasoning over shorter, denser prompts.
-# qwen3:8b + qwen3.5:9b-q4_K_M both fit a 10GB 3080 at NUM_CTX below with no
-# CPU offload. qwen3:14b-q4_K_M (previous JUDGE_MODEL) doesn't - ~8.3GB in
-# weights alone before KV cache, which was making things slow.
+# qwen3:8b is the long-context discovery role; qwen3.5:9b-q4_K_M fits a
+# 10GB 3080 as the judge role. qwen3.6:35b-a3b needs partial CPU offload,
+# so its preset uses a smaller JUDGE_NUM_CTX to leave memory for KV cache.
 MODEL = os.environ.get("HIGHLIGHT_MODEL", "qwen3:8b")
 JUDGE_MODEL = os.environ.get("HIGHLIGHT_JUDGE_MODEL", "qwen3.5:9b-q4_K_M")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
@@ -62,11 +65,12 @@ OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
 OLLAMA_SERVE = os.environ.get("OLLAMA_SERVE", "ollama")
 OLLAMA_START_ON_CONNECTION_ERROR = _env_bool("HIGHLIGHT_OLLAMA_START_ON_CONNECTION_ERROR", True)
 OLLAMA_SERVE_READY_TIMEOUT_SECONDS = _env_float("HIGHLIGHT_OLLAMA_SERVE_READY_TIMEOUT_SECONDS", 60)
-# Was 32768 everywhere; at Q4_K_M an 8-9B model's KV cache alone costs ~4-4.5GB
-# at that size - most of a 10GB card's headroom after weights. No prompt here
-# needs it (discovery, the biggest, is ~6-7K tokens; others 1-2K), so 8192
-# leaves margin while freeing VRAM for the model.
-NUM_CTX = _env_int("HIGHLIGHT_NUM_CTX", 8192)
+# Ollama's `options.num_ctx` is sent with each API request, so keep separate
+# budgets for the long transcript discovery prompt and the shorter judge-side
+# prompts. Discovery needs the larger window; qwen3.6's judge preset lowers
+# the judge window to reduce memory pressure.
+DISCOVERY_NUM_CTX = _env_int("HIGHLIGHT_DISCOVERY_NUM_CTX", 8192)
+JUDGE_NUM_CTX = _env_int("HIGHLIGHT_JUDGE_NUM_CTX", 8192)
 
 # --- Output size / selection ------------------------------------------------
 TOP_N = _env_int("HIGHLIGHT_TOP_N", 50)
@@ -115,6 +119,12 @@ VOCAL_ISOLATION_DEVICE = os.environ.get("VOCAL_ISOLATION_DEVICE", "auto")
 # (e.g. 20) via env var to trade a little separation quality at chunk
 # boundaries for bounded memory use.
 VOCAL_ISOLATION_SEGMENT_SECONDS = os.environ.get("VOCAL_ISOLATION_SEGMENT_SECONDS") or None
+# Shared ffmpeg noise gate used by both audio-extraction paths.
+NOISE_GATE_THRESHOLD_DB = _env_int("HIGHLIGHT_NOISE_GATE_THRESHOLD_DB", -35)
+NOISE_GATE_RATIO = _env_int("HIGHLIGHT_NOISE_GATE_RATIO", 8)
+NOISE_GATE_ATTACK_MS = _env_int("HIGHLIGHT_NOISE_GATE_ATTACK_MS", 10)
+NOISE_GATE_RELEASE_MS = _env_int("HIGHLIGHT_NOISE_GATE_RELEASE_MS", 200)
+
 
 # --- Speech-emotion sidecar (existing signal, unchanged) ---------------------
 # EMOTION_LOCAL_MODEL_DIR / _FILE stay in analyze_highlights_emotion.py
@@ -182,3 +192,349 @@ RUN_INFO_FILENAME = "run_info.json"
 # Unlike RUN_INFO_FILENAME, NOT written into the stream folder - see
 # SCRIPT_DIR / record_pipeline_run_history().
 RUN_HISTORY_FILENAME = "pipeline_run_history.csv"
+
+
+# The GUI in configure_models.py reads this registry and writes selected
+# defaults back to the definitions above. Runtime imports stay unchanged.
+#
+# Keeping the registry here gives the GUI one source for fields, labels,
+# presets, and the environment names used by the save-back code.
+
+
+# kind controls the editor shown by the GUI. stage controls grouping.
+# env is the environment variable used by the corresponding definition above.
+# Keep environment names unique.
+EDITABLE_PARAMS = [
+    # --- Models (per-step role assignment) ---
+    {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
+     "label": "Discovery model (MODEL)",
+     "help": "Reads each transcript chunk and proposes highlight candidates. Long context, less careful reasoning."},
+    {"key": "JUDGE_MODEL",      "env": "HIGHLIGHT_JUDGE_MODEL",      "kind": "model", "stage": "Models",
+     "label": "Judge / verify / titling model (JUDGE_MODEL)",
+     "help": "Verify, judge ranking, and audio-scan titling. Shorter prompts, careful structured output. Must support /api/chat with think:false (the qwen3.5 family does)."},
+    # --- Ollama connection / generation budget ---
+    {"key": "DISCOVERY_NUM_CTX", "env": "HIGHLIGHT_DISCOVERY_NUM_CTX", "kind": "int", "stage": "Ollama",
+     "label": "Discovery context window (DISCOVERY_NUM_CTX, tokens)",
+     "help": "Max prompt+output tokens for each full transcript discovery request. This is sent as API options.num_ctx; larger values preserve more transcript context but use more KV-cache VRAM."},
+    {"key": "JUDGE_NUM_CTX",     "env": "HIGHLIGHT_JUDGE_NUM_CTX",     "kind": "int", "stage": "Ollama",
+     "label": "Judge context window (JUDGE_NUM_CTX, tokens)",
+     "help": "Max prompt+output tokens for audio titling, verification, and final judging. Keep lower for qwen3.6:35b-a3b to reduce CPU/GPU memory pressure."},
+    {"key": "VERIFY_NUM_PREDICT","env": "HIGHLIGHT_VERIFY_NUM_PREDICT","kind": "int",  "stage": "Ollama",
+     "label": "Verify max output tokens (VERIFY_NUM_PREDICT)",
+     "help": "Per verify batch. If you see '0 coverage' warnings, raise this - the model is running out of output budget before reaching the PASS/FAIL lines."},
+    {"key": "AUDIO_SCAN_TITLE_NUM_PREDICT","env":"AUDIO_SCAN_TITLE_NUM_PREDICT","kind":"int","stage":"Ollama",
+     "label": "Audio-scan titling max output tokens (AUDIO_SCAN_TITLE_NUM_PREDICT)",
+     "help": "Per titling batch. Raise if audio-scan titles come back empty."},
+    {"key": "OLLAMA_RETRIES",   "env": "OLLAMA_RETRIES",             "kind": "int",   "stage": "Ollama",
+     "label": "Ollama retries on failure (OLLAMA_RETRIES)",
+     "help": "Linear backoff between retries; transient failures no longer silently drop coverage."},
+    {"key": "OLLAMA_RETRY_BACKOFF_SECONDS","env":"OLLAMA_RETRY_BACKOFF_SECONDS","kind":"float","stage":"Ollama",
+     "label": "Ollama retry backoff seconds (OLLAMA_RETRY_BACKOFF_SECONDS)",
+     "help": "Seconds between retries."},
+    {"key": "OLLAMA_START_ON_CONNECTION_ERROR","env":"HIGHLIGHT_OLLAMA_START_ON_CONNECTION_ERROR","kind":"bool","stage":"Ollama",
+     "label": "Auto-start local Ollama on connection failure",
+     "help": "If a call can't reach Ollama, spawn `ollama serve` (local host only) and retry after it responds to /api/version."},
+    {"key": "OLLAMA_SERVE_READY_TIMEOUT_SECONDS","env":"HIGHLIGHT_OLLAMA_SERVE_READY_TIMEOUT_SECONDS","kind":"float","stage":"Ollama",
+     "label": "Ollama serve readiness timeout (seconds)",
+     "help": "How long to wait for a freshly spawned `ollama serve` to accept connections."},
+    # --- Selection / counts ---
+    {"key": "TOP_N",            "env": "HIGHLIGHT_TOP_N",           "kind": "int",   "stage": "Selection",
+     "label": "Final highlights to export (TOP_N)",
+     "help": "Number of rows in the CSV and markers in the EDL."},
+    {"key": "JUDGE_POOL_SIZE",  "env": "HIGHLIGHT_JUDGE_POOL_SIZE",  "kind": "int",   "stage": "Selection",
+     "label": "Judge pool size (JUDGE_POOL_SIZE)",
+     "help": "Only this many top-scored candidates reach the judge. Larger = more judging calls."},
+    {"key": "VERIFY_POOL_SIZE", "env": "HIGHLIGHT_VERIFY_POOL_SIZE", "kind": "int",   "stage": "Selection",
+     "label": "Verify pool size (VERIFY_POOL_SIZE)",
+     "help": "Candidates trimmed to this before verification. Defaults to 1.5x the judge pool."},
+    {"key": "VERIFY_BATCH_SIZE","env": "HIGHLIGHT_VERIFY_BATCH_SIZE","kind": "int",   "stage": "Selection",
+     "label": "Verify batch size (VERIFY_BATCH_SIZE)",
+     "help": "Candidates per verify LLM call."},
+    {"key": "VERIFY_MIN_COVERAGE_RATIO","env":"HIGHLIGHT_VERIFY_MIN_COVERAGE_RATIO","kind":"float","stage":"Selection",
+     "label": "Min verify coverage ratio (VERIFY_MIN_COVERAGE_RATIO)",
+     "help": "If parsed-verdicts/items-sent drops below this, verify is untrusted and NOT checkpointed."},
+    {"key": "JUDGE_BATCH_SIZE", "env": "HIGHLIGHT_JUDGE_BATCH_SIZE", "kind": "int",   "stage": "Selection",
+     "label": "Judge batch size (JUDGE_BATCH_SIZE)",
+     "help": "Candidates per judge LLM call. The judge ranks them comparatively within the batch."},
+    {"key": "TIMESTAMP_TOLERANCE_SECONDS","env":"HIGHLIGHT_TIMESTAMP_TOLERANCE_SECONDS","kind":"int","stage":"Selection",
+     "label": "Anti-hallucination timestamp tolerance (seconds)",
+     "help": "Max seconds between a candidate's claimed timestamp and the nearest real transcript timestamp; beyond this it's dropped as hallucinated."},
+    # --- Vocal isolation ---
+    {"key": "VOCAL_ISOLATION_SEGMENT_SECONDS","env":"VOCAL_ISOLATION_SEGMENT_SECONDS","kind":"text","stage":"Vocal isolation",
+     "label": "Demucs segment seconds (VOCAL_ISOLATION_SEGMENT_SECONDS)",
+     "help": "Demucs processes audio in windows this many seconds long. Set to 20 if a long VOD OOMs in Demucs on a 10GB card; empty/0 = whole-file (slightly cleaner boundaries)."},
+    # --- Audio cleanup ---
+    {"key": "NOISE_GATE_THRESHOLD_DB", "env": "HIGHLIGHT_NOISE_GATE_THRESHOLD_DB", "kind": "int", "stage": "Audio cleanup",
+     "label": "Noise-gate threshold (dB)",
+     "help": "Audio below this level is attenuated before transcription. Raise it to suppress more room noise; lower it to preserve quiet speech."},
+    {"key": "NOISE_GATE_RATIO", "env": "HIGHLIGHT_NOISE_GATE_RATIO", "kind": "int", "stage": "Audio cleanup",
+     "label": "Noise-gate ratio",
+     "help": "How strongly the gate attenuates audio below the threshold."},
+    {"key": "NOISE_GATE_ATTACK_MS", "env": "HIGHLIGHT_NOISE_GATE_ATTACK_MS", "kind": "int", "stage": "Audio cleanup",
+     "label": "Noise-gate attack (ms)",
+     "help": "How quickly the gate closes when the signal drops below the threshold."},
+    {"key": "NOISE_GATE_RELEASE_MS", "env": "HIGHLIGHT_NOISE_GATE_RELEASE_MS", "kind": "int", "stage": "Audio cleanup",
+     "label": "Noise-gate release (ms)",
+     "help": "How quickly the gate reopens when speech resumes."},
+
+    # --- Emotion sidecar ---
+    {"key": "EMOTION_MAX_CANDIDATES","env":"EMOTION_MAX_CANDIDATES","kind":"int","stage":"Emotion",
+     "label": "Max emotion-scored candidates (EMOTION_MAX_CANDIDATES)",
+     "help": "Caps the expensive emotion-model pass on long VODs."},
+    {"key": "EMOTION_BATCH_SIZE", "env": "EMOTION_BATCH_SIZE", "kind": "int", "stage": "Emotion",
+     "label": "Emotion batch size (EMOTION_BATCH_SIZE)",
+     "help": "Candidates per emotion model forward pass."},
+    {"key": "EMOTION_ENABLED",  "env": "DISABLE_EMOTION_SCORING",   "kind": "bool",  "stage": "Emotion",
+     "label": "Enable speech-emotion scoring (EMOTION_ENABLED)",
+     "help": "When ON, boosts candidates with angry/happy/surprised speech. The env var is inverted (DISABLE_EMOTION_SCORING)."},
+    # --- Audio scan ---
+    {"key": "AUDIO_SCAN_ENABLED","env":"AUDIO_SCAN_ENABLED","kind":"bool","stage":"Audio scan",
+     "label": "Enable model-free audio scan (AUDIO_SCAN_ENABLED)",
+     "help": "DSP loudness/rate scan for wordless-reaction candidates that transcript discovery can't find."},
+    {"key": "AUDIO_SCAN_MAX_CANDIDATES","env":"AUDIO_SCAN_MAX_CANDIDATES","kind":"int","stage":"Audio scan",
+     "label": "Max audio-scan candidates (AUDIO_SCAN_MAX_CANDIDATES)",
+     "help": "Caps DSP peaks promoted to real titled+emotion-scored candidates."},
+    {"key": "AUDIO_SCAN_TITLE_BATCH_SIZE","env":"AUDIO_SCAN_TITLE_BATCH_SIZE","kind":"int","stage":"Audio scan",
+     "label": "Audio-scan titling batch size",
+     "help": "Peaks titled per LLM call."},
+]
+
+
+# Presets target an RTX 3080 with 10GB VRAM and 32GB system RAM.
+#
+# The 35B qwen3.6 model is larger than the card, so Ollama must offload part
+# of it to system memory. Its preset lowers JUDGE_NUM_CTX and uses larger
+# output budgets for the structured verify/judge responses. Discovery stays on
+# qwen3:8b with its own DISCOVERY_NUM_CTX.
+PRESETS = {
+    "3080 10GB - qwen3.6:35b-a3b (judge) + qwen3:8b (discovery)": {
+        "name_short": "qwen3.6:35b-a3b",
+        "description": ("Judge/verify/titling on qwen3.6:35b-a3b (slow; partial CPU "
+                        "offload), discovery on MODEL (qwen3:8b). For RTX 3080 "
+                        "10GB + 32GB DDR4. Better ranking; expect longer per-call "
+                        "latency from the judge/verify stages."),
+        "values": {
+            "MODEL":                       "qwen3:8b",
+            "JUDGE_MODEL":                 "qwen3.6:35b-a3b",
+            "DISCOVERY_NUM_CTX":            8192,
+            "JUDGE_NUM_CTX":                 6144,
+            "VERIFY_NUM_PREDICT":          2200,
+            "AUDIO_SCAN_TITLE_NUM_PREDICT":1800,
+            "OLLAMA_RETRIES":              3,
+            "OLLAMA_RETRY_BACKOFF_SECONDS":8.0,
+            "OLLAMA_START_ON_CONNECTION_ERROR": True,
+            "OLLAMA_SERVE_READY_TIMEOUT_SECONDS": 90.0,
+            "TOP_N":                       50,
+            "JUDGE_POOL_SIZE":             100,
+            "VERIFY_POOL_SIZE":           150,
+            "VERIFY_BATCH_SIZE":           8,
+            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
+            "JUDGE_BATCH_SIZE":           10,
+            "TIMESTAMP_TOLERANCE_SECONDS": 15,
+            "VOCAL_ISOLATION_SEGMENT_SECONDS": 20,
+            "NOISE_GATE_THRESHOLD_DB":   -35,
+            "NOISE_GATE_RATIO":             8,
+            "NOISE_GATE_ATTACK_MS":        10,
+            "NOISE_GATE_RELEASE_MS":       200,
+
+            "EMOTION_MAX_CANDIDATES":      200,
+            "EMOTION_BATCH_SIZE":          2,
+            "EMOTION_ENABLED":             True,
+            "AUDIO_SCAN_ENABLED":          True,
+            "AUDIO_SCAN_MAX_CANDIDATES":  100,
+            "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
+            "EXPORT_PREVIEW_CLIPS":       False,
+            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
+            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
+        },
+    },
+    "3080 10GB - qwen3.5:9b-q4_K_M (judge) + qwen3:8b (discovery)": {
+        "name_short": "qwen3.5:9b-q4_K_M",
+        "description": ("Judge/verify/titling on qwen3.5:9b-q4_K_M (fast, fully "
+                        "resident in 10GB), discovery on qwen3:8b. For RTX 3080 "
+                        "10GB + 32GB DDR4. The balanced default; judge in ~4-6s "
+                        "per batch."),
+        "values": {
+            "MODEL":                       "qwen3:8b",
+            "JUDGE_MODEL":                 "qwen3.5:9b-q4_K_M",
+            "DISCOVERY_NUM_CTX":            8192,
+            "JUDGE_NUM_CTX":                 8192,
+            "VERIFY_NUM_PREDICT":          1500,
+            "AUDIO_SCAN_TITLE_NUM_PREDICT":1200,
+            "OLLAMA_RETRIES":              2,
+            "OLLAMA_RETRY_BACKOFF_SECONDS":5.0,
+            "OLLAMA_START_ON_CONNECTION_ERROR": True,
+            "OLLAMA_SERVE_READY_TIMEOUT_SECONDS": 60.0,
+            "TOP_N":                       50,
+            "JUDGE_POOL_SIZE":             100,
+            "VERIFY_POOL_SIZE":           150,
+            "VERIFY_BATCH_SIZE":          10,
+            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
+            "JUDGE_BATCH_SIZE":           20,
+            "TIMESTAMP_TOLERANCE_SECONDS": 15,
+            "VOCAL_ISOLATION_SEGMENT_SECONDS": 20,
+            "NOISE_GATE_THRESHOLD_DB":   -35,
+            "NOISE_GATE_RATIO":             8,
+            "NOISE_GATE_ATTACK_MS":        10,
+            "NOISE_GATE_RELEASE_MS":       200,
+            "EMOTION_MAX_CANDIDATES":      250,
+            "EMOTION_BATCH_SIZE":          4,
+            "EMOTION_ENABLED":             True,
+            "AUDIO_SCAN_ENABLED":          True,
+            "AUDIO_SCAN_MAX_CANDIDATES":  120,
+            "AUDIO_SCAN_TITLE_BATCH_SIZE":10,
+            "EXPORT_PREVIEW_CLIPS":       False,
+            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
+            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
+        },
+    },
+}
+
+
+# --- Model detection ---------------------------------------------------------
+def list_ollama_models() -> tuple[list[str], str | None]:
+    """Return installed model names and an optional warning."""
+    try:
+        proc = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=20)
+    except FileNotFoundError:
+        return [], "ollama is not on PATH - install it from https://ollama.com/download, then `ollama pull <model>`."
+    except Exception as exc:
+        return [], f"couldn't run `ollama list`: {exc}"
+    if proc.returncode != 0:
+        return [], f"`ollama list` exited {proc.returncode}: {proc.stderr.strip()}"
+    names: list[str] = []
+    for line in proc.stdout.splitlines()[1:]:  # skip the "NAME ID SIZE MODIFIED" header
+        line = line.strip()
+        if not line:
+            continue
+        name = line.split()[0]
+        if name:
+            names.append(name)
+    return names, None
+
+
+# --- Save-back ---------------------------------------------------------------
+# Rewrite only the default literal on definitions listed in EDITABLE_PARAMS.
+# The source file is replaced atomically so a failed write cannot leave a
+# partial configuration behind.
+def _coerce_for_write(kind: str, value):
+    """Return the source literal for a registry value."""
+    if kind == "bool":
+        return "True" if value else "False"
+    if kind == "int":
+        return str(int(value)) if value not in (None, "") else "0"
+    if kind == "float":
+        return repr(float(value)) if value not in (None, "") else "0.0"
+    if kind == "model":
+        return f'"{value}"'
+    if value in (None, ""):
+        return "None"
+    return f'"{value}"'
+
+
+def apply_config_values(values: dict, file_path: str | None = None) -> tuple[bool, str]:
+    """Write the supplied defaults to the config file.
+
+    Only keys present in ``values`` are changed. The two definitions that do
+    not use the standard helper-call form are handled separately below.
+    """
+    path = Path(file_path) if file_path else Path(__file__).resolve()
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines(keepends=True)
+    changed = 0
+    touched: set[str] = set()
+
+    env_to_param = {param["env"]: param for param in EDITABLE_PARAMS}
+    keys_in_values = set(values.keys())
+
+    helper_alt = r'(?:os\.environ\.get|_env_int|_env_float|_env_bool)'
+    nested_default = r'[^()]*(?:\([^()]*\)[^()]*)*'
+    lhs_pat = re.compile(r'^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)')
+    helper_pat = re.compile(
+        r'(' + helper_alt + r'\(\s*"([^"]+)"\s*,\s*)(' + nested_default + r')(\))'
+    )
+    editable_keys = {param["key"] for param in EDITABLE_PARAMS}
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+
+        # These definitions do not use the standard helper-call form.
+        if stripped.startswith("EMOTION_ENABLED =") and "EMOTION_ENABLED" in keys_in_values:
+            new_val = "True" if values.get("EMOTION_ENABLED") else "False"
+            match = re.match(r'^(\s*EMOTION_ENABLED\s*=\s*).*?(\r?\n)$', line)
+            if match:
+                new_line = f'{match.group(1)}{new_val}{match.group(2)}'
+                if new_line != line:
+                    lines[i] = new_line
+                    changed += 1
+                touched.add("EMOTION_ENABLED")
+            continue
+
+        if stripped.startswith("VOCAL_ISOLATION_SEGMENT_SECONDS =") and "VOCAL_ISOLATION_SEGMENT_SECONDS" in keys_in_values:
+            raw_value = values.get("VOCAL_ISOLATION_SEGMENT_SECONDS", "")
+            text = raw_value.strip() if isinstance(raw_value, str) else str(raw_value).strip()
+            literal = "None" if text in ("", "0", "None", "none") else f'"{text}"'
+            match = re.match(
+                r'^(\s*VOCAL_ISOLATION_SEGMENT_SECONDS\s*=\s*).*?(\r?\n)?$',
+                line,
+            )
+            if match:
+                new_line = (
+                    f'{match.group(1)}os.environ.get("VOCAL_ISOLATION_SEGMENT_SECONDS") '
+                    f'or {literal}{match.group(2)}'
+                )
+                if new_line != line:
+                    lines[i] = new_line
+                    changed += 1
+                touched.add("VOCAL_ISOLATION_SEGMENT_SECONDS")
+            continue
+
+        # The helper call may be wrapped in another expression.
+        assignment = lhs_pat.match(line)
+        if not assignment:
+            continue
+        var_name = assignment.group(2)
+        if var_name not in editable_keys:
+            continue
+        if var_name not in keys_in_values:
+            continue
+        helper_match = helper_pat.search(line, assignment.end())
+        if not helper_match:
+            continue
+        call_prefix, env_name, _, close_paren = helper_match.groups()
+        param = env_to_param.get(env_name)
+        if param is None or param["key"] != var_name:
+            continue
+        new_literal = _coerce_for_write(param["kind"], values.get(param["key"]))
+        new_line = (
+            line[:helper_match.start()]
+            + call_prefix
+            + new_literal
+            + close_paren
+            + line[helper_match.end():]
+        )
+        if new_line != line:
+            lines[i] = new_line
+            changed += 1
+        touched.add(param["key"])
+
+    # Report params the caller asked for but we couldn't find a line for.
+    requested = keys_in_values & {param["key"] for param in EDITABLE_PARAMS}
+    skipped = sorted(requested - touched)
+
+    if changed == 0:
+        if not requested:
+            return True, "Nothing to do - no editable params in the request."
+        if not touched:
+            return False, f"Couldn't rewrite any of {len(skipped)} parameter(s): {', '.join(skipped)}. The config file structure may have changed."
+        return True, "No changes needed - values already match the file."
+
+    new_source = "".join(lines)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(new_source, encoding="utf-8")
+    os.replace(temp_path, path)
+    skipped_text = f" Skipped ({len(skipped)}): {', '.join(skipped)}." if skipped else ""
+    return True, f"Updated {changed} parameter(s) in {path.name}.{skipped_text}"
+

@@ -66,7 +66,7 @@ from datetime import datetime
 from pathlib import Path
 
 from pipeline_config import (
-    MODEL, JUDGE_MODEL, NUM_CTX, OLLAMA_URL, OLLAMA_CHAT_URL,
+    MODEL, JUDGE_MODEL, DISCOVERY_NUM_CTX, JUDGE_NUM_CTX, OLLAMA_URL, OLLAMA_CHAT_URL,
     OLLAMA_RETRIES, OLLAMA_RETRY_BACKOFF_SECONDS,
     OLLAMA_SERVE, OLLAMA_START_ON_CONNECTION_ERROR,
     OLLAMA_SERVE_READY_TIMEOUT_SECONDS,
@@ -122,17 +122,16 @@ def checkpoint_path(stream_folder, name):
 def checkpoint_exists(stream_folder, name):
     return os.path.exists(checkpoint_path(stream_folder, name))
 
-def save_checkpoint(stream_folder, name, data):
-    """Atomic write: build the file fully as a .tmp, then os.replace() it
-    into place. os.replace is atomic on both Windows and POSIX, so a
-    process killed mid-write (e.g. the GUI Stop button) can never leave a
-    half-written, corrupt checkpoint behind - either the old file is still
-    there, or the fully-written new one is."""
-    path = checkpoint_path(stream_folder, name)
+def _write_json_atomically(path, data):
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, path)
+
+def save_checkpoint(stream_folder, name, data):
+    """Save a stage checkpoint without exposing a partially-written JSON file."""
+    path = checkpoint_path(stream_folder, name)
+    _write_json_atomically(path, data)
     return path
 
 def load_checkpoint(stream_folder, name):
@@ -216,11 +215,7 @@ def load_pipeline_stats(stream_folder):
     }
 
 def save_pipeline_stats(stream_folder, stats):
-    path = os.path.join(stream_folder, "pipeline_stats.json")
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2)
-    os.replace(tmp_path, path)
+    _write_json_atomically(os.path.join(stream_folder, "pipeline_stats.json"), stats)
 
 def record_stage_stats(stream_folder, stage_name, stage_seconds):
     """Call at the end of every stage that finishes successfully: folds this
@@ -1070,7 +1065,7 @@ STRICT OUTPUT FORMAT:
             "stream": False,
             "options": {
                 "temperature": 0,
-                "num_ctx": NUM_CTX,
+                "num_ctx": JUDGE_NUM_CTX,
                 "num_predict": AUDIO_SCAN_TITLE_NUM_PREDICT,
             },
         }
@@ -1321,7 +1316,7 @@ def run_discovery(stream_folder, parts, prompts):
                     "stream": False,
                     "options": {
                         "temperature": 0,
-                        "num_ctx": NUM_CTX
+                        "num_ctx": DISCOVERY_NUM_CTX
                     }
                 }
 
@@ -1515,7 +1510,7 @@ def verify_candidates(highlights, transcript_blocks_by_part, verify_prompt_heade
             "stream": False,
             "options": {
                 "temperature": 0,
-                "num_ctx": NUM_CTX,
+                "num_ctx": JUDGE_NUM_CTX,
                 "num_predict": VERIFY_NUM_PREDICT
             }
         }
@@ -1604,7 +1599,7 @@ def run_judge_batch(pool, keep_n, judge_instructions):
         "stream": False,
         "options": {
             "temperature": 0,
-            "num_ctx": NUM_CTX,
+            "num_ctx": JUDGE_NUM_CTX,
             "num_predict": 3000
         }
     }
@@ -1833,6 +1828,8 @@ def write_run_info(stream_folder, final_highlights):
         "stream_folder": stream_folder,
         "model": MODEL,
         "judge_model": JUDGE_MODEL,
+        "discovery_num_ctx": DISCOVERY_NUM_CTX,
+        "judge_num_ctx": JUDGE_NUM_CTX,
         "top_n": TOP_N,
         "judge_pool_size": JUDGE_POOL_SIZE,
         "verify_pool_size": VERIFY_POOL_SIZE,
