@@ -39,6 +39,7 @@ Usage:
 # script just crashing on import with a SyntaxError/TypeError.
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -180,12 +181,152 @@ def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str], Pa
     return models_dir, missing, whisper_cli_path
 
 
+def remote_file_size(url: str) -> int | None:
+    """Best-effort HEAD request for the origin's content-length in bytes.
+
+    Hugging Face resolve URLs redirect to object storage, so redirects must
+    be followed before reading Content-Length; otherwise this would measure
+    the tiny redirect response body instead of the model.
+    Returns None when the server doesn't answer or reports no length, so
+    callers can't verify and keep the existing file -- never a false
+    "re-download" from a broken HEAD.
+    """
+    try:
+        with requests.head(url, allow_redirects=True, timeout=60) as r:
+            if 200 <= r.status_code < 300:
+                cl = r.headers.get("content-length")
+                if cl and cl.isdigit():
+                    return int(cl)
+    except Exception:
+        pass
+    return None
+
+
+_PINNED_SHA256 = {
+    # GitHub release assets are immutable: the digest is published by the
+    # GitHub API (releases/tags/v1.7.6 -> assets[].digest) and can never
+    # change for this tag. Verified 2026-08-11.
+    "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip":
+        "3fc4d3ebd9a678313de50c04d9e59c43117ae190f0cb7bff602d4aeefc4efe3d",
+}
+
+_HF_SHA_CACHE: dict[tuple[str, str], dict[str, str]] = {}
+
+
+def origin_sha256(url: str) -> str | None:
+    """The origin's SHA-256 for a file URL, when the source publishes one.
+
+    - huggingface.co resolve URLs: the repo tree API reports the LFS oid
+      (a real sha256) per file; the response is cached per repo/revision so
+      one API call serves every file of that repo. Small non-LFS files
+      (e.g. config.json) have no sha256 and return None.
+    - Pinned immutable GitHub release assets are known upfront in
+      _PINNED_SHA256.
+    - Any other origin returns None, and the caller falls back to the
+      Content-Length check only.
+    """
+    pinned = _PINNED_SHA256.get(url)
+    if pinned is not None:
+        return pinned
+    m = re.match(r"https://huggingface\.co/([^/]+)/([^/]+)/resolve/([^/]+)/(.+)$", url)
+    if not m:
+        return None
+    repo, rev, path = f"{m.group(1)}/{m.group(2)}", m.group(3), m.group(4)
+    key = (repo, rev)
+    if key not in _HF_SHA_CACHE:
+        try:
+            r = requests.get(
+                f"https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true",
+                timeout=60,
+            )
+            r.raise_for_status()
+            tree = {}
+            for entry in r.json():
+                lfs = entry.get("lfs") or {}
+                oid = lfs.get("oid", "")
+                if len(oid) == 64:
+                    tree[entry["path"]] = oid
+            _HF_SHA_CACHE[key] = tree
+        except Exception:
+            _HF_SHA_CACHE[key] = {}
+    return _HF_SHA_CACHE[key].get(path)
+
+
+def sha256_file(path: Path) -> str:
+    """Full-file SHA-256 hex digest (chunked; a 3 GB model takes a few seconds)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _download_to_temp(url: str, temp_path: Path, reporter: Reporter) -> None:
+    """Download one file to a temp path and verify its published size/hash."""
+    with requests.get(url, stream=True, timeout=300) as response:
+        response.raise_for_status()
+        content_length = response.headers.get("content-length")
+        total = int(content_length) if content_length and content_length.isdigit() else 0
+        if total == 0:
+            total = remote_file_size(url) or 0
+
+        downloaded = 0
+        with open(temp_path, "wb") as output:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                output.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    percent = downloaded * 100 // total
+                    if percent % 10 == 0:
+                        reporter.log(
+                            f"    {percent}% ({downloaded // (1024 * 1024)}MB / "
+                            f"{total // (1024 * 1024)}MB)"
+                        )
+
+    if total > 0 and downloaded != total:
+        raise IOError(f"download truncated: got {downloaded} bytes, expected {total}")
+
+    expected_hash = origin_sha256(url)
+    if expected_hash is not None:
+        actual_hash = sha256_file(temp_path)
+        if actual_hash != expected_hash:
+            raise IOError(
+                f"checksum mismatch: got {actual_hash[:12]}..., "
+                f"expected {expected_hash[:12]}..."
+            )
+        reporter.log(f"    sha256 verified ({expected_hash[:12]}...)")
+
+
 def download_file(url: str, dest_path: Path, reporter: Reporter, description: str) -> bool:
-    """Stream download with progress, skip-if-exists, atomic rename via temp file."""
+    """Stream download with progress, skip-if-exists, atomic rename via temp file.
+
+    Skip-if-exists is not blind: the origin's content-length (HEAD) is
+    compared against the local file, and a mismatched size re-downloads
+    instead of trusting a truncated/partial file as complete. When the
+    origin publishes a SHA-256 (HF LFS / pinned GitHub asset), the local
+    file must match it too. Fresh downloads are likewise rejected (temp
+    deleted) when the received byte count doesn't match the announced
+    length or the bytes don't match the origin's sha256, so a bad
+    first download can't be renamed over the destination.
+    """
     if dest_path.is_file():
-        reporter.log(f"  [OK]     {description} already exists at {dest_path}")
-        reporter.status(description, "Already downloaded")
-        return True
+        local_size = dest_path.stat().st_size
+        size_expected = remote_file_size(url)
+        size_ok = size_expected is None or local_size == size_expected
+        hash_expected = origin_sha256(url)
+        hash_ok = hash_expected is None or sha256_file(dest_path) == hash_expected
+        if size_ok and hash_ok:
+            verified = " (sha256 verified)" if hash_expected is not None else ""
+            reporter.log(f"  [OK]     {description} already exists at {dest_path}{verified}")
+            reporter.status(description, "Already downloaded")
+            return True
+        reasons = []
+        if not size_ok:
+            reasons.append(f"size {local_size} != expected {size_expected}")
+        if not hash_ok:
+            reasons.append("sha256 mismatch")
+        reporter.log(f"  [WARN]   {description} exists but {'; '.join(reasons)}, re-downloading")
 
     reporter.log(f"  [INFO]   Downloading {description}...")
     reporter.status(description, "Downloading...")
@@ -193,19 +334,7 @@ def download_file(url: str, dest_path: Path, reporter: Reporter, description: st
 
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
     try:
-        with requests.get(url, stream=True, timeout=300) as r:
-            r.raise_for_status()
-            total = int(r.headers.get('content-length', 0))
-            downloaded = 0
-            with open(tmp_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = downloaded * 100 // total
-                            if pct % 10 == 0:
-                                reporter.log(f"    {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+        _download_to_temp(url, tmp_path, reporter)
         tmp_path.replace(dest_path)
         reporter.log(f"  [OK]     {description} downloaded to {dest_path}")
         reporter.status(description, "Downloaded")
@@ -265,19 +394,7 @@ def download_whisper_cpp_cublas(models_dir: Path, reporter: Reporter) -> bool:
     url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip"
     tmp_zip = models_dir / "whisper-cublas.zip.tmp"
     try:
-        with requests.get(url, stream=True, timeout=300) as r:
-            r.raise_for_status()
-            total = int(r.headers.get('content-length', 0))
-            downloaded = 0
-            with open(tmp_zip, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = downloaded * 100 // total
-                            if pct % 10 == 0:
-                                reporter.log(f"    {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+        _download_to_temp(url, tmp_zip, reporter)
 
         reporter.log(f"  [INFO]   Extracting whisper.cpp release...")
         import shutil

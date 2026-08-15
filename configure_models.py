@@ -13,6 +13,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pipeline_config as cfg  # noqa: E402
+_MODEL_PARAM_KEYS = ("MODEL", "JUDGE_MODEL")
+
+
+def _matching_preset_name(model_values: dict, presets: dict) -> str | None:
+    """Return the preset whose discovery and judge models are selected."""
+    for name, preset in presets.items():
+        preset_values = preset.get("values", {})
+        if all(model_values.get(key) == preset_values.get(key) for key in _MODEL_PARAM_KEYS):
+            return name
+    return None
 
 
 def _current_values() -> dict:
@@ -48,8 +58,14 @@ def run_gui() -> int:
     style.map("Accent.TButton", background=[("active", "#357a55")])
 
     var_state: dict[str, tk.Variable] = {}
+    phrase_editors: dict[str, tk.Text] = {}
     installed_models: list[str] = []
     config_path = Path(cfg.__file__).resolve()
+
+    def phrase_text(value) -> str:
+        if isinstance(value, (list, tuple)):
+            return "\n".join(str(item) for item in value)
+        return "" if value is None else str(value)
 
     def make_var(param: dict, value) -> tk.Variable:
         kind = param["kind"]
@@ -67,20 +83,42 @@ def run_gui() -> int:
             except (TypeError, ValueError):
                 value = 0.0
             variable = tk.DoubleVar(value=value)
+        elif kind == "phrases":
+            variable = tk.StringVar(value=phrase_text(value))
         else:
             variable = tk.StringVar(value="" if value is None else str(value))
         return variable
 
     def init_state_from(values: dict) -> None:
-        var_state.clear()
         for param in cfg.EDITABLE_PARAMS:
             key = param["key"]
-            var_state[key] = make_var(param, values.get(key))
+            if param["kind"] == "phrases" and key in phrase_editors:
+                editor = phrase_editors[key]
+                editor.delete("1.0", "end")
+                editor.insert("1.0", phrase_text(values.get(key)))
+                continue
+
+            value_var = make_var(param, values.get(key))
+            if key in var_state:
+                var_state[key].set(value_var.get())
+            else:
+                var_state[key] = value_var
+
+    def set_state_value(key: str, value) -> None:
+        editor = phrase_editors.get(key)
+        if editor is not None:
+            editor.delete("1.0", "end")
+            editor.insert("1.0", phrase_text(value))
+        else:
+            var_state[key].set(value)
 
     def collect_state() -> dict:
         values: dict = {}
         for param in cfg.EDITABLE_PARAMS:
             key = param["key"]
+            if param["kind"] == "phrases":
+                values[key] = phrase_editors[key].get("1.0", "end-1c")
+                continue
             variable = var_state[key]
             if param["kind"] == "bool":
                 values[key] = bool(variable.get())
@@ -128,7 +166,12 @@ def run_gui() -> int:
     models_status_var = tk.StringVar(value="Click 'Scan models' to detect installed Ollama models.")
 
     model_combos: dict[str, list[ttk.Combobox]] = {}
-    model_params = [param for param in cfg.EDITABLE_PARAMS if param["kind"] == "model"]
+    model_params = [
+        param
+        for key in _MODEL_PARAM_KEYS
+        for param in cfg.EDITABLE_PARAMS
+        if param["key"] == key and param["kind"] == "model"
+    ]
     for param in model_params:
         row_frame = ttk.Frame(top)
         row_frame.pack(fill="x", pady=2)
@@ -166,6 +209,12 @@ def run_gui() -> int:
     )
     preset_cb.pack(side="left", padx=(6, 6))
 
+    def sync_preset_to_models(*_args) -> None:
+        model_values = {key: var_state[key].get() for key in _MODEL_PARAM_KEYS}
+        matching = _matching_preset_name(model_values, cfg.PRESETS)
+        preset_var.set(matching or "")
+
+
     def apply_preset() -> None:
         name = preset_var.get()
         if not name:
@@ -176,9 +225,10 @@ def run_gui() -> int:
             return
         values = cfg.PRESETS[name].get("values", {})
         for key, value in values.items():
-            if key in var_state:
-                var_state[key].set(value)
+            if key in var_state or key in phrase_editors:
+                set_state_value(key, value)
         preset = cfg.PRESETS[name]
+        sync_preset_to_models()
         log(f"Loaded preset '{preset.get('name_short', name)}' into the form.")
         log(preset.get("description", ""))
         log("Review the values, then click Save.")
@@ -189,8 +239,12 @@ def run_gui() -> int:
         style="Accent.TButton",
         command=apply_preset,
     ).pack(side="left", padx=(0, 6))
-    if preset_names:
-        preset_cb.current(0)
+    for key in _MODEL_PARAM_KEYS:
+        var_state[key].trace_add("write", sync_preset_to_models)
+    preset_cb.bind("<<ComboboxSelected>>", lambda _event: apply_preset())
+    sync_preset_to_models()
+    if not preset_names:
+        preset_var.set("")
 
     middle_container = ttk.Frame(root, padding=(12, 4, 12, 4))
     middle_container.pack(fill="both", expand=True)
@@ -237,9 +291,27 @@ def run_gui() -> int:
                     width=28,
                 )
                 model_combos.setdefault(param["key"], []).append(widget)
+            elif kind == "phrases":
+                widget = tk.Text(
+                    section,
+                    height=8,
+                    width=58,
+                    wrap="word",
+                    bg="#1e1e1e",
+                    fg="#f2f2f2",
+                    insertbackground="#f2f2f2",
+                    relief="flat",
+                )
+                widget.insert("1.0", var_state[param["key"]].get())
+                phrase_editors[param["key"]] = widget
             else:
                 widget = ttk.Entry(section, textvariable=var_state[param["key"]], width=14)
-            widget.grid(row=row, column=1, sticky="w", pady=(2, 0))
+            widget.grid(
+                row=row,
+                column=1,
+                sticky="ew" if kind == "phrases" else "w",
+                pady=(2, 0),
+            )
             ttk.Label(section, text=param["help"], foreground="#8a8a8a", wraplength=720).grid(
                 row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 4)
             )
@@ -320,6 +392,7 @@ def run_gui() -> int:
     def do_revert() -> None:
         importlib.reload(cfg)
         init_state_from(_current_values())
+        sync_preset_to_models()
         log("Reverted to the values currently in pipeline_config.py.")
 
     ttk.Button(
