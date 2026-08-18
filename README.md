@@ -1,12 +1,12 @@
 # Pog Engine
 
-**Pog Engine** is an AI-powered pipeline for analyzing OBS and stream VODs. It transcribes your content, finds potential viral moments using **offline LLMs, speech emotion recognition, and audio analysis**, then exports ranked highlights as **DaVinci Resolve timeline markers**.
+**Pog Engine** is an AI-powered pipeline for analyzing virality in OBS or stream VODs. It transcribes your content, finds potential viral moments using **offline LLMs, speech emotion recognition, and audio analysis**, then exports ranked highlights as **DaVinci Resolve timeline markers**.
 
 Finish your stream, run Pog Engine, and get your best moments without scrubbing through hours of footage.
 
 **100% offline. Your data never leave your PC and will not be used to train AI.**
 
-Built for streamers who rely on **speech, reactions, and audio** to create viral moments.
+Built by solo content creator, for solo content creators & editors.
 
 > **Note:** Pog Engine currently cannot detect purely visual moments like physical comedy or crazy gameplay.
 
@@ -19,12 +19,19 @@ Built for streamers who rely on **speech, reactions, and audio** to create viral
 - Ollama capable of running:
   - `qwen3:8b`
   - `qwen3.5:9b-q4_K_M`
+  - `qwen3.6:35b-a3b` 
+  >*OPTIONAL, This model is a lot smarter and slower than qwen3.5 but will require some RAM overflow if you have a 10gb card like me,
+
 
 Built around an RTX 3080 (10GB VRAM). Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
 
 ## OBS Setup Requirement FOR LOCAL RECORDED VOD
 
+Pog Engine was written to work best with a locally recorded VOD with separated audio channels.
+
 Your OBS recording **must match the required configuration exactly**:
+
+If you are using VODs downloaded from a streaming platform, you can skip this step.
 
 > <img width="1920" height="1404" alt="pog" src="https://github.com/user-attachments/assets/78af85a5-0b44-4fd7-8151-d6033ab1d802" />
 
@@ -42,6 +49,10 @@ To download qwen3:8b
 ```ollama run qwen3.5:9b-q4_K_M```
 
 To download qwen3.5:9b-q4_K_M
+
+```ollama run qwen3.6:35b-a3b```
+
+To download qwen3.6:35b-a3b (OPTIONAL)
 
 ## 2. Setting up Pog_Engine
 
@@ -61,7 +72,7 @@ Your final result should look like this
 
 ## How to use:
 
-1. Place **Drag MP4 on me** shortcut in your VOD folder
+1. Place **Drag MP4 on me** shortcut in your **VOD folder**
 3. Drop your VOD.mp4 onto the shortcut
 4. Go to the created folder
 5. Open **6_RunAllSteps.bat**
@@ -82,7 +93,10 @@ Marker Tracker
 >View your markers in order and categories
 
 Subtitle to Marker 
->Turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
+>Turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!", this feature is already included in Pog Engine, this script is here just in case the AI misjudged your hype moment so you can manually find these moments yourself.
+
+Send Markers from Timeline to Clip
+>Send marker from timeline to clip so when you move the clip to another timeline to edit, the marker follows.
 
 
 
