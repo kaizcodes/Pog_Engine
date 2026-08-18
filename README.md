@@ -89,7 +89,7 @@ highlights.edl (your highlight markers)
 
 You are welcomed to use any marker conversion tool to convert Davinci Resolve markers to use in other programs.
 
-## Companion tools ($5.99): 
+## Companion tools (COMING SOON): 
 These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
 
 1-Click Import 
