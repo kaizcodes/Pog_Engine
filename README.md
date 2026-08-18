@@ -1,96 +1,64 @@
 # Pog Engine
 
-**Pog Engine** is an AI-powered pipeline for analyzing OBS and stream VODs. It transcribes your content, finds potential viral moments using **offline LLMs, speech emotion recognition, and audio analysis**, then exports ranked highlights as **DaVinci Resolve timeline markers**.
+Pog Engine is a Windows pipeline that turns an OBS or Twitch VOD into ranked,
+audio/transcript-based highlights and a DaVinci Resolve marker EDL.
 
-Finish your stream, run Pog Engine, and get your best moments without scrubbing through hours of footage.
+By default, analysis runs locally with Whisper.cpp, Ollama, audio signal
+processing, and speech-emotion scoring. Setup downloads dependencies and model
+assets; the pipeline does not analyze video frames, so purely visual moments
+are out of scope.
 
-**100% offline. Your data never leave your PC and will not be used to train AI.**
+## Requirements
 
-Built for streamers who rely on **speech, reactions, and audio** to create viral moments.
+- Windows and Python 3.10+ (`Install_PogEngine.bat` can install Python 3.11.9)
+- FFmpeg **and ffprobe** on `PATH`
+- [Ollama](https://ollama.com/download/windows) with the default models:
 
-> **Note:** Pog Engine currently cannot detect purely visual moments like physical comedy or crazy gameplay.
+  ```text
+  qwen3:8b
+  qwen3.5:9b-q4_K_M
+  ```
 
+- An NVIDIA GPU is recommended; CPU fallback is slower.
 
+## Setup
 
-## PC Requirement
+1. Install Ollama and pull the models above.
+2. Run `Install_PogEngine.bat` from the project folder. It installs/checks
+   Python packages, downloads the required Whisper/emotion/separation assets,
+   configures local paths, and creates `Drag MP4 on me.lnk`.
+3. Optionally run `ConfigurePogEngine.bat` to change models or pipeline
+   settings.
 
-- NVIDIA GPU (8GB+ VRAM, 10GB recommended)
-- CUDA 12.4 compatible
-- Ollama capable of running:
-  - `qwen3:8b`
-  - `qwen3.5:9b-q4_K_M`
+## Run
 
-Built around an RTX 3080 (10GB VRAM). Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
+1. Copy `Drag MP4 on me.lnk` into the folder containing your VOD.
+2. Drop an `.mp4` or `.mkv` onto the shortcut. Pog Engine creates a folder
+   named after the VOD and generates the numbered helper scripts. It detects
+   separate OBS audio tracks automatically; single-track VODs use voice
+   isolation.
+3. Double-click `6_RunAllSteps.bat`.
 
-## OBS Setup Requirement FOR LOCAL RECORDED VOD
+The pipeline extracts or isolates the mic audio, transcribes it with
+Whisper.cpp, cleans and chunks the SRT, then:
 
-Your OBS recording **must match the required configuration exactly**:
+1. discovers transcript candidates with Ollama;
+2. scans the full audio for energetic moments;
+3. scores speech emotion;
+4. verifies and ranks candidates; and
+5. exports the results.
 
-> <img width="1920" height="1404" alt="pog" src="https://github.com/user-attachments/assets/78af85a5-0b44-4fd7-8151-d6033ab1d802" />
+Each analysis stage checkpoints its output, so rerunning resumes completed
+work. Use `5_AnalyzeHighlights.bat` to run only the analysis stage after the
+first four steps are complete.
 
+## Outputs
 
-## 1. Installating Ollama:
+The VOD folder contains the processed audio/transcript files plus:
 
-Install [Ollama](https://ollama.com/download/windows)
+- By default, `top50_highlights.csv` — ranked highlights and metadata
+- By default, `top50_markers.edl` — import into DaVinci Resolve as timeline markers
+- `run_info.json` — models, settings, and run statistics
 
-Open Command Prompt and type
-
-```ollama run qwen3:8b ```
-
-To download qwen3:8b
-
-```ollama run qwen3.5:9b-q4_K_M```
-
-To download qwen3.5:9b-q4_K_M
-
-## 2. Setting up Pog_Engine
-
-<img width="916" height="401" alt="{B07D9456-F90D-4832-BBBF-039A72DAFAAB}" src="https://github.com/user-attachments/assets/381e916a-d8f8-4c61-9d0b-93625fa20813" />
- 
-Code -> Download ZIP
-
-1. Extract ZIP and store the files in ```Pog_Engine``` folder
-2. Run **Install_PogEngine.bat**
-3. Click browse and select ```Pog_Engine``` folder
-
-Your final result should look like this
-
-<img width="833" height="683" alt="{D3F7F48C-B080-4423-9907-96503B98168F}" src="https://github.com/user-attachments/assets/2a339fdc-9839-4494-9cad-100632833451" />
-
-*Side note: You can put whatever you want in gallery, I added this so I could use my fanart as wallpaper while waiting for it to finish.
-
-## How to use:
-
-1. Place **Drag MP4 on me** shortcut in your VOD folder
-3. Drop your VOD.mp4 onto the shortcut
-4. Go to the created folder
-5. Open **6_RunAllSteps.bat**
-6. Watch it works
-
-Files you'll need for davinci resolve:
-VOD.mp4
-VOD**fixed**.srt (must have fixed in name)
-highlights.edl (your highlight markers)
-
-## Companion tools ($5.99): 
-These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
-
-1-Click Import 
->Import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
-
-Marker Tracker
->View your markers in order and categories
-
-Subtitle to Marker 
->Turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!"
-
-
-
-## Tech Stack
-
-- Python
-- Ollama
-- Whisper.cpp
-- FFmpeg
-- PyTorch
-- DaVinci Resolve
+`TOP_N` and other pipeline settings can be changed with
+`ConfigurePogEngine.bat`.
