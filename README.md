@@ -44,17 +44,12 @@ After finish installing Ollama, LOGIN NOT REQUIRED.
 
 Open Command Prompt and type
 
-```ollama run qwen3:8b ```
+Download qwen3:8b : ```ollama run qwen3:8b ```
 
-To download qwen3:8b
+Download qwen3.5:9b-q4_K_M : ```ollama run qwen3.5:9b-q4_K_M```
 
-```ollama run qwen3.5:9b-q4_K_M```
+>Download qwen3.6:35b-a3b (OPTIONAL)```ollama run qwen3.6:35b-a3b```
 
-To download qwen3.5:9b-q4_K_M
-
-```ollama run qwen3.6:35b-a3b```
-
-To download qwen3.6:35b-a3b (OPTIONAL)
 
 ## 2. Setting up Pog_Engine
 
