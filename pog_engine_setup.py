@@ -184,16 +184,13 @@ def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str], Pa
 def remote_file_size(url: str) -> int | None:
     """Best-effort HEAD request for the origin's content-length in bytes.
 
-    Hugging Face resolve URLs redirect to object storage, so redirects must
-    be followed before reading Content-Length; otherwise this would measure
-    the tiny redirect response body instead of the model.
     Returns None when the server doesn't answer or reports no length, so
     callers can't verify and keep the existing file -- never a false
     "re-download" from a broken HEAD.
     """
     try:
-        with requests.head(url, allow_redirects=True, timeout=60) as r:
-            if 200 <= r.status_code < 300:
+        with requests.head(url, timeout=60) as r:
+            if r.ok:
                 cl = r.headers.get("content-length")
                 if cl and cl.isdigit():
                     return int(cl)
@@ -260,43 +257,6 @@ def sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def _download_to_temp(url: str, temp_path: Path, reporter: Reporter) -> None:
-    """Download one file to a temp path and verify its published size/hash."""
-    with requests.get(url, stream=True, timeout=300) as response:
-        response.raise_for_status()
-        content_length = response.headers.get("content-length")
-        total = int(content_length) if content_length and content_length.isdigit() else 0
-        if total == 0:
-            total = remote_file_size(url) or 0
-
-        downloaded = 0
-        with open(temp_path, "wb") as output:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                output.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    percent = downloaded * 100 // total
-                    if percent % 10 == 0:
-                        reporter.log(
-                            f"    {percent}% ({downloaded // (1024 * 1024)}MB / "
-                            f"{total // (1024 * 1024)}MB)"
-                        )
-
-    if total > 0 and downloaded != total:
-        raise IOError(f"download truncated: got {downloaded} bytes, expected {total}")
-
-    expected_hash = origin_sha256(url)
-    if expected_hash is not None:
-        actual_hash = sha256_file(temp_path)
-        if actual_hash != expected_hash:
-            raise IOError(
-                f"checksum mismatch: got {actual_hash[:12]}..., "
-                f"expected {expected_hash[:12]}..."
-            )
-        reporter.log(f"    sha256 verified ({expected_hash[:12]}...)")
-
 
 def download_file(url: str, dest_path: Path, reporter: Reporter, description: str) -> bool:
     """Stream download with progress, skip-if-exists, atomic rename via temp file.
@@ -334,7 +294,30 @@ def download_file(url: str, dest_path: Path, reporter: Reporter, description: st
 
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
     try:
-        _download_to_temp(url, tmp_path, reporter)
+        with requests.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            cl = r.headers.get("content-length")
+            total = int(cl) if cl and cl.isdigit() else 0
+            if total == 0:
+                total = remote_file_size(url) or 0
+            downloaded = 0
+            with open(tmp_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = downloaded * 100 // total
+                            if pct % 10 == 0:
+                                reporter.log(f"    {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+        if total > 0 and downloaded != total:
+            raise IOError(f"download truncated: got {downloaded} bytes, expected {total}")
+        sha_expected = origin_sha256(url)
+        if sha_expected is not None:
+            actual = sha256_file(tmp_path)
+            if actual != sha_expected:
+                raise IOError(f"checksum mismatch: got {actual[:12]}..., expected {sha_expected[:12]}...")
+            reporter.log(f"    sha256 verified ({sha_expected[:12]}...)")
         tmp_path.replace(dest_path)
         reporter.log(f"  [OK]     {description} downloaded to {dest_path}")
         reporter.status(description, "Downloaded")
@@ -394,7 +377,30 @@ def download_whisper_cpp_cublas(models_dir: Path, reporter: Reporter) -> bool:
     url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip"
     tmp_zip = models_dir / "whisper-cublas.zip.tmp"
     try:
-        _download_to_temp(url, tmp_zip, reporter)
+        with requests.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            cl = r.headers.get("content-length")
+            total = int(cl) if cl and cl.isdigit() else 0
+            if total == 0:
+                total = remote_file_size(url) or 0
+            downloaded = 0
+            with open(tmp_zip, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = downloaded * 100 // total
+                            if pct % 10 == 0:
+                                reporter.log(f"    {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+        if total > 0 and downloaded != total:
+            raise IOError(f"download truncated: got {downloaded} bytes, expected {total}")
+        sha_expected = origin_sha256(url)
+        if sha_expected is not None:
+            actual = sha256_file(tmp_zip)
+            if actual != sha_expected:
+                raise IOError(f"checksum mismatch: got {actual[:12]}..., expected {sha_expected[:12]}...")
+            reporter.log(f"    sha256 verified ({sha_expected[:12]}...)")
 
         reporter.log(f"  [INFO]   Extracting whisper.cpp release...")
         import shutil

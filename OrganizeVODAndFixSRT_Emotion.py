@@ -30,11 +30,10 @@ from pipeline_config import (
 DEFAULT_CHUNK_MINUTES = 25
 MIN_REPEAT_SENTENCE_WORDS = 3
 MIN_SUBTITLE_WORDS = 3
-MAX_SUBTITLE_WORDS = 6
 MAX_SUBTITLE_LINE_CHARS = 42
-# Words per "thought" for LLM discovery to read (see merge_entries_for_
-# analysis()) - independent of the on-screen caption size above; the LLM
-# does better with fuller thoughts than a stream of 3-6 word fragments.
+# Maximum characters per displayed SRT line; Whisper controls caption boundaries.
+# Words per "thought" for LLM discovery to read (see merge_entries_for_analysis())
+# - independent of the on-screen caption line width above.
 TRANSCRIPT_MERGE_TARGET_WORDS = 30
 # A gap this long between captions is a new-thought boundary when merging
 # for LLM analysis, even before the target word count above is hit.
@@ -134,92 +133,6 @@ def remove_consecutive_repeated_sentences(text: str) -> tuple[str, int]:
 
     return " ".join(kept_units), removed_count
 
-NATURAL_BREAK_LEAD_WORDS = {
-    "and", "but", "so", "because", "then", "or", "which", "that",
-    "when", "if", "since", "while", "though", "although",
-}
-
-def find_natural_break_indices(words: list[str]) -> set[int]:
-    """Word indices that make a reasonable pause point for a caption break:
-    right after a comma, or right before a conjunction/subordinator that
-    naturally starts a new breath group (e.g. "...the boss, {break} and
-    then he just...")."""
-    natural: set[int] = set()
-    for index, word in enumerate(words):
-        if word.rstrip("\"'").endswith(","):
-            natural.add(index + 1)
-        if index > 0 and word.strip(".,!?\"'").lower() in NATURAL_BREAK_LEAD_WORDS:
-            natural.add(index)
-    return natural
-
-def split_sentence_into_natural_chunks(sentence: str) -> list[str]:
-    """Splits one sentence into ~MIN_SUBTITLE_WORDS-MAX_SUBTITLE_WORDS-word
-    pieces. Distributes words as evenly as possible across however many
-    chunks the sentence needs, snapping each cut point to a nearby natural
-    break (comma, conjunction) when one exists, rather than a hard
-    mechanical every-N-words cut - the goal is captions that still read
-    like natural phrases, not just short for the sake of short.
-    """
-    words = sentence.split()
-    if len(words) <= MAX_SUBTITLE_WORDS:
-        return [sentence] if words else []
-
-    natural_breaks = find_natural_break_indices(words)
-    n_chunks = math.ceil(len(words) / MAX_SUBTITLE_WORDS)
-    ideal_size = len(words) / n_chunks
-
-    cut_points: list[int] = []
-    cursor = 0
-    for chunk_num in range(1, n_chunks):
-        ideal = round(chunk_num * ideal_size)
-        # Keep every chunk (including what's left after this cut) within
-        # [MIN, MAX] words where the remaining word count allows it.
-        lo = cursor + MIN_SUBTITLE_WORDS
-        hi = min(cursor + MAX_SUBTITLE_WORDS, len(words) - MIN_SUBTITLE_WORDS * (n_chunks - chunk_num))
-        if hi < lo:
-            hi = lo
-        ideal = max(lo, min(ideal, hi))
-
-        best_cut = ideal
-        best_distance = None
-        for candidate in natural_breaks:
-            if lo <= candidate <= hi:
-                distance = abs(candidate - ideal)
-                if best_distance is None or distance < best_distance:
-                    best_cut, best_distance = candidate, distance
-
-        cut_points.append(best_cut)
-        cursor = best_cut
-
-    chunks: list[str] = []
-    start = 0
-    for cut in cut_points:
-        chunks.append(" ".join(words[start:cut]))
-        start = cut
-    chunks.append(" ".join(words[start:]))
-    return [chunk for chunk in chunks if chunk]
-
-def split_caption_text(text: str, duration_ms: int) -> list[str]:
-    """Split a long Whisper subtitle into short, natural-sounding captions
-    (target MIN_SUBTITLE_WORDS-MAX_SUBTITLE_WORDS words each), without ever
-    cutting in the middle of a sentence you're still speaking - sentence
-    boundaries (.!?) are found first and never merged across; only text
-    within one sentence gets subdivided further, and only when it's longer
-    than MAX_SUBTITLE_WORDS words.
-    """
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return []
-
-    raw_sentences = re.findall(r"[^.!?]+[.!?]+(?:['\"])?|[^.!?]+$", text)
-
-    pieces: list[str] = []
-    for sentence in raw_sentences or [text]:
-        sentence = sentence.strip()
-        if sentence:
-            pieces.extend(split_sentence_into_natural_chunks(sentence))
-
-    return [piece for piece in pieces if piece]
 
 def wrap_caption_text(text: str) -> list[str]:
     wrapped = textwrap.wrap(
@@ -248,25 +161,11 @@ def split_caption_block(block: str, start_index: int) -> list[str]:
     start_text, end_text = [part.strip() for part in lines[1].split("-->", 1)]
     start_ms = parse_srt_time(start_text)
     end_ms = parse_srt_time(end_text)
-    duration_ms = max(end_ms - start_ms, 1)
-    pieces = split_caption_text(normalize_caption_text(lines[2:]), duration_ms)
-    if not pieces:
+    subtitle_text = normalize_caption_text(lines[2:])
+    if not subtitle_text:
         return []
 
-    cursor_ms = start_ms
-    split_blocks: list[str] = []
-
-    for offset, piece in enumerate(pieces):
-        if offset == len(pieces) - 1:
-            piece_end_ms = end_ms
-        else:
-            piece_end_ms = start_ms + round(duration_ms * (offset + 1) / len(pieces))
-            piece_end_ms = min(max(piece_end_ms, cursor_ms + 1), end_ms)
-
-        split_blocks.append(make_srt_block(start_index + offset, cursor_ms, piece_end_ms, piece))
-        cursor_ms = piece_end_ms
-
-    return split_blocks
+    return [make_srt_block(start_index, start_ms, end_ms, subtitle_text)]
 
 def fix_srt(input_path: Path) -> Path:
     """Fix bad Whisper SRT timestamps, collapse adjacent repeats, and renumber."""
@@ -342,22 +241,17 @@ def fix_srt(input_path: Path) -> Path:
         print(f"Removed {removed_block_count} consecutive repeated subtitle block(s)")
     if removed_sentence_count:
         print(f"Removed {removed_sentence_count} consecutive repeated sentence(s)")
-    split_count = len(renumbered_blocks) - len(deduped_blocks)
-    if split_count:
-        print(f"Split long subtitle text into {split_count} additional Resolve-friendly block(s)")
 
     write_text_crlf(output_path, "\r\n\r\n".join(renumbered_blocks), encoding="utf-8")
     print(f"Fixed file saved as: {output_path}")
     return output_path
 
 def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, str]]:
-    """Regroups the short (3-6 word) on-screen captions back into fuller,
-    more natural chunks for the LLM discovery passes to read - a stream of
-    isolated 3-6 word fragments with no surrounding context is harder for a
-    model to reason about than a couple of full sentences at a time. Each
-    merged chunk keeps the timestamp of whichever caption started it, which
-    stays a precise, real anchor for the anti-hallucination timestamp check
-    downstream in analyze_highlights_emotion.py.
+    """Regroups the on-screen captions into fuller, more natural chunks for
+    the LLM discovery passes to read. Each merged chunk keeps the timestamp
+    of whichever caption started it, which stays a precise, real anchor for
+    the anti-hallucination timestamp check downstream in
+    analyze_highlights_emotion.py.
 
     A chunk closes (a new one starts) when adding the next caption would
     push it past TRANSCRIPT_MERGE_TARGET_WORDS words, when there's a long
@@ -613,11 +507,9 @@ REM produced choppy, mid-sentence-feeling subtitles (and whisper.cpp has a
 REM known bug where -ml + -sow together can emit 0-duration "empty"
 REM segments - see ggml-org/whisper.cpp#1967). Segmentation is left to VAD
 REM (the --vad-* flags below), which breaks at real pauses in your speech
-REM instead of an arbitrary character count. The natural-length segments
-REM this produces then get split into short display captions (and
-REM re-merged into fuller chunks for the LLM) by 3_FixSRT.bat and
-REM 4_SplitSRT.bat - see split_sentence_into_natural_chunks() and
-REM merge_entries_for_analysis() in this script.
+REM The natural-length segments this produces are preserved as complete
+REM captions by 3_FixSRT.bat and re-merged into fuller chunks for the LLM
+REM by 4_SplitSRT.bat - see merge_entries_for_analysis() in this script.
 REM
 REM -mc -1 (unlimited context, whisper.cpp's own default) instead of a
 REM small fixed number, so it keeps remembering earlier context across a
