@@ -27,11 +27,11 @@ Built around an RTX 3080 (10GB VRAM). Larger models may work better on GPUs with
 
 ## OBS Setup Requirement FOR LOCAL RECORDED VOD
 
+If you are using VODs downloaded from a streaming platform, you can skip this step.
+
 Pog Engine was written to work best with a locally recorded VOD with separated audio channels.
 
 Your OBS recording **must match the required configuration exactly**:
-
-If you are using VODs downloaded from a streaming platform, you can skip this step.
 
 > <img width="1920" height="1404" alt="pog" src="https://github.com/user-attachments/assets/78af85a5-0b44-4fd7-8151-d6033ab1d802" />
 
@@ -39,6 +39,8 @@ If you are using VODs downloaded from a streaming platform, you can skip this st
 ## 1. Installating Ollama:
 
 Install [Ollama](https://ollama.com/download/windows)
+
+After finish installing Ollama, LOGIN NOT REQUIRED.
 
 Open Command Prompt and type
 
@@ -63,12 +65,14 @@ Code -> Download ZIP
 1. Extract ZIP and store the files in ```Pog_Engine``` folder
 2. Run **Install_PogEngine.bat**
 3. Click browse and select ```Pog_Engine``` folder
+4. Then **Start Setup**
 
-Your final result should look like this
+Your final result should say OK / Already Downloaded
 
-<img width="833" height="683" alt="{D3F7F48C-B080-4423-9907-96503B98168F}" src="https://github.com/user-attachments/assets/2a339fdc-9839-4494-9cad-100632833451" />
+<img width="845" height="703" alt="{7B6681C9-FB82-46E4-A084-B8C94ABC8A03}" src="https://github.com/user-attachments/assets/f203b77d-9957-4266-9eb5-c77d891d2565" />
 
-*Side note: You can put whatever you want in gallery, I added this so I could use my fanart as wallpaper while waiting for it to finish.
+
+*Side note: You can put whatever you want in gallery, I added this so I could use my fanart as screensaver while waiting for it to finish.
 
 ## How to use:
 
@@ -78,10 +82,12 @@ Your final result should look like this
 5. Open **6_RunAllSteps.bat**
 6. Watch it works
 
-Files you'll need for davinci resolve:
+Files you'll need for Davinci Resolve:
 VOD.mp4
 VOD**fixed**.srt (must have fixed in name)
 highlights.edl (your highlight markers)
+
+You are welcomed to use any marker conversion tool to convert Davinci Resolve markers to use in other programs.
 
 ## Companion tools ($5.99): 
 These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
@@ -98,11 +104,16 @@ Subtitle to Marker
 Send Markers from Timeline to Clip
 >Send marker from timeline to clip so when you move the clip to another timeline to edit, the marker follows.
 
+## Known Issues:
+>none at the moment.
+Please report any issues to the issues tab.
 
+## ROADMAP:
+1. Auto clips extraction, cut the middle man and get the clips immediately to use
 
 ## Tech Stack
 
-- Python
+- Python 3.11
 - Ollama
 - Whisper.cpp
 - FFmpeg
