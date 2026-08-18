@@ -89,6 +89,13 @@ highlights.edl (your highlight markers)
 
 You are welcomed to use any marker conversion tool to convert Davinci Resolve markers to use in other programs.
 
+## Configure Pog Engine (ADVANCED USER ONLY)
+I made the default settings for Pog Engine to work on all machines, this configurator tool is more for advanced power users who want to tweak their parameters.
+
+Launch **ConfigurePogEngine.bat**
+
+You can change the presets model I have written to use on my own machine and I know will work on machines with similar spec.
+
 ## Companion tools (COMING SOON): 
 These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
 
