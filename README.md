@@ -116,7 +116,7 @@ Please report any issues to the issues tab.
 ## If you wish to support me
 You could buy me a coffee here: https://ko-fi.com/kaizuchaneru
 
-The money will be put back into development and maintaining this project.
+The money will be put into development and maintaining this project.
 
 ## Tech Stack
 
