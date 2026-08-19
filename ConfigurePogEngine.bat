@@ -1,4 +1,4 @@
 @echo off
 setlocal
-python "%~dp0OrganizeVODAndFixSRT_Emotion.py" --config --no-pause
-pause
+start "" /b pythonw "%~dp0OrganizeVODAndFixSRT_Emotion.py" --config --no-pause
+exit /b 0

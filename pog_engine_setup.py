@@ -182,12 +182,21 @@ def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str], Pa
 
 
 def remote_file_size(url: str) -> int | None:
-    """Best-effort HEAD request for the origin's content-length in bytes.
+    """Best-effort origin size, using authoritative HF metadata when available.
 
-    Returns None when the server doesn't answer or reports no length, so
-    callers can't verify and keep the existing file -- never a false
-    "re-download" from a broken HEAD.
+    Hugging Face's redirected ``resolve`` endpoint can return the size of a
+    tiny redirect/error response to HEAD (roughly 1 KB), not the LFS blob.
+    The tree API publishes the actual file size, so prefer it for HF URLs and
+    fall back to HEAD for other origins.
     """
+    m = re.match(r"https://huggingface\.co/([^/]+)/([^/]+)/resolve/([^/]+)/(.+)$", url)
+    if m:
+        repo, rev, path = f"{m.group(1)}/{m.group(2)}", m.group(3), m.group(4)
+        entry = _huggingface_tree_entry(repo, rev, path)
+        size = entry.get("size")
+        if isinstance(size, int):
+            return size
+        return None
     try:
         with requests.head(url, timeout=60) as r:
             if r.ok:
@@ -199,6 +208,24 @@ def remote_file_size(url: str) -> int | None:
     return None
 
 
+def _huggingface_tree_entry(repo: str, rev: str, path: str) -> dict:
+    key = (repo, rev)
+    if key not in _HF_TREE_CACHE:
+        try:
+            r = requests.get(
+                f"https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true",
+                timeout=60,
+            )
+            r.raise_for_status()
+            _HF_TREE_CACHE[key] = {
+                entry["path"]: entry for entry in r.json()
+                if isinstance(entry.get("path"), str)
+            }
+        except Exception:
+            _HF_TREE_CACHE[key] = {}
+    return _HF_TREE_CACHE[key].get(path, {})
+
+
 _PINNED_SHA256 = {
     # GitHub release assets are immutable: the digest is published by the
     # GitHub API (releases/tags/v1.7.6 -> assets[].digest) and can never
@@ -207,20 +234,14 @@ _PINNED_SHA256 = {
         "3fc4d3ebd9a678313de50c04d9e59c43117ae190f0cb7bff602d4aeefc4efe3d",
 }
 
+_HF_TREE_CACHE: dict[tuple[str, str], dict[str, dict]] = {}
 _HF_SHA_CACHE: dict[tuple[str, str], dict[str, str]] = {}
 
 
 def origin_sha256(url: str) -> str | None:
     """The origin's SHA-256 for a file URL, when the source publishes one.
 
-    - huggingface.co resolve URLs: the repo tree API reports the LFS oid
-      (a real sha256) per file; the response is cached per repo/revision so
-      one API call serves every file of that repo. Small non-LFS files
-      (e.g. config.json) have no sha256 and return None.
-    - Pinned immutable GitHub release assets are known upfront in
-      _PINNED_SHA256.
-    - Any other origin returns None, and the caller falls back to the
-      Content-Length check only.
+    Hugging Face's tree API reports the LFS oid (a real SHA-256) per file.
     """
     pinned = _PINNED_SHA256.get(url)
     if pinned is not None:
@@ -231,21 +252,13 @@ def origin_sha256(url: str) -> str | None:
     repo, rev, path = f"{m.group(1)}/{m.group(2)}", m.group(3), m.group(4)
     key = (repo, rev)
     if key not in _HF_SHA_CACHE:
-        try:
-            r = requests.get(
-                f"https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true",
-                timeout=60,
-            )
-            r.raise_for_status()
-            tree = {}
-            for entry in r.json():
-                lfs = entry.get("lfs") or {}
-                oid = lfs.get("oid", "")
-                if len(oid) == 64:
-                    tree[entry["path"]] = oid
-            _HF_SHA_CACHE[key] = tree
-        except Exception:
-            _HF_SHA_CACHE[key] = {}
+        _huggingface_tree_entry(repo, rev, path)
+        tree = _HF_TREE_CACHE.get(key, {})
+        _HF_SHA_CACHE[key] = {
+            file_path: (entry.get("lfs") or {}).get("oid", "")
+            for file_path, entry in tree.items()
+            if len((entry.get("lfs") or {}).get("oid", "")) == 64
+        }
     return _HF_SHA_CACHE[key].get(path)
 
 
@@ -740,39 +753,29 @@ def _migrate_default_hf_htdemucs(dst_hub_root: Path, reporter: Reporter) -> bool
         return False
 
 
-def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
-    """Triggers Demucs' one-time ~80MB separation-model download now, during
-    setup, instead of leaving it for whenever the first single-track/
-    Twitch-style VOD gets processed. Runs demucs against a 1-second silent
-    wav purely to make it load (and therefore download/cache) the model -
-    the separation result itself is discarded.
+def predownload_demucs_model(models_dir: Path, reporter: Reporter, download: bool = True) -> bool:
+    """Check for, and optionally download, Demucs' separation model.
 
-    Downloads into models_dir/torch_cache (TORCH_HUB_CACHE + TORCH_HOME) and
-    models_dir/hf_cache (HF_HUB_CACHE + HF_HOME), matching TORCH_CACHE_DIR in
-    isolate_vocals.py (patched to the same path in patch_paths() above), so
-    the model ends up in the same place isolate_vocals.py will look for it
-    later instead of two different caches existing side by side.
+    The initial GUI inventory passes ``download=False`` so opening the
+    installer is read-only.  Start Setup uses the default ``True`` and
+    downloads the model when it is missing.
 
-    Two bugs this replaces:
-      1) The old presence check matched ANY .safetensors/.bin/.th in any
-         cache dir, so unrelated repos (Ollama GGUF pulls, transformers
-         weights) in the default HF cache made it falsely report 'already
-         downloaded' and skip - even when HTDemucs itself was absent.
-      2) HF_HOME alone doesn't reliably redirect huggingface_hub's snapshot
-         dir on newer versions (HF_HUB_CACHE takes precedence), so the
-         download silently wrote to ~/.cache/huggingface instead of the
-         redirect and the success log lied about the location. Setting
-         HF_HUB_CACHE explicitly fixes the redirect for real.
+    Downloads go into models_dir/torch_cache (TORCH_HUB_CACHE + TORCH_HOME)
+    and models_dir/hf_cache (HF_HUB_CACHE + HF_HOME), matching
+    TORCH_CACHE_DIR in isolate_vocals.py (patched to the same path in
+    patch_paths()).
+
+    Presence is anchored on the actual HTDemucs repository, not on a loose
+    file extension that unrelated cached models could satisfy.
     """
     reporter.log("  demucs separation model (~80MB, one-time download)")
     reporter.status("demucs model", "Checking...")
 
     if not is_importable("demucs"):
-        reporter.log("    [WARN] demucs isn't installed - skipping model pre-download.")
-        reporter.log("           It will be downloaded automatically the first time a single-track")
-        reporter.log("           VOD is processed instead (needs internet then).")
-        reporter.status("demucs model", "Skipped")
-        return
+        reporter.log("    [WARN] demucs isn't installed - cannot check its model.")
+        reporter.log("           Start Setup will install demucs before downloading its model.")
+        reporter.status("demucs model", "Missing")
+        return False
 
     torch_cache_dir = models_dir / "torch_cache"
     hf_cache_dir = models_dir / "hf_cache"
@@ -787,18 +790,29 @@ def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
     if already_in_redirect:
         reporter.log(f"    [OK]     already cached in redirect ({hf_cache_dir}) - skipping.")
         reporter.status("demucs model", "Already downloaded")
-        return
+        return True
 
     if already_in_default:
+        if not download:
+            reporter.log("    [OK]     found HTDemucs in the default user cache.")
+            reporter.log("           Start Setup will move it into the Pog_Engine cache.")
+            reporter.status("demucs model", "Already downloaded")
+            return True
         reporter.log("    Found HTDemucs in the default user cache (left there by a previous")
         reporter.log("    install whose HF redirect didn't take). Moving it into the redirect...")
         if _migrate_default_hf_htdemucs(hf_cache_dir, reporter):
             reporter.status("demucs model", "Already downloaded")
-            return
+            return True
         # Migration failed (e.g. cache locked) - leave it; the pipeline still
         # works from the default location at runtime. Fall through to attempt
         # a fresh download into the redirect anyway, since the redirect being
         # empty means a future clean run is still wrong.
+
+    if not download:
+        reporter.log("    [MISSING] HTDemucs model is not cached.")
+        reporter.log("              Click Start Setup to download it.")
+        reporter.status("demucs model", "Missing")
+        return False
 
     reporter.status("demucs model", "Downloading...")
     torch_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -839,33 +853,30 @@ def predownload_demucs_model(models_dir: Path, reporter: Reporter) -> None:
         if return_code == 0 and _demucs_repo_dir(hf_cache_dir) is not None:
             reporter.log(f"    [OK]     separation model downloaded and cached in {hf_cache_dir}")
             reporter.status("demucs model", "Downloaded")
-        elif return_code == 0:
-            # Demucs exited clean but, heartbreakingly, didn't land in the
-            # redirect we just set. This is the regression the env-var fix
-            # above is meant to prevent; if it still happens, demucs likely
-            # resolved the repo from elsewhere (HF_HUB_CACHE not honored by
-            # this huggingface_hub build). Surface it as a hard failure
-            # rather than silently lie, then check the default cache so the
-            # user at least knows where it ended up.
+            return True
+        if return_code == 0:
+            # Demucs exited clean but did not land in the redirect. Surface
+            # that mismatch instead of claiming the cache is ready.
             if _demucs_repo_dir(default_hub_root) is not None:
                 reporter.log(f"    [WARN] demucs exited OK but HTDemucs is NOT in the redirect")
                 reporter.log(f"           ({hf_cache_dir}); a newer huggingface_hub ignored HF_HUB_CACHE.")
-                reporter.log(f"           Found it in the default cache instead - the pipeline still")
-                reporter.log(f"           works at runtime, but the redirect stayed empty.")
+                reporter.log("           Found it in the default cache instead - the pipeline still")
+                reporter.log("           works at runtime, but the redirect stayed empty.")
             else:
-                reporter.log(f"    [WARN] demucs exited OK but no HTDemucs cache was created anywhere")
-                reporter.log(f"           we can find. The pipeline will re-download on first use.")
-            reporter.status("demucs model", "Failed")
+                reporter.log("    [WARN] demucs exited OK but no HTDemucs cache was created anywhere")
+                reporter.log("           we can find. The pipeline will re-download on first use.")
         else:
             reporter.log(f"    [WARN] model pre-download exited with code {return_code}. It will be")
             reporter.log("           retried automatically the first time a single-track VOD actually")
             reporter.log("           needs it (needs internet then).")
-            reporter.status("demucs model", "Failed")
+        reporter.status("demucs model", "Failed")
+        return False
     except Exception as exc:
         reporter.log(f"    [WARN] model pre-download failed: {exc}")
         reporter.log("           It will be retried automatically the first time a single-track VOD")
         reporter.log("           actually needs it (needs internet then).")
         reporter.status("demucs model", "Failed")
+        return False
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1035,16 +1046,13 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
 
 
 def _verify_python_packages(models_dir: Path, reporter: Reporter,
-                            installed_label: str = "installed") -> bool:
+                            installed_label: str = "installed",
+                            download_models: bool = False) -> bool:
     """Re-import every required package and report its real status.
 
-    The old install branch of check_python_packages returned True
-    unconditionally after install_dependencies(), so the Summary could claim
-    "everything ready" - and create the drag-and-drop shortcut - even when
-    torch or demucs had silently failed to install. Both install and
-    check-only modes now route through this single verifier so they can never
-    disagree about what's actually importable. `installed_label` only changes
-    the OK status word shown in the GUI ("OK" vs "Already installed").
+    The launch-time inventory passes ``download_models=False`` so checking
+    does not change the machine. Start Setup enables it after the user clicks
+    the button.
     """
     all_ok = True
 
@@ -1070,7 +1078,9 @@ def _verify_python_packages(models_dir: Path, reporter: Reporter,
         reporter.status("demucs", "Missing")
         all_ok = False
 
-    predownload_demucs_model(models_dir, reporter)  # own check/reporting
+    demucs_model_ok = predownload_demucs_model(
+        models_dir, reporter, download=download_models
+    )
 
     for module_name, pip_name in SIMPLE_PACKAGES.items():
         reporter.status(pip_name, "Checking...")
@@ -1082,26 +1092,22 @@ def _verify_python_packages(models_dir: Path, reporter: Reporter,
             reporter.status(pip_name, "Missing")
             all_ok = False
 
-    return all_ok
+    return all_ok and demucs_model_ok
 
 
 def check_python_packages(models_dir: Path, reporter: Reporter, install: bool) -> bool:
-    """Install packages if install=True, then verify what's actually importable.
-
-    Verification runs in BOTH modes (previously install-mode returned True
-    unconditionally, masking failed installs). The install branch first runs
-    install_dependencies() - which emits its own "Installing..." section and
-    reports per-package failures - then calls _verify_python_packages() under
-    a "Verifying Python packages" section so the final per-row status reflects
-    the on-disk truth, not pip's exit code.
-    """
+    """Install packages when requested, then verify what's importable."""
     if install:
         install_dependencies(reporter, models_dir)
         reporter.section("Verifying Python packages")
-        return _verify_python_packages(models_dir, reporter, installed_label="installed")
+        return _verify_python_packages(
+            models_dir, reporter, installed_label="installed", download_models=True
+        )
 
     reporter.section("Checking Python packages")
-    return _verify_python_packages(models_dir, reporter, installed_label="already installed")
+    return _verify_python_packages(
+        models_dir, reporter, installed_label="already installed", download_models=False
+    )
 
 # ============================================================================
 # Drag-and-drop shortcut

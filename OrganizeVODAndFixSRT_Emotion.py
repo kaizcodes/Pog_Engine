@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Iterable
 
 from pipeline_config import (
+    EMOTION_ENABLED,
+    EMOTION_MODEL_ID,
     JUDGE_MODEL,
     MODEL,
     NOISE_GATE_ATTACK_MS,
@@ -25,8 +27,8 @@ from pipeline_config import (
     NOISE_GATE_RELEASE_MS,
     NOISE_GATE_THRESHOLD_DB,
     OLLAMA_URL,
+    VOCAL_ISOLATION_MODEL,
 )
-
 DEFAULT_CHUNK_MINUTES = 25
 MIN_REPEAT_SENTENCE_WORDS = 3
 MIN_SUBTITLE_WORDS = 3
@@ -685,6 +687,97 @@ def build_run_all_steps(target_folder: Path, base_name: str) -> list[RunAllStep]
         RunAllStep("5. Analyze highlights", "5_AnalyzeHighlights.bat", "transcript_part", False, "highlights_csv"),
     ]
 
+
+ANALYSIS_STAGE_DETAILS = {
+    "5a. Discovery": {
+        "task": "Discovery: transcript candidate passes",
+        "model": f"Model: {MODEL}",
+        "next": "Next mini-process: 5b. Audio Scan",
+    },
+    "5b. Audio Scan": {
+        "task": "Audio Scan: model-free energy analysis",
+        "model": f"Title model when needed: {JUDGE_MODEL}",
+        "next": "Next mini-process: 5c. Emotion Scoring",
+    },
+    "5c. Emotion Scoring": {
+        "task": "Emotion Scoring: loading speech-emotion model",
+        "model": f"Model: {EMOTION_MODEL_ID}" if EMOTION_ENABLED else "Model: disabled by configuration",
+        "next": "Next mini-process: 5d. Verification",
+    },
+    "5d. Verification": {
+        "task": "Verification: checking candidates against transcript",
+        "model": f"Model: {JUDGE_MODEL}",
+        "next": "Next mini-process: 5e. Judging",
+    },
+    "5e. Judging": {
+        "task": "Judging: ranking the candidate pool",
+        "model": f"Model: {JUDGE_MODEL}",
+        "next": "Next mini-process: 5f. Export",
+    },
+    "5f. Export": {
+        "task": "Export: writing CSV, EDL, and run metadata",
+        "model": "Model: none",
+        "next": "Next: Run complete",
+    },
+}
+
+
+def _step_model_details(index: int) -> tuple[str, str]:
+    if index == 0:
+        return (
+            "Process: ffmpeg extraction; Demucs runs for single-track VODs",
+            f"Vocal model when needed: {VOCAL_ISOLATION_MODEL}",
+        )
+    if index == 1:
+        return (
+            "Process: whisper.cpp transcription with voice activity detection",
+            f"Whisper model: {Path(WHISPER_MODEL).name}; VAD: {Path(WHISPER_VAD).name}",
+        )
+    if index == 2:
+        return "Process: repair timestamps and remove adjacent repeats", "Model: none"
+    if index == 3:
+        return "Process: regroup captions into transcript_part files", "Model: none"
+    return (
+        "Process: discovery → audio scan → emotion → verification → judging → export",
+        f"Models: {MODEL} / {JUDGE_MODEL} / {EMOTION_MODEL_ID if EMOTION_ENABLED else 'emotion disabled'}",
+    )
+
+
+def _strip_console_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]", "", text).strip()
+
+
+def _console_log_tag(text: str) -> str:
+    lowered = text.casefold()
+    if "skipping because output" in lowered or "checkpoint already exists, skipping" in lowered:
+        return "success"
+    if (
+        "[warn" in lowered
+        or "[!]" in lowered
+        or "retrying" in lowered
+        or "continuing without" in lowered
+        or "skipping" in lowered
+    ):
+        return "warning"
+    if (
+        "error" in lowered
+        or "failed" in lowered
+        or "exception" in lowered
+        or re.search(r"exit code \d+", lowered)
+    ):
+        return "failure"
+    if (
+        "[ok]" in lowered
+        or "done" in lowered
+        or "saved" in lowered
+        or "finished" in lowered
+        or "success" in lowered
+        or "found output" in lowered
+        or "complete" in lowered
+    ):
+        return "success"
+    return "info"
+
 def newest_file(paths: Iterable[Path]) -> Path | None:
     existing_paths = [path for path in paths if path.exists()]
     if not existing_paths:
@@ -778,7 +871,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
 
     root = tk.Tk()
     root.title("Step 6 - Run All VOD Steps - Emotion Edition")
-    root.geometry("980x640")
+    root.geometry("1080x760")
     root.configure(bg="#121212")
 
     style = ttk.Style(root)
@@ -804,12 +897,131 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     status_var = tk.StringVar(value=f"Ready to run. Log: {run_log_path}")
     progress_var = tk.DoubleVar(value=0)
     exit_code = {"value": 0}
+    status_colors = {
+        "Waiting": "#b0b0b0",
+        "Running": "#ffd166",
+        "Done": "#7CFC98",
+        "Skipped": "#7CFC98",
+        "Failed": "#ff6b6b",
+        "Stopped": "#ffb86c",
+    }
+    step_name_labels: list[tk.Label] = []
+    step_status_labels: list[tk.Label] = []
+    step_detail_vars: list[tk.StringVar] = []
+    step_detail_labels: list[tk.Label] = []
+    step_runtime: list[dict[str, str]] = []
+    summary_status_label: dict[str, tk.Label | None] = {"widget": None}
+
+    def next_step_text(index: int) -> str:
+        if index + 1 < len(steps):
+            return f"Next: {steps[index + 1].label}"
+        return "Next: Run complete"
+
+    for index, _step in enumerate(steps):
+        process_detail, model_detail = _step_model_details(index)
+        step_runtime.append(
+            {
+                "task": "Waiting",
+                "model": model_detail,
+                "message": process_detail,
+                "next": next_step_text(index),
+                "stage": "",
+            }
+        )
+
+    def render_step_detail(index: int) -> None:
+        state = step_runtime[index]
+        detail_parts = [state["task"], state["model"], state["message"], state["next"]]
+        step_detail_vars[index].set("\n".join(part for part in detail_parts if part))
+
+    def set_step_status(index: int, value: str) -> None:
+        step_status_vars[index].set(value)
+        color = status_colors.get(value, "#f2f2f2")
+        step_name_labels[index].configure(fg=color)
+        step_status_labels[index].configure(fg=color)
+        step_detail_labels[index].configure(fg=color)
+        if summary_status_label["widget"] is not None:
+            summary_status_label["widget"].configure(fg=color)
+        render_step_detail(index)
+
+    def update_step_detail(index: int, message: str) -> None:
+        step_runtime[index]["message"] = message
+        render_step_detail(index)
+
+    def update_step_from_output(index: int, raw_line: str) -> None:
+        line = _strip_console_ansi(raw_line)
+        if not line:
+            return
+        lowered = line.casefold()
+        state = step_runtime[index]
+
+        if index == 4:
+            for stage_label, stage_info in ANALYSIS_STAGE_DETAILS.items():
+                if stage_label.casefold() not in lowered:
+                    continue
+                state["stage"] = stage_label
+                if "checkpoint already exists, skipping" in lowered:
+                    state["task"] = f"Finished earlier: {stage_info['task']}"
+                    state["message"] = "Checkpoint found; this mini-process was resumed without rerunning it."
+                else:
+                    state["task"] = f"Running mini-process: {stage_info['task']}"
+                    state["message"] = "Reading live analyzer output..."
+                state["model"] = stage_info["model"]
+                state["next"] = stage_info["next"]
+                render_step_detail(index)
+                break
+
+            if "speech emotion scoring" in lowered:
+                state["task"] = "Running mini-process: Emotion Scoring"
+                state["model"] = f"Model: {EMOTION_MODEL_ID}" if EMOTION_ENABLED else "Model: disabled by configuration"
+            elif "full-file audio scan" in lowered:
+                state["task"] = "Running mini-process: Audio Scan"
+                state["model"] = f"Title model when needed: {JUDGE_MODEL}"
+            elif "verifying " in lowered:
+                state["task"] = "Running mini-process: Verification"
+                state["model"] = f"Model: {JUDGE_MODEL}"
+            elif "running judge stage" in lowered or "judging in " in lowered:
+                state["task"] = "Running mini-process: Judging"
+                state["model"] = f"Model: {JUDGE_MODEL}"
+            elif "top " in lowered and " highlights saved" in lowered:
+                state["task"] = "Running mini-process: Export"
+                state["model"] = "Model: none"
+
+        model_match = re.search(
+            r"(Model(?: metadata source)?|VAD model):\s*(.+)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if model_match:
+            model_label, model_value = model_match.groups()
+            state["model"] = f"Loaded {model_label}: {model_value.strip()}"
+
+        action_patterns = (
+            r"^Step \d+/\d+:",
+            r"^Transcribing ",
+            r"^Fixing ",
+            r"^Splitting ",
+            r"Analyzing transcript_part",
+            r"Generating titles for ",
+            r"Saved \d+ emotion score",
+            r"Response received in ",
+        )
+        if any(re.search(pattern, line, flags=re.IGNORECASE) for pattern in action_patterns):
+            state["task"] = line[:180]
+        elif "found output:" in lowered:
+            state["message"] = line[:220]
+        elif "stage finished in " in lowered:
+            state["message"] = line[:180]
+        elif line.startswith("[") and ("[" in line[1:] or "]" in line):
+            state["message"] = f"Latest: {line[:180]}"
+        render_step_detail(index)
 
     main_frame = ttk.Frame(root, padding=12)
     main_frame.pack(fill="both", expand=True)
     main_frame.columnconfigure(0, weight=3)
     main_frame.columnconfigure(1, weight=2)
     main_frame.rowconfigure(2, weight=1)
+    main_frame.rowconfigure(4, weight=1)
 
     ttk.Label(main_frame, text="Step 6: Run everything + emotion analysis", font=("Segoe UI", 16, "bold")).grid(
         row=0, column=0, sticky="w"
@@ -818,23 +1030,82 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     status_row = ttk.Frame(main_frame)
     status_row.grid(row=1, column=0, sticky="ew", pady=(4, 8))
     status_row.columnconfigure(0, weight=1)
-    ttk.Label(status_row, textvariable=status_var).grid(row=0, column=0, sticky="w")
+    summary_label = tk.Label(
+        status_row,
+        textvariable=status_var,
+        anchor="w",
+        justify="left",
+        bg="#121212",
+        fg="#f2f2f2",
+        font=("Segoe UI", 10),
+    )
+    summary_label.grid(row=0, column=0, sticky="ew")
+    summary_status_label["widget"] = summary_label
     stop_button = ttk.Button(status_row, text="Stop", style="Stop.TButton")
     stop_button.grid(row=0, column=1, sticky="e", padx=(10, 0))
 
-    step_frame = ttk.LabelFrame(main_frame, text="Progress", padding=10)
+    step_frame = ttk.LabelFrame(main_frame, text="Progress and live details", padding=10)
     step_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
+    step_frame.columnconfigure(2, weight=1)
     step_status_vars: list[tk.StringVar] = []
     for row, step in enumerate(steps):
-        ttk.Label(step_frame, text=step.label).grid(row=row, column=0, sticky="w", pady=3)
+        step_name_label = tk.Label(
+            step_frame,
+            text=step.label,
+            anchor="w",
+            bg="#121212",
+            fg="#f2f2f2",
+            font=("Segoe UI", 10, "bold"),
+        )
+        step_name_label.grid(row=row, column=0, sticky="nw", pady=5, padx=(0, 12))
+        step_name_labels.append(step_name_label)
         state_var = tk.StringVar(value="Waiting")
         step_status_vars.append(state_var)
-        ttk.Label(step_frame, textvariable=state_var, width=18).grid(row=row, column=1, sticky="e", pady=3)
+        status_label = tk.Label(
+            step_frame,
+            textvariable=state_var,
+            width=10,
+            anchor="e",
+            bg="#121212",
+            fg=status_colors["Waiting"],
+            font=("Segoe UI", 9, "bold"),
+        )
+        status_label.grid(row=row, column=1, sticky="ne", pady=5, padx=(0, 12))
+        step_status_labels.append(status_label)
+        detail_var = tk.StringVar()
+        step_detail_vars.append(detail_var)
+        detail_label = tk.Label(
+            step_frame,
+            textvariable=detail_var,
+            anchor="w",
+            justify="left",
+            wraplength=620,
+            bg="#121212",
+            fg=status_colors["Waiting"],
+            font=("Segoe UI", 9),
+        )
+        detail_label.grid(row=row, column=2, sticky="ew", pady=5)
+        step_detail_labels.append(detail_label)
+
+    for index in range(len(steps)):
+        render_step_detail(index)
 
     progress = ttk.Progressbar(main_frame, variable=progress_var, maximum=len(steps), style="Orange.Horizontal.TProgressbar")
     progress.grid(row=3, column=0, sticky="ew", padx=(0, 10), pady=(10, 0))
 
-    log_box = tk.Text(main_frame, height=12, wrap="word", state="disabled", bg="#0f0f0f", fg="#f2f2f2", insertbackground="#f2f2f2")
+    log_box = tk.Text(
+        main_frame,
+        height=12,
+        wrap="word",
+        state="disabled",
+        bg="#0f0f0f",
+        fg="#f2f2f2",
+        insertbackground="#f2f2f2",
+    )
+    log_box.tag_configure("info", foreground="#f2f2f2")
+    log_box.tag_configure("success", foreground="#7CFC98")
+    log_box.tag_configure("failure", foreground="#ff6b6b")
+    log_box.tag_configure("warning", foreground="#ffd166")
     log_box.grid(row=4, column=0, sticky="nsew", padx=(0, 10), pady=(10, 0))
 
     gallery_frame = ttk.LabelFrame(main_frame, text="Best Of Gallery", padding=4)
@@ -850,9 +1121,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     gallery_photo = {"value": None}
     current_gallery_path = {"value": None}
 
-    def append_log(text: str) -> None:
+    def append_log(text: str, tag: str | None = None) -> None:
         log_box.configure(state="normal")
-        log_box.insert("end", text)
+        log_box.insert("end", text, tag or _console_log_tag(text))
         log_box.see("end")
         log_box.configure(state="disabled")
         write_run_log(text)
@@ -904,6 +1175,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     def run_step_process(index: int, step: RunAllStep) -> bool:
         step_path = target_folder / step.bat_name
         if not step_path.exists():
+            events.put(("status", (index, "Failed")))
             events.put(("failed", f"Missing step script: {step_path}"))
             return False
 
@@ -911,12 +1183,14 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             existing_output, _ = run_all_file_info(target_folder, base_name, step.expected_kind)
             if existing_output is not None:
                 events.put(("status", (index, "Skipped")))
+                events.put(("detail", (index, f"Output already exists: {existing_output}. No subprocess needed.")))
                 events.put(("log", f"\n--- {step.label} ---\n"))
                 events.put(("log", f"Skipping because output already exists: {existing_output}\n"))
                 events.put(("progress", index + 1))
                 return True
 
         events.put(("status", (index, "Running")))
+        events.put(("detail", (index, f"Started {step.bat_name}; waiting for its live output.")))
         events.put(("log", f"\n--- {step.label} ---\n"))
 
         args: list[str] = []
@@ -926,6 +1200,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 events.put(("status", (index, "Failed")))
                 events.put(("failed", f"{step.label} could not find input file:\n{input_description}"))
                 return False
+            events.put(("detail", (index, f"Input: {input_path}\nRunning: {step.bat_name}")))
             events.put(("log", f"Using input: {input_path}\n"))
             if step.pass_input:
                 args.append(str(input_path))
@@ -933,23 +1208,27 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         command = ["cmd.exe", "/c", "call", str(step_path), *args]
         env = os.environ.copy()
         env["RUN_ALL"] = "1"
+        events.put(("detail", (index, f"Subprocess: {step.bat_name}\nCommand started; mini-process details will appear below.")))
         events.put(("log", f"Command: {' '.join(command)}\n"))
 
-        process = subprocess.Popen(
-            command,
-            cwd=target_folder,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        current_process["popen"] = process
-
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=target_folder,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as exc:
+            events.put(("status", (index, "Failed")))
+            events.put(("failed", f"{step.label} could not start: {exc}"))
+            return False
         assert process.stdout is not None
         for line in process.stdout:
-            events.put(("log", line))
+            events.put(("output", (index, line)))
 
         return_code = process.wait()
         current_process["popen"] = None
@@ -971,6 +1250,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 events.put(("status", (index, "Failed")))
                 events.put(("failed", f"{step.label} did not create expected file:\n{expected_description}"))
                 return False
+            events.put(("detail", (index, f"Output verified: {expected_output}\n{next_step_text(index)}")))
             events.put(("log", f"Found output: {expected_output}\n"))
 
         events.put(("status", (index, "Done")))
@@ -1078,17 +1358,28 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
 
             if kind == "status":
                 index, value = payload
-                step_status_vars[index].set(value)
+                set_step_status(index, value)
                 status_var.set(f"{steps[index].label}: {value}")
-                write_run_log(f"[STATUS] {steps[index].label}: {value}\n")
+                append_log(
+                    f"[STATUS] {steps[index].label}: {value}\n",
+                    "success" if value in {"Done", "Skipped"} else _console_log_tag(value),
+                )
+            elif kind == "detail":
+                index, message = payload
+                update_step_detail(index, str(message))
             elif kind == "progress":
                 progress_var.set(payload)
+            elif kind == "output":
+                index, line = payload
+                append_log(line)
+                update_step_from_output(index, line)
             elif kind == "log":
                 append_log(payload)
             elif kind == "failed":
                 exit_code["value"] = 1
                 status_var.set(str(payload))
-                append_log(f"\nERROR: {payload}\n")
+                summary_label.configure(fg=status_colors["Failed"])
+                append_log(f"\nERROR: {payload}\n", "failure")
                 stop_button.configure(state="disabled")
             elif kind == "stopped":
                 last_done = payload
@@ -1096,14 +1387,17 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                     f"Stopped by user. Last fully completed step: {last_done}. "
                     f"Run 6_RunAllSteps.bat again to continue from there."
                 )
+                summary_label.configure(fg=status_colors["Stopped"])
                 append_log(
                     f"\nStopped by user. Last fully completed step: {last_done}.\n"
-                    "Ollama models unloaded. Run 6_RunAllSteps.bat again to continue.\n"
+                    "Ollama models unloaded. Run 6_RunAllSteps.bat again to continue.\n",
+                    "warning",
                 )
                 stop_button.configure(state="disabled", text="Stopped")
             elif kind == "complete":
                 status_var.set(str(payload))
-                append_log(f"\n{payload}\n")
+                summary_label.configure(fg=status_colors["Done"])
+                append_log(f"\n{payload}\n", "success")
                 progress_var.set(len(steps))
                 write_run_log(f"[PROGRESS] {len(steps)}/{len(steps)}\n")
                 stop_button.configure(state="disabled")

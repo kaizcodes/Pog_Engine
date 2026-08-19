@@ -29,6 +29,21 @@ def _env_bool(name, default):
     return raw.lower() not in {"0", "false", "no"}
 
 
+def _env_list(name, default):
+    """Read a newline- or semicolon-separated list from the environment."""
+    raw = os.environ.get(name)
+    values = default if raw is None else re.split(r"[\r\n;]+", raw)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        item = item.strip()
+        key = item.casefold()
+        if item and key not in seen:
+            unique.append(item)
+            seen.add(key)
+    return unique
+
+
 # --- Ollama models ---------------------------------------------------------
 # JUDGE_MODEL is separate from MODEL: discovery just reads a transcript chunk
 # and proposes candidates; verify/judge/titling need more careful structured
@@ -146,6 +161,53 @@ EMOTION_BOOSTS = {
     "sad": 0.5,
     "disgust": 0.5,
 }
+
+# --- Hype phrase signal -------------------------------------------------------
+# Enter one phrase per line in the configurator. Matching is case-insensitive
+# substring matching within the configured window around each candidate.
+HYPE_PHRASES_ENABLED = _env_bool("HYPE_PHRASES_ENABLED", True)
+HYPE_PHRASE_WINDOW_SECONDS = _env_int("HYPE_PHRASE_WINDOW_SECONDS", 15)
+HYPE_PHRASE_BOOST = _env_float("HYPE_PHRASE_BOOST", 1.5)
+HYPE_PHRASE_MIN_MATCHES = _env_int("HYPE_PHRASE_MIN_MATCHES", 1)
+
+DEFAULT_HYPE_PHRASES = [
+    "clip that",
+    "someone clip",
+    "did you see that",
+    "no shot",
+    "let's fucking go",
+    "what was that",
+    "i'm built different",
+    "easy",
+    "i'm crazy",
+    "i'm cracked",
+    "did i just",
+    "that was disgusting",
+    "i can't believe it",
+    "outplayed",
+    "outsmarted",
+    "get out of my lobby",
+    "clip it",
+    "clip it chat",
+    "that's crazy",
+    "insane",
+    "bruh",
+    "i'm the goat",
+    "what can i say",
+    "someone clip that",
+    "chat clip it",
+    "holy shit",
+    "hell yeah",
+    "crazy movement",
+    "killed everyone",
+    "deleted",
+    "nuked",
+    "what just happened",
+    "what the fuck",
+    "no way",
+    "oh my god",
+]
+HYPE_PHRASES = _env_list("HYPE_PHRASES", DEFAULT_HYPE_PHRASES)
 
 # --- Full-file audio scan (new candidate source) -----------------------------
 # Closes a gap: candidates used to come only from LLM discovery reading
@@ -297,6 +359,23 @@ EDITABLE_PARAMS = [
     {"key": "AUDIO_SCAN_TITLE_BATCH_SIZE","env":"AUDIO_SCAN_TITLE_BATCH_SIZE","kind":"int","stage":"Audio scan",
      "label": "Audio-scan titling batch size",
      "help": "Peaks titled per LLM call."},
+    # --- Hype phrase signal ---
+    {"key": "HYPE_PHRASES_ENABLED",    "env": "HYPE_PHRASES_ENABLED",    "kind": "bool",  "stage": "Hype phrase signal",
+     "label": "Enable hype phrase detection (HYPE_PHRASES_ENABLED)",
+     "help": "Detects streamer hype phrases like 'clip that', 'no shot', 'let\\'s fucking go', etc. in transcript around candidates and boosts their scores."},
+    {"key": "HYPE_PHRASE_WINDOW_SECONDS","env": "HYPE_PHRASE_WINDOW_SECONDS","kind": "int",  "stage": "Hype phrase signal",
+     "label": "Search window around candidate (seconds)",
+     "help": "How many seconds before/after each candidate timestamp to search for hype phrases in the transcript."},
+    {"key": "HYPE_PHRASE_BOOST",      "env": "HYPE_PHRASE_BOOST",      "kind": "float", "stage": "Hype phrase signal",
+     "label": "Hype phrase score boost (HYPE_PHRASE_BOOST)",
+     "help": "Score points added when hype phrases are detected (capped at 2.0). Applied like emotion boost."},
+    {"key": "HYPE_PHRASE_MIN_MATCHES","env": "HYPE_PHRASE_MIN_MATCHES","kind": "int",   "stage": "Hype phrase signal",
+     "label": "Min phrase matches to trigger boost",
+     "help": "Minimum number of distinct hype phrase matches needed within the window to apply the boost."},
+    {"key": "HYPE_PHRASES", "env": "HYPE_PHRASES", "kind": "phrases", "stage": "Hype phrase signal",
+     "label": "Hype phrases",
+     "help": "One phrase per line. Matching is case-insensitive and searches the transcript window around each candidate."},
+
 ]
 
 
@@ -307,12 +386,12 @@ EDITABLE_PARAMS = [
 # output budgets for the structured verify/judge responses. Discovery stays on
 # qwen3:8b with its own DISCOVERY_NUM_CTX.
 PRESETS = {
-    "3080 10GB - qwen3.6:35b-a3b (judge) + qwen3:8b (discovery)": {
+    "3080 10GB - qwen3:8b (discovery) + qwen3.6:35b-a3b (judge)": {
         "name_short": "qwen3.6:35b-a3b",
-        "description": ("Judge/verify/titling on qwen3.6:35b-a3b (slow; partial CPU "
-                        "offload), discovery on MODEL (qwen3:8b). For RTX 3080 "
-                        "10GB + 32GB DDR4. Better ranking; expect longer per-call "
-                        "latency from the judge/verify stages."),
+        "description": ("Discovery on qwen3:8b; judge/verify/titling on qwen3.6:35b-a3b "
+                        "(slow; partial CPU offload). For RTX 3080 10GB + 32GB DDR4. "
+                        "Better ranking; expect longer per-call latency from the "
+                        "judge/verify stages."),
         "values": {
             "MODEL":                       "qwen3:8b",
             "JUDGE_MODEL":                 "qwen3.6:35b-a3b",
@@ -340,6 +419,10 @@ PRESETS = {
             "EMOTION_MAX_CANDIDATES":      200,
             "EMOTION_BATCH_SIZE":          2,
             "EMOTION_ENABLED":             True,
+            "HYPE_PHRASES_ENABLED":        True,
+            "HYPE_PHRASE_WINDOW_SECONDS":  15,
+            "HYPE_PHRASE_BOOST":           1.5,
+            "HYPE_PHRASE_MIN_MATCHES":     1,
             "AUDIO_SCAN_ENABLED":          True,
             "AUDIO_SCAN_MAX_CANDIDATES":  100,
             "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
@@ -348,12 +431,12 @@ PRESETS = {
             "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
         },
     },
-    "3080 10GB - qwen3.5:9b-q4_K_M (judge) + qwen3:8b (discovery)": {
+    "3080 10GB - qwen3:8b (discovery) + qwen3.5:9b-q4_K_M (judge)": {
         "name_short": "qwen3.5:9b-q4_K_M",
-        "description": ("Judge/verify/titling on qwen3.5:9b-q4_K_M (fast, fully "
-                        "resident in 10GB), discovery on qwen3:8b. For RTX 3080 "
-                        "10GB + 32GB DDR4. The balanced default; judge in ~4-6s "
-                        "per batch."),
+        "description": ("Discovery on qwen3:8b; judge/verify/titling on "
+                        "qwen3.5:9b-q4_K_M (fast, fully resident in 10GB). For "
+                        "RTX 3080 10GB + 32GB DDR4. The balanced default; judge "
+                        "in ~4-6s per batch."),
         "values": {
             "MODEL":                       "qwen3:8b",
             "JUDGE_MODEL":                 "qwen3.5:9b-q4_K_M",
@@ -380,6 +463,10 @@ PRESETS = {
             "EMOTION_MAX_CANDIDATES":      250,
             "EMOTION_BATCH_SIZE":          4,
             "EMOTION_ENABLED":             True,
+            "HYPE_PHRASES_ENABLED":        True,
+            "HYPE_PHRASE_WINDOW_SECONDS":  15,
+            "HYPE_PHRASE_BOOST":           1.5,
+            "HYPE_PHRASE_MIN_MATCHES":     1,
             "AUDIO_SCAN_ENABLED":          True,
             "AUDIO_SCAN_MAX_CANDIDATES":  120,
             "AUDIO_SCAN_TITLE_BATCH_SIZE":10,
@@ -432,6 +519,19 @@ def _coerce_for_write(kind: str, value):
     return f'"{value}"'
 
 
+def _phrase_defaults_source(value, indent: str, newline: str) -> str:
+    raw_phrases = value.splitlines() if isinstance(value, str) else (value or [])
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for raw_phrase in raw_phrases:
+        phrase = str(raw_phrase).strip()
+        key = phrase.casefold()
+        if phrase and key not in seen:
+            phrases.append(phrase)
+            seen.add(key)
+    rows = "".join(f"{indent}    {phrase!r},{newline}" for phrase in phrases)
+    return f"{indent}DEFAULT_HYPE_PHRASES = [{newline}{rows}{indent}]{newline}"
+
 def apply_config_values(values: dict, file_path: str | None = None) -> tuple[bool, str]:
     """Write the supplied defaults to the config file.
 
@@ -440,9 +540,23 @@ def apply_config_values(values: dict, file_path: str | None = None) -> tuple[boo
     """
     path = Path(file_path) if file_path else Path(__file__).resolve()
     source = path.read_text(encoding="utf-8")
-    lines = source.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in source else "\n"
     changed = 0
     touched: set[str] = set()
+
+    if "HYPE_PHRASES" in values:
+        phrase_block = re.compile(
+            r"(?ms)^DEFAULT_HYPE_PHRASES\s*=\s*\[.*?^\]\s*(?:\r?\n|$)"
+        )
+        replacement = _phrase_defaults_source(values["HYPE_PHRASES"], "", newline)
+        new_source, replacements = phrase_block.subn(replacement, source, count=1)
+        if replacements:
+            touched.add("HYPE_PHRASES")
+            if new_source != source:
+                changed += 1
+            source = new_source
+
+    lines = source.splitlines(keepends=True)
 
     env_to_param = {param["env"]: param for param in EDITABLE_PARAMS}
     keys_in_values = set(values.keys())

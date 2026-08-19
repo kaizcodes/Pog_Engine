@@ -76,6 +76,8 @@ from pipeline_config import (
     EMOTION_MODEL_ID, EMOTION_SCORES_CSV, EMOTION_WINDOW_SECONDS,
     EMOTION_MODEL_INPUT_SECONDS, EMOTION_CONFIDENCE_FLOOR, EMOTION_MAX_CANDIDATES,
     EMOTION_BATCH_SIZE, EMOTION_USE_FP16, EMOTION_ENABLED, EMOTION_BOOSTS,
+    HYPE_PHRASES_ENABLED, HYPE_PHRASE_WINDOW_SECONDS, HYPE_PHRASE_BOOST,
+    HYPE_PHRASE_MIN_MATCHES, HYPE_PHRASES,
     AUDIO_SCAN_ENABLED, AUDIO_SCAN_HOP_SECONDS,
     AUDIO_SCAN_MIN_SEPARATION_SECONDS, AUDIO_SCAN_MIN_ZSCORE, AUDIO_SCAN_MAX_CANDIDATES,
     AUDIO_SCAN_SKIP_NEAR_EXISTING_SECONDS, AUDIO_SCAN_LOUDNESS_WEIGHT,
@@ -520,6 +522,12 @@ def emotion_boost(label, confidence):
         boost += 0.5
     return min(boost, 2.0)
 
+def add_score_boost(highlight, boost):
+    if boost <= 0:
+        return False
+    highlight["Score"] = int(min(10, max(1, round(highlight["Score"] + boost))))
+    return True
+
 def load_existing_emotion_scores(csv_path):
     if not os.path.exists(csv_path):
         return {}
@@ -732,11 +740,55 @@ def apply_emotion_scores_to_highlights(highlights, stream_folder):
         h["Emotion"] = emotion
         h["EmotionConfidence"] = f"{confidence:.2f}"
         h["EmotionBoost"] = boost
-        if boost > 0:
-            h["Score"] = int(min(10, max(1, round(h["Score"] + boost))))
+        if add_score_boost(h, boost):
             boosted += 1
 
     print(f"Emotion scoring attached to {len(scores_by_timestamp)} timestamp(s); boosted {boosted} candidate(s).")
+
+def find_hype_phrase_matches(text):
+    normalized = text.casefold()
+    return [
+        phrase for phrase in HYPE_PHRASES
+        if phrase.casefold() in normalized
+    ]
+
+
+def apply_hype_phrase_boost(highlights, transcript_blocks_by_part):
+    """Boost candidates whose nearby transcript contains configured phrases."""
+    if not highlights or not HYPE_PHRASES_ENABLED or not HYPE_PHRASES:
+        return
+
+    all_blocks = flatten_transcript_blocks(transcript_blocks_by_part)
+    if not all_blocks:
+        return
+
+    block_times = [start for start, _ in all_blocks]
+    boosted_count = 0
+    for highlight in highlights:
+        candidate_seconds = timestamp_to_seconds(highlight["Timestamp"])
+        left = bisect.bisect_left(
+            block_times, candidate_seconds - HYPE_PHRASE_WINDOW_SECONDS
+        )
+        right = bisect.bisect_right(
+            block_times, candidate_seconds + HYPE_PHRASE_WINDOW_SECONDS
+        )
+        if left >= right:
+            continue
+
+        window_text = " ".join(text for _, text in all_blocks[left:right])
+        matched_phrases = find_hype_phrase_matches(window_text)
+        if len(matched_phrases) < HYPE_PHRASE_MIN_MATCHES:
+            continue
+
+        boost = min(max(HYPE_PHRASE_BOOST, 0.0), 2.0)
+        highlight["HypePhraseBoost"] = boost
+        highlight["HypePhrases"] = ", ".join(matched_phrases)
+        if add_score_boost(highlight, boost):
+            boosted_count += 1
+
+    if boosted_count:
+        print(f"Hype phrase boost applied to {boosted_count} candidate(s).")
+
 
 def timestamp_to_seconds(ts):
     h, m, s = map(int, ts.split(":"))
@@ -1766,6 +1818,7 @@ def write_highlights_csv(stream_folder, final_highlights, top_n):
         writer.writerow([
             "Rank", "Score", "RawScore", "ScoreCap", "JudgeScore",
             "TranscriptScore", "Emotion", "EmotionConfidence", "EmotionBoost",
+            "HypePhraseBoost", "HypePhrases",
             "Timestamp", "Title", "Reason", "Category"
         ])
         for rank, h in enumerate(final_highlights, start=1):
@@ -1779,6 +1832,8 @@ def write_highlights_csv(stream_folder, final_highlights, top_n):
                 h.get("Emotion", ""),
                 h.get("EmotionConfidence", ""),
                 h.get("EmotionBoost", 0),
+                h.get("HypePhraseBoost", 0),
+                h.get("HypePhrases", ""),
                 h["Timestamp"],
                 h["Title"],
                 h["Reason"],
@@ -1836,6 +1891,11 @@ def write_run_info(stream_folder, final_highlights):
         "timestamp_tolerance_seconds": TIMESTAMP_TOLERANCE_SECONDS,
         "emotion_enabled": EMOTION_ENABLED,
         "emotion_boosts": EMOTION_BOOSTS,
+        "hype_phrases_enabled": HYPE_PHRASES_ENABLED,
+        "hype_phrases": HYPE_PHRASES,
+        "hype_phrase_window_seconds": HYPE_PHRASE_WINDOW_SECONDS,
+        "hype_phrase_boost": HYPE_PHRASE_BOOST,
+        "hype_phrase_min_matches": HYPE_PHRASE_MIN_MATCHES,
         "audio_scan_enabled": AUDIO_SCAN_ENABLED,
         "audio_scan_candidates_found": stats.get("audio_scan_candidates_found", 0),
         "audio_scan_candidates_kept": stats.get("audio_scan_candidates_kept", 0),
@@ -2349,7 +2409,10 @@ def run_stage_emotion(stream_folder):
 
         highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["audioscan"], stage)
 
+        transcript_blocks_by_part = build_transcript_blocks_by_part(stream_folder)
+
         apply_emotion_scores_to_highlights(highlights, stream_folder)
+        apply_hype_phrase_boost(highlights, transcript_blocks_by_part)
         highlights.sort(key=lambda x: x["Score"], reverse=True)
 
         save_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES[stage], highlights)
