@@ -113,6 +113,11 @@ Please report any issues to the issues tab.
 ## ROADMAP:
 1. Auto clips extraction, cut the middle man and get the clips immediately to use
 
+## If you wish to support me
+You could buy me a coffee here: https://ko-fi.com/kaizuchaneru
+
+The money will be put back into development and maintaining this project.
+
 ## Tech Stack
 
 - Python 3.11
