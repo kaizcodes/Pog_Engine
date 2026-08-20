@@ -69,23 +69,21 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 OLLAMA_RETRIES = _env_int("OLLAMA_RETRIES", 2)
 OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
-# Ollama is normally a user-launched tray app; when the user forgets to start
-# it, stage 5 used to die on the first ConnectionError with no recovery.
-# ensure_ollama_running() in analyze_highlights_emotion.py now boots it
-# automatically (ollama serve) when a call gets a connection-level failure,
-# then waits for /api/version to answer before retrying. Only fires for a
-# local server - a remote OLLAMA_URL can't be fixed by spawning a process.
-# OLLAMA_SERVE_READY_TIMEOUT_SECONDS bounds how long a stage waits for a
-# freshly started server to accept connections (cold start is ~1-3s).
-OLLAMA_SERVE = os.environ.get("OLLAMA_SERVE", "ollama")
-OLLAMA_START_ON_CONNECTION_ERROR = _env_bool("HIGHLIGHT_OLLAMA_START_ON_CONNECTION_ERROR", True)
-OLLAMA_SERVE_READY_TIMEOUT_SECONDS = _env_float("HIGHLIGHT_OLLAMA_SERVE_READY_TIMEOUT_SECONDS", 60)
+# Ollama must be running before the highlight analyzer starts. The analyzer
+# performs a /api/version preflight and stops with instructions to close the
+# RunAll GUI, launch Ollama manually, and rerun it if the server is unavailable.
 # Ollama's `options.num_ctx` is sent with each API request, so keep separate
 # budgets for the long transcript discovery prompt and the shorter judge-side
 # prompts. Discovery needs the larger window; qwen3.6's judge preset lowers
 # the judge window to reduce memory pressure.
 DISCOVERY_NUM_CTX = _env_int("HIGHLIGHT_DISCOVERY_NUM_CTX", 8192)
 JUDGE_NUM_CTX = _env_int("HIGHLIGHT_JUDGE_NUM_CTX", 8192)
+# --- Pipeline behavior -------------------------------------------------------
+# The RunAll GUI can optionally suspend Windows after every pipeline step
+# completes successfully. Keep this opt-in so an unattended run never sleeps
+# the machine unless the user explicitly enables it in the configurator.
+AUTO_SLEEP_AFTER_PIPELINE = _env_bool("AUTO_SLEEP_AFTER_PIPELINE", False)
+
 
 # --- Output size / selection ------------------------------------------------
 TOP_N = _env_int("HIGHLIGHT_TOP_N", 50)
@@ -267,6 +265,10 @@ RUN_HISTORY_FILENAME = "pipeline_run_history.csv"
 # env is the environment variable used by the corresponding definition above.
 # Keep environment names unique.
 EDITABLE_PARAMS = [
+    # --- General pipeline behavior ---
+    {"key": "AUTO_SLEEP_AFTER_PIPELINE", "env": "AUTO_SLEEP_AFTER_PIPELINE", "kind": "bool", "stage": "General",
+     "label": "Put PC to sleep after pipeline completes",
+     "help": "When ON, the RunAll GUI puts this Windows PC to sleep after all five pipeline steps finish successfully. Default: OFF."},
     # --- Models (per-step role assignment) ---
     {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
      "label": "Discovery model (MODEL)",
@@ -293,12 +295,6 @@ EDITABLE_PARAMS = [
     {"key": "OLLAMA_RETRY_BACKOFF_SECONDS","env":"OLLAMA_RETRY_BACKOFF_SECONDS","kind":"float","stage":"Ollama",
      "label": "Ollama retry backoff seconds (OLLAMA_RETRY_BACKOFF_SECONDS)",
      "help": "Seconds between retries."},
-    {"key": "OLLAMA_START_ON_CONNECTION_ERROR","env":"HIGHLIGHT_OLLAMA_START_ON_CONNECTION_ERROR","kind":"bool","stage":"Ollama",
-     "label": "Auto-start local Ollama on connection failure",
-     "help": "If a call can't reach Ollama, spawn `ollama serve` (local host only) and retry after it responds to /api/version."},
-    {"key": "OLLAMA_SERVE_READY_TIMEOUT_SECONDS","env":"HIGHLIGHT_OLLAMA_SERVE_READY_TIMEOUT_SECONDS","kind":"float","stage":"Ollama",
-     "label": "Ollama serve readiness timeout (seconds)",
-     "help": "How long to wait for a freshly spawned `ollama serve` to accept connections."},
     # --- Selection / counts ---
     {"key": "TOP_N",            "env": "HIGHLIGHT_TOP_N",           "kind": "int",   "stage": "Selection",
      "label": "Final highlights to export (TOP_N)",
@@ -401,8 +397,6 @@ PRESETS = {
             "AUDIO_SCAN_TITLE_NUM_PREDICT":1800,
             "OLLAMA_RETRIES":              3,
             "OLLAMA_RETRY_BACKOFF_SECONDS":8.0,
-            "OLLAMA_START_ON_CONNECTION_ERROR": True,
-            "OLLAMA_SERVE_READY_TIMEOUT_SECONDS": 90.0,
             "TOP_N":                       50,
             "JUDGE_POOL_SIZE":             100,
             "VERIFY_POOL_SIZE":           150,
@@ -446,8 +440,6 @@ PRESETS = {
             "AUDIO_SCAN_TITLE_NUM_PREDICT":1200,
             "OLLAMA_RETRIES":              2,
             "OLLAMA_RETRY_BACKOFF_SECONDS":5.0,
-            "OLLAMA_START_ON_CONNECTION_ERROR": True,
-            "OLLAMA_SERVE_READY_TIMEOUT_SECONDS": 60.0,
             "TOP_N":                       50,
             "JUDGE_POOL_SIZE":             100,
             "VERIFY_POOL_SIZE":           150,
@@ -470,6 +462,49 @@ PRESETS = {
             "AUDIO_SCAN_ENABLED":          True,
             "AUDIO_SCAN_MAX_CANDIDATES":  120,
             "AUDIO_SCAN_TITLE_BATCH_SIZE":10,
+            "EXPORT_PREVIEW_CLIPS":       False,
+            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
+            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
+        },
+    },
+    "3080 10GB - qwen3.5:9b-q4_K_M (discovery) + qwen3.6:35b-a3b (judge)": {
+        "name_short": "qwen3.5:9b-q4_K_M + qwen3.6:35b-a3b",
+        "description": ("Discovery and judge/verify/titling on qwen3.5:9b-q4_K_M "
+                        "and qwen3.6:35b-a3b respectively (slow; partial CPU "
+                        "offload). For RTX 3080 10GB + 32GB DDR4. Uses the "
+                        "stronger qwen3.5 discovery model while retaining the "
+                        "larger qwen3.6 judge."),
+        "values": {
+            "MODEL":                       "qwen3.5:9b-q4_K_M",
+            "JUDGE_MODEL":                 "qwen3.6:35b-a3b",
+            "DISCOVERY_NUM_CTX":            8192,
+            "JUDGE_NUM_CTX":                 6144,
+            "VERIFY_NUM_PREDICT":          2200,
+            "AUDIO_SCAN_TITLE_NUM_PREDICT":1800,
+            "OLLAMA_RETRIES":              3,
+            "OLLAMA_RETRY_BACKOFF_SECONDS":8.0,
+            "TOP_N":                       50,
+            "JUDGE_POOL_SIZE":             100,
+            "VERIFY_POOL_SIZE":           150,
+            "VERIFY_BATCH_SIZE":           8,
+            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
+            "JUDGE_BATCH_SIZE":           10,
+            "TIMESTAMP_TOLERANCE_SECONDS": 15,
+            "VOCAL_ISOLATION_SEGMENT_SECONDS": 20,
+            "NOISE_GATE_THRESHOLD_DB":   -35,
+            "NOISE_GATE_RATIO":             8,
+            "NOISE_GATE_ATTACK_MS":        10,
+            "NOISE_GATE_RELEASE_MS":       200,
+            "EMOTION_MAX_CANDIDATES":      200,
+            "EMOTION_BATCH_SIZE":          2,
+            "EMOTION_ENABLED":             True,
+            "HYPE_PHRASES_ENABLED":        True,
+            "HYPE_PHRASE_WINDOW_SECONDS":  15,
+            "HYPE_PHRASE_BOOST":           1.5,
+            "HYPE_PHRASE_MIN_MATCHES":     1,
+            "AUDIO_SCAN_ENABLED":          True,
+            "AUDIO_SCAN_MAX_CANDIDATES":  100,
+            "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
             "EXPORT_PREVIEW_CLIPS":       False,
             "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
             "PREVIEW_CLIP_SECONDS_AFTER":  10.0,

@@ -61,15 +61,12 @@ import bisect
 import difflib
 import io
 import argparse
-from urllib.parse import urlparse
 from datetime import datetime
 from pathlib import Path
 
 from pipeline_config import (
     MODEL, JUDGE_MODEL, DISCOVERY_NUM_CTX, JUDGE_NUM_CTX, OLLAMA_URL, OLLAMA_CHAT_URL,
     OLLAMA_RETRIES, OLLAMA_RETRY_BACKOFF_SECONDS,
-    OLLAMA_SERVE, OLLAMA_START_ON_CONNECTION_ERROR,
-    OLLAMA_SERVE_READY_TIMEOUT_SECONDS,
     TOP_N, JUDGE_POOL_SIZE, VERIFY_POOL_SIZE, VERIFY_BATCH_SIZE, VERIFY_MIN_COVERAGE_RATIO,
     VERIFY_NUM_PREDICT, JUDGE_BATCH_SIZE,
     TIMESTAMP_TOLERANCE_SECONDS,
@@ -108,10 +105,6 @@ CALL_STATS = {"ollama_calls": 0, "ollama_seconds": 0.0, "ollama_retries": 0}
 AUDIO_SCAN_STATS = {"candidates_found": 0, "candidates_kept": 0}
 PROCESS_START_TIME = time.time()
 
-# Handle of the last `ollama serve` this process spawned via
-# ensure_ollama_running(); used to avoid double-starting and to detect that
-# a spawned server died before becoming ready.
-_OLLAMA_SERVE_PROC = None
 
 # --- Checkpoint I/O -----------------------------------------------------
 # Makes each stage resumable: every stage function checks checkpoint_exists()
@@ -320,90 +313,34 @@ def _ollama_base_url(url):
 
 
 def ollama_is_reachable(base_url, timeout=3):
-    """True if an Ollama server answers /api/version at base_url. Any HTTP
-    response counts (a busy server is still up); only connection-level
-    failures mean there is no server there."""
+    """True if an Ollama server answers /api/version successfully."""
     try:
-        requests.get(base_url.rstrip("/") + "/api/version", timeout=timeout)
+        response = requests.get(base_url.rstrip("/") + "/api/version", timeout=timeout)
+        response.raise_for_status()
         return True
     except requests.exceptions.RequestException:
         return False
 
 
-def ensure_ollama_running(url):
-    """If no Ollama server is answering at url, start one (`ollama serve`,
-    detached so it outlives this process) and wait until it accepts
-    connections. Keeps a pipeline run from dying because the user forgot to
-    launch Ollama first.
+def ollama_startup_message(base_url):
+    return (
+        f"Ollama is not active at {base_url}.\n"
+        "Close the RunAll GUI, launch Ollama manually, wait for it to finish "
+        "starting, then run 6_RunAllSteps.bat again."
+    )
 
-    Only auto-starts for a local server (localhost/127.0.0.1/::1) - a remote
-    OLLAMA_URL can't be fixed by spawning a process here. Keeps at most one
-    spawned server alive per process; re-spawns only if a previous one
-    exited, and reports if that one dies before becoming ready.
-    """
+
+def require_ollama_ready(url):
+    """Report the manual startup workflow and refuse to begin without Ollama."""
     base_url = _ollama_base_url(url)
     if ollama_is_reachable(base_url):
         return True
-    if not OLLAMA_START_ON_CONNECTION_ERROR:
-        return False
-    host = urlparse(url).hostname
-    if host not in ("localhost", "127.0.0.1", "::1"):
-        print(f"     [!] Ollama not reachable at {base_url} and host {host!r} is not local - not auto-starting.")
-        return False
-
-    global _OLLAMA_SERVE_PROC
-    if _OLLAMA_SERVE_PROC is not None and _OLLAMA_SERVE_PROC.poll() is None:
-        # We already launched one and it is still alive; it just isn't
-        # answering yet (or just went down). Wait on it, don't re-spawn.
-        pass
-    else:
-        print(f"     [!] Ollama is not running; starting it ({OLLAMA_SERVE} serve)...")
-        try:
-            flags = (
-                getattr(subprocess, "DETACHED_PROCESS", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-            _OLLAMA_SERVE_PROC = subprocess.Popen(
-                [OLLAMA_SERVE, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=flags,
-                close_fds=True,
-            )
-        except Exception as exc:
-            print(f"     [WARN] Could not launch {OLLAMA_SERVE!r} serve: {exc}")
-            return False
-
-    deadline = time.time() + OLLAMA_SERVE_READY_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        if ollama_is_reachable(base_url):
-            print(f"     [OK] Ollama is up at {base_url}.")
-            return True
-        if _OLLAMA_SERVE_PROC is not None and _OLLAMA_SERVE_PROC.poll() is not None:
-            print(f"     [WARN] {OLLAMA_SERVE!r} serve exited with code {_OLLAMA_SERVE_PROC.returncode} before becoming ready.")
-            return False
-        time.sleep(0.5)
-    print(f"     [WARN] Ollama still not answering at {base_url} after {OLLAMA_SERVE_READY_TIMEOUT_SECONDS:.0f}s.")
+    print(f"     [ERROR] {ollama_startup_message(base_url)}")
     return False
 
 
 def ollama_generate(payload, timeout, url=None):
-    """POST to an Ollama endpoint (default /api/generate) with a couple of
-    retries.
-
-    A transient hiccup (Ollama busy loading a different model, a brief
-    connection reset) used to just silently reduce candidate coverage for
-    whichever part/batch was in flight, since the raw requests.post() call
-    had no retry. This wraps the one HTTP call every stage of the pipeline
-    makes, so a retry only has to be written once. Also tracks call count and
-    elapsed time centrally for the end-of-run summary.
-
-    url defaults to OLLAMA_URL (/api/generate) but callers that need
-    thinking reliably disabled on JUDGE_MODEL should pass OLLAMA_CHAT_URL
-    instead - see the OLLAMA_CHAT_URL note in pipeline_config.py for why
-    /api/generate's think:false can't be trusted for qwen3.5.
-    """
+    """POST to an Ollama endpoint (default /api/generate) with retries."""
     if url is None:
         url = OLLAMA_URL
     last_exc = None
@@ -417,13 +354,14 @@ def ollama_generate(payload, timeout, url=None):
             return response
         except Exception as exc:
             last_exc = exc
-            if isinstance(exc, requests.exceptions.ConnectionError):
-                ensure_ollama_running(url)
+            if isinstance(exc, requests.exceptions.ConnectionError) and attempt == OLLAMA_RETRIES:
+                print(f"     [ERROR] {ollama_startup_message(_ollama_base_url(url))}")
             if attempt < OLLAMA_RETRIES:
                 CALL_STATS["ollama_retries"] += 1
                 print(f"     [!] Ollama call failed ({exc}); retrying in {OLLAMA_RETRY_BACKOFF_SECONDS:.0f}s...")
                 time.sleep(OLLAMA_RETRY_BACKOFF_SECONDS * (attempt + 1))
     raise last_exc
+
 
 def find_mic_wav(stream_folder):
     """Find the mic WAV produced by step 1."""
@@ -436,7 +374,6 @@ def find_mic_wav(stream_folder):
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
-
 def find_source_video(stream_folder):
     """Find the original recording (mp4/mkv/mov) that step 0 moved into this
     folder, so preview clips can be cut with picture, not just the extracted
@@ -2599,10 +2536,15 @@ def main():
     print("Stream Folder:", stream_folder)
     print()
 
+    if not require_ollama_ready(OLLAMA_URL):
+        return 1
+
     if args.stage:
         run_single_stage_forced(stream_folder, args.stage)
     else:
         run_all_remaining_stages(stream_folder)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

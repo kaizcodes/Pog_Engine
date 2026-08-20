@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 from pipeline_config import (
+    AUTO_SLEEP_AFTER_PIPELINE,
     EMOTION_ENABLED,
     EMOTION_MODEL_ID,
     JUDGE_MODEL,
@@ -53,6 +54,27 @@ WHISPER_CLI = r"G:\pog_dev\models\Release\whisper-cli.exe"
 WHISPER_MODEL = r"G:\pog_dev\models\ggml-large-v3.bin"
 WHISPER_VAD = r"G:\pog_dev\models\ggml-silero-v6.2.0.bin"
 
+
+def _ollama_base_url(url: str) -> str:
+    return url.split("/api/", 1)[0]
+
+
+def ollama_is_reachable(base_url: str, timeout: float = 3) -> bool:
+    """Return true only when the Ollama health endpoint responds successfully."""
+    try:
+        response = requests.get(base_url.rstrip("/") + "/api/version", timeout=timeout)
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+def ollama_not_ready_message(base_url: str) -> str:
+    return (
+        f"Ollama is not active at {base_url}.\n"
+        "Close the RunAll GUI, launch Ollama manually, wait for it to finish "
+        "starting, then run 6_RunAllSteps.bat again."
+    )
 
 @dataclass(frozen=True)
 class SubtitleEntry:
@@ -717,7 +739,7 @@ ANALYSIS_STAGE_DETAILS = {
     "5f. Export": {
         "task": "Export: writing CSV, EDL, and run metadata",
         "model": "Model: none",
-        "next": "Next: Run complete",
+        "next": "",
     },
 }
 
@@ -734,9 +756,9 @@ def _step_model_details(index: int) -> tuple[str, str]:
             f"Whisper model: {Path(WHISPER_MODEL).name}; VAD: {Path(WHISPER_VAD).name}",
         )
     if index == 2:
-        return "Process: repair timestamps and remove adjacent repeats", "Model: none"
+        return "Process: repair timestamps and remove adjacent repeats", ""
     if index == 3:
-        return "Process: regroup captions into transcript_part files", "Model: none"
+        return "Process: regroup captions into transcript_part files", ""
     return (
         "Process: discovery → audio scan → emotion → verification → judging → export",
         f"Models: {MODEL} / {JUDGE_MODEL} / {EMOTION_MODEL_ID if EMOTION_ENABLED else 'emotion disabled'}",
@@ -833,7 +855,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     steps = build_run_all_steps(target_folder, base_name)
 
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import messagebox, ttk
 
     try:
         from PIL import Image, ImageTk
@@ -915,7 +937,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     def next_step_text(index: int) -> str:
         if index + 1 < len(steps):
             return f"Next: {steps[index + 1].label}"
-        return "Next: Run complete"
+        return ""
 
     for index, _step in enumerate(steps):
         process_detail, model_detail = _step_model_details(index)
@@ -1189,6 +1211,17 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 events.put(("progress", index + 1))
                 return True
 
+        if step.bat_name == "5_AnalyzeHighlights.bat":
+            ollama_base_url = _ollama_base_url(OLLAMA_URL)
+            if not ollama_is_reachable(ollama_base_url):
+                message = ollama_not_ready_message(ollama_base_url)
+                events.put(("status", (index, "Failed")))
+                events.put(("detail", (index, "Ollama must be running before Step 5 can start.")))
+                events.put(("log", f"\n--- {step.label} ---\n{message}\n"))
+                events.put(("ollama_unavailable", message))
+                events.put(("failed", message))
+                return False
+
         events.put(("status", (index, "Running")))
         events.put(("detail", (index, f"Started {step.bat_name}; waiting for its live output.")))
         events.put(("log", f"\n--- {step.label} ---\n"))
@@ -1250,7 +1283,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 events.put(("status", (index, "Failed")))
                 events.put(("failed", f"{step.label} did not create expected file:\n{expected_description}"))
                 return False
-            events.put(("detail", (index, f"Output verified: {expected_output}\n{next_step_text(index)}")))
+            events.put(("detail", (index, f"Output verified: {expected_output}")))
             events.put(("log", f"Found output: {expected_output}\n"))
 
         events.put(("status", (index, "Done")))
@@ -1271,6 +1304,19 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             events.put(("log", f"[stop] Killed process tree (PID {process.pid}).\n"))
         except Exception as exc:
             events.put(("log", f"[stop] taskkill failed: {exc}\n"))
+
+    def request_system_sleep() -> None:
+        """Put Windows into sleep after a successful, opted-in pipeline run."""
+        try:
+            import ctypes
+
+            set_suspend_state = ctypes.windll.powrprof.SetSuspendState
+            set_suspend_state.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
+            set_suspend_state.restype = ctypes.c_bool
+            if not set_suspend_state(False, False, False):
+                raise OSError("SetSuspendState returned FALSE")
+        except Exception as exc:
+            events.put(("log", f"[sleep] Could not put the PC to sleep: {exc}\n"))
 
     def unload_ollama_models_now() -> None:
         for model_name in (MODEL, JUDGE_MODEL):
@@ -1367,6 +1413,8 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             elif kind == "detail":
                 index, message = payload
                 update_step_detail(index, str(message))
+            elif kind == "ollama_unavailable":
+                messagebox.showwarning("Ollama is not running", str(payload), parent=root)
             elif kind == "progress":
                 progress_var.set(payload)
             elif kind == "output":
@@ -1395,12 +1443,18 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 )
                 stop_button.configure(state="disabled", text="Stopped")
             elif kind == "complete":
-                status_var.set(str(payload))
+                status_message = str(payload)
+                if AUTO_SLEEP_AFTER_PIPELINE:
+                    status_message += " PC will go to sleep now."
+                status_var.set(status_message)
                 summary_label.configure(fg=status_colors["Done"])
-                append_log(f"\n{payload}\n", "success")
+                append_log(f"\n{status_message}\n", "success")
                 progress_var.set(len(steps))
                 write_run_log(f"[PROGRESS] {len(steps)}/{len(steps)}\n")
                 stop_button.configure(state="disabled")
+                if AUTO_SLEEP_AFTER_PIPELINE:
+                    append_log("[sleep] Auto-sleep is enabled; suspending Windows.\n", "success")
+                    threading.Thread(target=request_system_sleep, daemon=True).start()
 
         root.after(100, drain_events)
 

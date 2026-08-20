@@ -145,6 +145,26 @@ def run_gui() -> int:
         text=("Choose the Ollama models, apply a preset for this machine, then save. "
               "Changes go directly to pipeline_config.py."),
     ).pack(anchor="w", pady=(2, 8))
+    general_params = [param for param in cfg.EDITABLE_PARAMS if param["stage"] == "General"]
+    if general_params:
+        general_frame = ttk.LabelFrame(top, text="Pipeline behavior", padding=(8, 4))
+        general_frame.pack(fill="x", pady=(0, 6))
+        general_frame.columnconfigure(1, weight=1)
+        for row_index, param in enumerate(general_params):
+            ttk.Label(general_frame, text=param["label"], anchor="w").grid(
+                row=row_index * 2, column=0, sticky="w", padx=(0, 8), pady=(2, 0)
+            )
+            if param["kind"] == "bool":
+                widget = ttk.Checkbutton(general_frame, variable=var_state[param["key"]])
+            else:
+                widget = ttk.Entry(general_frame, textvariable=var_state[param["key"]], width=14)
+            widget.grid(row=row_index * 2, column=1, sticky="w", pady=(2, 0))
+            ttk.Label(
+                general_frame,
+                text=param["help"],
+                foreground="#8a8a8a",
+                wraplength=900,
+            ).grid(row=row_index * 2 + 1, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
 
     def refresh_models() -> None:
@@ -289,6 +309,8 @@ def run_gui() -> int:
 
     section_row = 0
     for stage, params in by_stage.items():
+        if stage == "General":
+            continue
         section = ttk.LabelFrame(params_frame, text=stage, padding=(10, 6))
         section.grid(row=section_row, column=0, sticky="ew", pady=(0, 8))
         section.columnconfigure(1, weight=1)
