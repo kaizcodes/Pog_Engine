@@ -52,10 +52,8 @@ Download qwen3.5:9b-q4_K_M : ```ollama run qwen3.5:9b-q4_K_M```
 
 
 ## 2. Setting up Pog_Engine
-
-<img width="916" height="401" alt="{B07D9456-F90D-4832-BBBF-039A72DAFAAB}" src="https://github.com/user-attachments/assets/381e916a-d8f8-4c61-9d0b-93625fa20813" />
- 
-Code -> Download ZIP
+Get PogEngine.zip here
+https://github.com/kaizcodes/Pog_Engine/releases/tag/Release
 
 1. Extract ZIP and store the files in ```Pog_Engine``` folder
 2. Run **Install_PogEngine.bat**
@@ -90,6 +88,10 @@ I made the default settings for Pog Engine to work on all machines, this configu
 Launch **ConfigurePogEngine.bat**
 
 You can change the presets model I have written to use on my own machine and I know will work on machines with similar spec.
+
+## Updating Pog Engine:
+When there is a new Pog Engine update, you should grab it from Releases and replace all the files in your folder with the files in the ZIP.
+This will unfortunately override your preset if you have adjusted it.
 
 ## Companion tools (COMING SOON): 
 These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
