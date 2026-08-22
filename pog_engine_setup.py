@@ -45,7 +45,11 @@ import json
 import os
 import queue
 import re
-import requests
+try:
+    import requests
+except ImportError:
+    # The installer must be able to install requests on a clean Python.
+    requests = None  # type: ignore[assignment]
 import shutil
 import subprocess
 import sys
@@ -55,6 +59,44 @@ import urllib.request
 import wave
 import zipfile
 from pathlib import Path
+
+
+def ensure_requests() -> bool:
+    """Make the installer's own HTTP dependency available before setup starts."""
+    global requests
+    if requests is not None:
+        return True
+
+    print("[INFO] requests is missing; installing it into this Python interpreter...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install",
+         "--disable-pip-version-check", "requests"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.stdout.strip():
+        print(result.stdout.rstrip())
+    if result.returncode != 0:
+        print("[ERROR] Could not install requests.")
+        if result.stderr.strip():
+            print(result.stderr.rstrip())
+        print(f"       Python used: {sys.executable}")
+        print("       Run this same interpreter with -m pip, then rerun the installer.")
+        return False
+
+    try:
+        import requests as installed_requests
+    except ImportError as exc:
+        print(f"[ERROR] requests was installed but cannot be imported: {exc}")
+        print(f"       Python used: {sys.executable}")
+        return False
+    requests = installed_requests
+    print("[OK]     requests is ready.")
+    return True
+
+
 REQUIRED_SCRIPTS = [
     "analyze_highlights_emotion.py",
     "OrganizeVODAndFixSRT_Emotion.py",
@@ -1533,6 +1575,8 @@ def main(argv: list[str]) -> int:
     args = [a for a in args if a != "--cli"]
     default_dir = args[0] if args else str(Path(__file__).resolve().parent)
 
+    if not ensure_requests():
+        return 1
     if cli_mode:
         return run_cli(default_dir)
 
