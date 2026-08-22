@@ -50,8 +50,8 @@ try:
 except ImportError:
     # The installer must be able to install requests on a clean Python.
     requests = None  # type: ignore[assignment]
-import shutil
-import subprocess
+import winreg
+
 import sys
 import tempfile
 import threading
@@ -504,27 +504,81 @@ def find_whisper_cli(pog_dir: Path, reporter: Reporter) -> Path | None:
     reporter.status("whisper-cli.exe", "Missing")
     return None
 
+def download_ffmpeg(pog_dir: Path, reporter: Reporter) -> bool:
+
+    """Download the Windows ffmpeg/ffprobe bundle when neither is available."""
+    local_bin = pog_dir / "ffmpeg" / "bin"
+    local_ffmpeg = local_bin / "ffmpeg.exe"
+    local_ffprobe = local_bin / "ffprobe.exe"
+    if local_ffmpeg.is_file() and local_ffprobe.is_file():
+        os.environ["PATH"] = str(local_bin) + os.pathsep + os.environ.get("PATH", "")
+        persist_ffmpeg_path(local_bin)
+        reporter.log(f"  [OK]     ffmpeg bundle already exists at {local_bin}")
+        reporter.status("ffmpeg download", "Already downloaded")
+        return True
+
+    reporter.section("Downloading ffmpeg / ffprobe")
+    url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+    zip_path = pog_dir / "ffmpeg-release-essentials.zip.tmp"
+    extract_dir = pog_dir / "ffmpeg-release-essentials.extract.tmp"
+    try:
+        if not zip_path.is_file():
+            with requests.get(url, stream=True, timeout=300) as response:
+                response.raise_for_status()
+                with open(zip_path, "wb") as output:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            output.write(chunk)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(extract_dir)
+        ffmpeg_candidates = list(extract_dir.rglob("ffmpeg.exe"))
+        ffprobe_candidates = list(extract_dir.rglob("ffprobe.exe"))
+        if not ffmpeg_candidates or not ffprobe_candidates:
+            raise IOError("the archive did not contain ffmpeg.exe and ffprobe.exe")
+        local_bin.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ffmpeg_candidates[0], local_ffmpeg)
+        shutil.copy2(ffprobe_candidates[0], local_ffprobe)
+        os.environ["PATH"] = str(local_bin) + os.pathsep + os.environ.get("PATH", "")
+        zip_path.unlink(missing_ok=True)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        persist_ffmpeg_path(local_bin)
+        reporter.status("ffmpeg download", "Downloaded")
+        return True
+    except Exception as exc:
+        reporter.log(f"  [WARN] ffmpeg download failed: {exc}")
+        reporter.status("ffmpeg download", "Failed")
+        zip_path.unlink(missing_ok=True)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return False
+def persist_ffmpeg_path(local_bin: Path) -> None:
+    """Make the private bundle available to future .bat/Python processes."""
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0,
+                        winreg.KEY_READ | winreg.KEY_WRITE) as key:
+        try:
+            current = winreg.QueryValueEx(key, "Path")[0]
+        except FileNotFoundError:
+            current = ""
+        entries = [item for item in current.split(";") if item]
+        normalized = str(local_bin).rstrip("\\").casefold()
+        if not any(item.rstrip("\\").casefold() == normalized for item in entries):
+            entries.append(str(local_bin))
+            winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, ";".join(entries))
+
 
 def check_ffmpeg(reporter: Reporter) -> bool:
-    """ffmpeg is used throughout (mic extraction, transcode, preview clips)
-    and was never explicitly checked before - now that ffprobe also drives
-    the single-track-vs-multi-track VOD detection (see count_audio_streams()
-    in OrganizeVODAndFixSRT_Emotion.py), a missing install silently falls
-    back to "assume multi-track" instead of failing loudly, so it's worth
-    surfacing here."""
-    reporter.section("Checking for ffmpeg / ffprobe")
+    """Check ffmpeg and ffprobe, including the installer's local bundle."""
     ffmpeg_ok = shutil.which("ffmpeg") is not None
     ffprobe_ok = shutil.which("ffprobe") is not None
+    reporter.section("Checking for ffmpeg / ffprobe")
     reporter.log(f"  {mark(ffmpeg_ok)} ffmpeg on PATH")
     reporter.status("ffmpeg", "OK" if ffmpeg_ok else "Missing")
     reporter.log(f"  {mark(ffprobe_ok)} ffprobe on PATH")
     reporter.status("ffprobe", "OK" if ffprobe_ok else "Missing")
     if not (ffmpeg_ok and ffprobe_ok):
-        reporter.log("      -> both ship together: install ffmpeg (https://ffmpeg.org/download.html)")
-        reporter.log("         and add its bin folder to PATH. ffprobe is what auto-detects whether a")
-        reporter.log("         dropped VOD is a single-track Twitch-style file or a locally recorded")
-        reporter.log("         file with separate game/mic tracks - without it, every VOD is assumed")
-        reporter.log("         to have separate tracks (safe, but wrong for a Twitch VOD).")
+        reporter.log("      -> ffmpeg/ffprobe were not found. The installer downloads them")
+        reporter.log("         into ffmpeg\\bin when setup runs; rerun setup if needed.")
     return ffmpeg_ok and ffprobe_ok
 
 
@@ -1222,7 +1276,9 @@ def run_all_checks(pog_dir: Path, reporter: Reporter, install: bool = True) -> b
         download_all_models(models_dir, reporter)
         # Re-check models after downloads so summary is accurate
         _, missing_models, whisper_cli = check_models(pog_dir, reporter)
-    
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            download_ffmpeg(pog_dir, reporter)
+
     ffmpeg_ok = check_ffmpeg(reporter)
 
     # Repoint the machine-specific path constants in the three pipeline scripts
