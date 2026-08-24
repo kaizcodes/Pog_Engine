@@ -13,15 +13,19 @@ make_extract_mic_bat_singletrack() there.
 Not meant to be run standalone in normal use - the auto-generated
 1_ExtractMicAudio.bat calls this after extracting the full mix with ffmpeg:
 
-  python isolate_vocals.py <mixed_audio.wav> <output_mic.wav>
+  python isolate_vocals.py <mixed_audio.w64> <output_mic.wav>
 
-<mixed_audio.wav> should be the full-quality mixed track (44.1kHz stereo is
+The runner saves the full-mix Demucs input chunks and the trimmed separated
+mic chunks in persistent folders, concatenates the separated chunks into a
+Wave64 file, then renders <output_mic.wav> at 16kHz mono with the shared noise
+gate. This lets Step 1 finish all separation and rendering before Step 2
+creates its independent Whisper chunks.
+
+<mixed_audio.w64> should be the full-quality mixed track (44.1kHz stereo is
 what the .bat extracts, since downsampling before separation would hurt
-separation quality). <output_mic.wav> is written at 16kHz mono with the same
-noise gate the multi-track path applies, so everything downstream
-(2_TranscribeAudio.bat, the emotion model, the audio-scan sidecar - all of
-which just look for *_mic.wav) sees an identical format regardless of which
-path produced it.
+separation quality). <output_mic.wav> is written at 16kHz mono, so everything
+downstream (2_TranscribeAudio.bat, the emotion model, the audio-scan sidecar -
+all of which look for *_mic.wav) sees one stable format.
 
 Demucs downloads its pretrained separation model (~80MB, htdemucs by
 default) the first time it runs on a machine - see TORCH_CACHE_DIR below for
@@ -33,6 +37,9 @@ predownload_demucs_model() there.
 
 from __future__ import annotations
 
+import argparse
+import json
+import math
 import os
 import shutil
 import subprocess
@@ -112,16 +119,11 @@ def detect_device() -> str:
         return "cpu"
 
 
-def run_demucs(input_wav: Path, work_dir: Path) -> Path:
-    """Runs Demucs as a subprocess (rather than importing its API directly)
-    so this script's own dependencies stay minimal and its behavior matches
-    running `python -m demucs` by hand for debugging. Returns the path to
-    the separated vocals.wav stem."""
-    device = detect_device()
-    print(f"[isolate-vocals] Model: {VOCAL_ISOLATION_MODEL}  Device: {device}")
-    if device == "cpu":
-        print("[isolate-vocals] No GPU in use - this will be much slower on a long VOD.")
+DEMUCS_CHUNK_SECONDS = 10 * 60
+DEMUCS_CHUNK_OVERLAP_SECONDS = 1
 
+
+def _demucs_command(input_wav: Path, work_dir: Path, device: str) -> list[str]:
     cmd = [
         sys.executable, "-m", "demucs",
         "-n", VOCAL_ISOLATION_MODEL,
@@ -130,19 +132,327 @@ def run_demucs(input_wav: Path, work_dir: Path) -> Path:
         "-o", str(work_dir),
     ]
     if VOCAL_ISOLATION_SEGMENT_SECONDS:
-        cmd += ["--segment", str(VOCAL_ISOLATION_SEGMENT_SECONDS)]
+        segment_seconds = int(VOCAL_ISOLATION_SEGMENT_SECONDS)
+        if segment_seconds <= 0:
+            raise ValueError("VOCAL_ISOLATION_SEGMENT_SECONDS must be positive")
+        # HTDemucs' checkpoint was trained with a 7.8-second Transformer
+        # window. Demucs rejects the CLI's integer segment values above 7;
+        # omit the override so it uses the model-native 7.8-second window.
+        if (
+            VOCAL_ISOLATION_MODEL.lower().startswith("htdemucs")
+            and segment_seconds > 7
+        ):
+            print(
+                "[isolate-vocals] [!] Requested Demucs segment "
+                f"{segment_seconds}s exceeds HTDemucs' 7.8s training window; "
+                "using the model-native 7.8s window instead.",
+                flush=True,
+            )
+        else:
+            cmd += ["--segment", str(segment_seconds)]
     cmd.append(str(input_wav))
+    return cmd
 
-    print("[isolate-vocals] Running:", " ".join(cmd))
+
+def _run_checked(cmd: list[str], description: str) -> None:
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        raise RuntimeError(f"demucs exited with code {result.returncode}")
+        raise RuntimeError(f"{description} exited with code {result.returncode}")
 
-    # Demucs writes to {out}/{model_name}/{track_stem}/{stem}.wav.
+
+def _probe_duration_seconds(input_wav: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(input_wav),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe exited with code {result.returncode}")
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"ffprobe returned an invalid duration: {result.stdout!r}") from exc
+    if duration <= 0:
+        raise RuntimeError(f"ffprobe returned a non-positive duration: {duration}")
+    return duration
+
+
+def _run_demucs_once(input_wav: Path, work_dir: Path, device: str) -> Path:
+    cmd = _demucs_command(input_wav, work_dir, device)
+    print("[isolate-vocals] Running:", " ".join(cmd), flush=True)
+    _run_checked(cmd, "demucs")
     vocals_path = work_dir / VOCAL_ISOLATION_MODEL / input_wav.stem / "vocals.wav"
     if not vocals_path.exists():
         raise RuntimeError(f"demucs finished but expected output not found: {vocals_path}")
     return vocals_path
+
+
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    temporary_path = path.with_name(path.name + ".tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _load_json(path: Path) -> dict[str, object] | None:
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return candidate if isinstance(candidate, dict) else None
+
+
+def _prepare_demucs_chunks(
+    input_wav: Path,
+    chunk_dir: Path,
+    duration: float,
+) -> list[dict[str, object]]:
+    """Persist the full-mix windows that Demucs will receive."""
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    duration_ms = round(duration * 1_000)
+    chunk_count = max(1, math.ceil(duration / DEMUCS_CHUNK_SECONDS))
+    manifest_path = chunk_dir / "chunk_manifest.json"
+    existing_manifest = _load_json(manifest_path)
+    reusable = (
+        existing_manifest is not None
+        and existing_manifest.get("source_audio") == input_wav.name
+        and existing_manifest.get("duration_ms") == duration_ms
+        and existing_manifest.get("chunk_seconds") == DEMUCS_CHUNK_SECONDS
+        and existing_manifest.get("overlap_seconds") == DEMUCS_CHUNK_OVERLAP_SECONDS
+        and isinstance(existing_manifest.get("chunks"), list)
+        and len(existing_manifest["chunks"]) == chunk_count
+    )
+
+    entries: list[dict[str, object]] = []
+    for index in range(chunk_count):
+        logical_start = index * DEMUCS_CHUNK_SECONDS
+        logical_end = min(duration, logical_start + DEMUCS_CHUNK_SECONDS)
+        left_overlap = DEMUCS_CHUNK_OVERLAP_SECONDS if index else 0
+        right_overlap = (
+            DEMUCS_CHUNK_OVERLAP_SECONDS if logical_end < duration else 0
+        )
+        chunk_start = max(0.0, logical_start - left_overlap)
+        chunk_duration = logical_end - chunk_start + right_overlap
+        chunk_path = chunk_dir / f"{input_wav.stem}_demucs_chunk_{index + 1:04d}.w64"
+        if not (
+            reusable
+            and chunk_path.is_file()
+            and chunk_path.stat().st_size > 0
+        ):
+            print(
+                f"[isolate-vocals] Extracting Demucs chunk "
+                f"{index + 1:02d}/{chunk_count:02d}: "
+                f"{logical_start:.1f}s-{logical_end:.1f}s",
+                flush=True,
+            )
+            _run_checked(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{chunk_start:.3f}", "-i", str(input_wav),
+                    "-t", f"{chunk_duration:.3f}",
+                    "-map", "0:a:0",
+                    "-ar", "44100", "-ac", "2",
+                    "-c:a", "pcm_s16le", "-f", "w64", str(chunk_path),
+                ],
+                "ffmpeg Demucs chunk extraction",
+            )
+        entries.append(
+            {
+                "filename": chunk_path.name,
+                "logical_start_ms": round(logical_start * 1_000),
+                "logical_end_ms": round(logical_end * 1_000),
+                "left_overlap_ms": left_overlap * 1_000,
+                "right_overlap_ms": right_overlap * 1_000,
+            }
+        )
+
+    _write_json_atomic(
+        manifest_path,
+        {
+            "source_audio": input_wav.name,
+            "duration_ms": duration_ms,
+            "chunk_seconds": DEMUCS_CHUNK_SECONDS,
+            "overlap_seconds": DEMUCS_CHUNK_OVERLAP_SECONDS,
+            "chunks": entries,
+        },
+    )
+    print(
+        f"[isolate-vocals] Demucs input chunks ready in {chunk_dir}",
+        flush=True,
+    )
+    return entries
+
+
+def _prepare_mic_chunks(
+    input_wav: Path,
+    demucs_chunk_dir: Path,
+    mic_chunk_dir: Path,
+    entries: list[dict[str, object]],
+    duration: float,
+    work_dir: Path,
+    device: str,
+) -> list[Path]:
+    """Run Demucs per saved input chunk and persist trimmed vocal chunks."""
+    mic_chunk_dir.mkdir(parents=True, exist_ok=True)
+    duration_ms = round(duration * 1_000)
+    manifest_path = mic_chunk_dir / "chunk_manifest.json"
+    existing_manifest = _load_json(manifest_path)
+    reusable = (
+        existing_manifest is not None
+        and existing_manifest.get("source_audio") == input_wav.name
+        and existing_manifest.get("duration_ms") == duration_ms
+        and existing_manifest.get("chunk_seconds") == DEMUCS_CHUNK_SECONDS
+        and existing_manifest.get("overlap_seconds") == DEMUCS_CHUNK_OVERLAP_SECONDS
+        and isinstance(existing_manifest.get("chunks"), list)
+        and len(existing_manifest["chunks"]) == len(entries)
+    )
+
+    mic_paths: list[Path] = []
+    mic_entries: list[dict[str, object]] = []
+    for index, entry in enumerate(entries):
+        demucs_filename = entry["filename"]
+        if not isinstance(demucs_filename, str):
+            raise RuntimeError("Demucs manifest contains an invalid chunk filename.")
+        demucs_path = demucs_chunk_dir / demucs_filename
+        if not demucs_path.is_file() or demucs_path.stat().st_size <= 0:
+            raise RuntimeError(f"Demucs chunk is missing or empty: {demucs_path}")
+
+        mic_path = mic_chunk_dir / (
+            f"{input_wav.stem}_mic_chunk_{index + 1:04d}.w64"
+        )
+        if not (
+            reusable
+            and mic_path.is_file()
+            and mic_path.stat().st_size > 0
+        ):
+            chunk_work_dir = work_dir / f"demucs_{index + 1:04d}"
+            chunk_vocals = _run_demucs_once(
+                demucs_path,
+                chunk_work_dir,
+                device,
+            )
+            logical_start_ms = entry["logical_start_ms"]
+            logical_end_ms = entry["logical_end_ms"]
+            left_overlap_ms = entry["left_overlap_ms"]
+            if not all(
+                isinstance(value, int)
+                for value in (
+                    logical_start_ms,
+                    logical_end_ms,
+                    left_overlap_ms,
+                )
+            ):
+                raise RuntimeError("Demucs manifest contains invalid chunk timing.")
+            logical_duration_ms = logical_end_ms - logical_start_ms
+            _run_checked(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(chunk_vocals),
+                    "-ss", f"{left_overlap_ms / 1_000:.3f}",
+                    "-t", f"{logical_duration_ms / 1_000:.3f}",
+                    "-ar", "44100", "-ac", "2",
+                    "-c:a", "pcm_s16le", "-f", "w64", str(mic_path),
+                ],
+                "ffmpeg Demucs vocal chunk trim",
+            )
+        mic_paths.append(mic_path)
+        mic_entries.append(
+            {
+                "filename": mic_path.name,
+                "logical_start_ms": entry["logical_start_ms"],
+                "logical_end_ms": entry["logical_end_ms"],
+            }
+        )
+
+    _write_json_atomic(
+        manifest_path,
+        {
+            "source_audio": input_wav.name,
+            "duration_ms": duration_ms,
+            "chunk_seconds": DEMUCS_CHUNK_SECONDS,
+            "overlap_seconds": DEMUCS_CHUNK_OVERLAP_SECONDS,
+            "chunks": mic_entries,
+        },
+    )
+    print(
+        f"[isolate-vocals] Mic chunks ready in {mic_chunk_dir}",
+        flush=True,
+    )
+    return mic_paths
+
+
+def _combine_mic_chunks(mic_paths: list[Path], combined_path: Path) -> Path:
+    """Concatenate trimmed, separated vocal chunks into one Wave64 file."""
+    if not mic_paths:
+        raise RuntimeError("No separated microphone chunks were produced.")
+    combined_path.parent.mkdir(parents=True, exist_ok=True)
+    concat_list = combined_path.with_name(combined_path.name + ".concat.txt")
+    concat_list.write_text(
+        "".join(f"file '{path.as_posix()}'\n" for path in mic_paths),
+        encoding="utf-8",
+    )
+    try:
+        _run_checked(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                "-c", "copy", "-f", "w64", str(combined_path),
+            ],
+            "ffmpeg separated vocal concatenation",
+        )
+    finally:
+        concat_list.unlink(missing_ok=True)
+    return combined_path
+
+
+def run_demucs_chunked(
+    input_wav: Path,
+    work_dir: Path,
+    *,
+    demucs_chunk_dir: Path | None = None,
+    mic_chunk_dir: Path | None = None,
+    combined_path: Path | None = None,
+) -> Path:
+    """Persist Demucs input/mic chunks, then combine the trimmed mic chunks."""
+    duration = _probe_duration_seconds(input_wav)
+    demucs_chunk_dir = demucs_chunk_dir or input_wav.parent / (
+        f"{input_wav.stem}_demucs_chunks"
+    )
+    mic_chunk_dir = mic_chunk_dir or input_wav.parent / (
+        f"{input_wav.stem}_mic_demucs_chunks"
+    )
+    combined_path = combined_path or input_wav.parent / (
+        f"{input_wav.stem}_mic_combined.w64"
+    )
+
+    device = detect_device()
+    print(f"[isolate-vocals] Model: {VOCAL_ISOLATION_MODEL}  Device: {device}", flush=True)
+    if device == "cpu":
+        print("[isolate-vocals] No GPU in use - this will be much slower on a long VOD.", flush=True)
+
+    demucs_entries = _prepare_demucs_chunks(
+        input_wav,
+        demucs_chunk_dir,
+        duration,
+    )
+    mic_paths = _prepare_mic_chunks(
+        input_wav,
+        demucs_chunk_dir,
+        mic_chunk_dir,
+        demucs_entries,
+        duration,
+        work_dir,
+        device,
+    )
+    combined = _combine_mic_chunks(mic_paths, combined_path)
+    print(f"[isolate-vocals] Combined separated mic audio: {combined}", flush=True)
+    return combined
 
 
 def finalize_mic_wav(vocals_wav: Path, output_wav: Path) -> None:
@@ -167,14 +477,20 @@ def finalize_mic_wav(vocals_wav: Path, output_wav: Path) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("Usage: python isolate_vocals.py <mixed_audio.wav> <output_mic.wav>")
-        return 1
+    parser = argparse.ArgumentParser(
+        description="Separate a mixed VOD track into a rendered microphone track."
+    )
+    parser.add_argument("input_wav", help="Full mixed audio, normally Wave64.")
+    parser.add_argument("output_wav", help="Rendered 16kHz mono microphone WAV.")
+    parser.add_argument("--demucs-chunk-dir", type=Path)
+    parser.add_argument("--mic-chunk-dir", type=Path)
+    parser.add_argument("--combined-path", type=Path)
+    args = parser.parse_args()
 
     use_local_torch_cache()
 
-    input_wav = Path(sys.argv[1]).resolve()
-    output_wav = Path(sys.argv[2]).resolve()
+    input_wav = Path(args.input_wav).resolve()
+    output_wav = Path(args.output_wav).resolve()
 
     if not input_wav.exists():
         print(f"ERROR: input file not found: {input_wav}")
@@ -187,12 +503,30 @@ def main() -> int:
         print("       Run Install_PogEngine.bat again (it installs this), or: pip install demucs")
         return 1
 
-    work_dir = Path(tempfile.mkdtemp(prefix="pog_demucs_"))
+    work_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"{input_wav.stem}_demucs_",
+            dir=str(input_wav.parent),
+        )
+    )
+    print(f"[isolate-vocals] Temporary Demucs workspace: {work_dir}", flush=True)
     try:
-        vocals_wav = run_demucs(input_wav, work_dir)
-        print(f"[isolate-vocals] Vocal stem separated: {vocals_wav}")
+        vocals_wav = run_demucs_chunked(
+            input_wav,
+            work_dir,
+            demucs_chunk_dir=args.demucs_chunk_dir.resolve()
+            if args.demucs_chunk_dir
+            else None,
+            mic_chunk_dir=args.mic_chunk_dir.resolve()
+            if args.mic_chunk_dir
+            else None,
+            combined_path=args.combined_path.resolve()
+            if args.combined_path
+            else None,
+        )
+        print(f"[isolate-vocals] Combined separated mic audio: {vocals_wav}")
         finalize_mic_wav(vocals_wav, output_wav)
-        print(f"[isolate-vocals] Saved isolated voice track: {output_wav}")
+        print(f"[isolate-vocals] Saved rendered voice track: {output_wav}")
     except Exception as exc:
         print(f"ERROR: vocal isolation failed: {exc}")
         return 1

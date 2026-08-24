@@ -78,6 +78,13 @@ OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
 # the judge window to reduce memory pressure.
 DISCOVERY_NUM_CTX = _env_int("HIGHLIGHT_DISCOVERY_NUM_CTX", 8192)
 JUDGE_NUM_CTX = _env_int("HIGHLIGHT_JUDGE_NUM_CTX", 8192)
+# --- Transcription -----------------------------------------------------------
+# Long uninterrupted Whisper runs can enter a repeated-text decoding loop.
+# Independent chunks reset the decoder context; overlap protects words at
+# chunk boundaries. Both values remain environment-overridable for tuning.
+TRANSCRIPTION_CHUNK_MINUTES = _env_int("TRANSCRIPTION_CHUNK_MINUTES", 30)
+TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", 10)
+
 # --- Pipeline behavior -------------------------------------------------------
 # The RunAll GUI can optionally suspend Windows after every pipeline step
 # completes successfully. Keep this opt-in so an unattended run never sleeps
@@ -126,12 +133,11 @@ VOCAL_ISOLATION_MODEL = os.environ.get("VOCAL_ISOLATION_MODEL", "htdemucs")
 # detect_device() in isolate_vocals.py. CPU works but is much slower on a
 # multi-hour VOD.
 VOCAL_ISOLATION_DEVICE = os.environ.get("VOCAL_ISOLATION_DEVICE", "auto")
-# Unset by default (demucs' own default chunking behavior). Demucs processes
-# audio in windows this many seconds long rather than the whole file at once;
-# if a run dies with a CUDA out-of-memory error on a very long VOD, set this
-# (e.g. 20) via env var to trade a little separation quality at chunk
-# boundaries for bounded memory use.
-VOCAL_ISOLATION_SEGMENT_SECONDS = os.environ.get("VOCAL_ISOLATION_SEGMENT_SECONDS") or None
+# HTDemucs' model-native window is 7.8 seconds; Demucs' CLI accepts integer
+# overrides only, so the safe default is 7. Long inputs are externally split
+# into bounded windows by isolate_vocals.py because Demucs otherwise allocates
+# its output tensor for the entire file.
+VOCAL_ISOLATION_SEGMENT_SECONDS = os.environ.get("VOCAL_ISOLATION_SEGMENT_SECONDS") or "7"
 # Shared ffmpeg noise gate used by both audio-extraction paths.
 NOISE_GATE_THRESHOLD_DB = _env_int("HIGHLIGHT_NOISE_GATE_THRESHOLD_DB", -35)
 NOISE_GATE_RATIO = _env_int("HIGHLIGHT_NOISE_GATE_RATIO", 8)
@@ -252,6 +258,17 @@ RUN_INFO_FILENAME = "run_info.json"
 # Unlike RUN_INFO_FILENAME, NOT written into the stream folder - see
 # SCRIPT_DIR / record_pipeline_run_history().
 RUN_HISTORY_FILENAME = "pipeline_run_history.csv"
+# One row is appended for every big step attempted by the RunAll GUI. The
+# separate file keeps these five user-facing durations independent from the
+# analyzer's six internal-stage history.
+STEP_HISTORY_FILENAME = "View_Pipeline_Duration_History.csv"
+BIG_STEP_LABELS = (
+    "1. Extract mic audio",
+    "2. Transcribe audio",
+    "3. Fix SRT",
+    "4. Split SRT",
+    "5. Analyze highlights",
+)
 
 
 # The GUI in configure_models.py reads this registry and writes selected
@@ -266,6 +283,14 @@ RUN_HISTORY_FILENAME = "pipeline_run_history.csv"
 # Keep environment names unique.
 EDITABLE_PARAMS = [
     # --- General pipeline behavior ---
+    # --- Transcription ---
+    {"key": "TRANSCRIPTION_CHUNK_MINUTES", "env": "TRANSCRIPTION_CHUNK_MINUTES", "kind": "int", "stage": "Transcription",
+     "label": "Whisper chunk length (minutes)",
+     "help": "Each audio chunk starts a fresh Whisper decoder context. 30 minutes is a safe default for long VODs."},
+    {"key": "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", "env": "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", "kind": "int", "stage": "Transcription",
+     "label": "Whisper chunk overlap (seconds)",
+     "help": "Overlap between adjacent audio chunks so speech at boundaries is not lost. 10 seconds is the default."},
+
     {"key": "AUTO_SLEEP_AFTER_PIPELINE", "env": "AUTO_SLEEP_AFTER_PIPELINE", "kind": "bool", "stage": "General",
      "label": "Put PC to sleep after pipeline completes",
      "help": "When ON, the RunAll GUI puts this Windows PC to sleep after all five pipeline steps finish successfully. Default: OFF."},
@@ -320,7 +345,7 @@ EDITABLE_PARAMS = [
     # --- Vocal isolation ---
     {"key": "VOCAL_ISOLATION_SEGMENT_SECONDS","env":"VOCAL_ISOLATION_SEGMENT_SECONDS","kind":"text","stage":"Vocal isolation",
      "label": "Demucs segment seconds (VOCAL_ISOLATION_SEGMENT_SECONDS)",
-     "help": "Demucs processes audio in windows this many seconds long. Set to 20 if a long VOD OOMs in Demucs on a 10GB card; empty/0 = whole-file (slightly cleaner boundaries)."},
+     "help": "Demucs processes audio in windows this many seconds long. For HTDemucs, use an integer from 1 to 7; larger values are rejected by the model, so the runner uses its native 7.8-second window. Empty/0 uses that native window."},
     # --- Audio cleanup ---
     {"key": "NOISE_GATE_THRESHOLD_DB", "env": "HIGHLIGHT_NOISE_GATE_THRESHOLD_DB", "kind": "int", "stage": "Audio cleanup",
      "label": "Noise-gate threshold (dB)",
@@ -404,12 +429,58 @@ PRESETS = {
             "VERIFY_MIN_COVERAGE_RATIO":   0.5,
             "JUDGE_BATCH_SIZE":           10,
             "TIMESTAMP_TOLERANCE_SECONDS": 15,
-            "VOCAL_ISOLATION_SEGMENT_SECONDS": 20,
+            "TRANSCRIPTION_CHUNK_MINUTES": 30,
+            "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS": 10,
+
+            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
             "NOISE_GATE_THRESHOLD_DB":   -35,
             "NOISE_GATE_RATIO":             8,
             "NOISE_GATE_ATTACK_MS":        10,
             "NOISE_GATE_RELEASE_MS":       200,
 
+            "EMOTION_MAX_CANDIDATES":      200,
+            "EMOTION_BATCH_SIZE":          2,
+            "EMOTION_ENABLED":             True,
+            "HYPE_PHRASES_ENABLED":        True,
+            "HYPE_PHRASE_WINDOW_SECONDS":  15,
+            "HYPE_PHRASE_BOOST":           1.5,
+            "HYPE_PHRASE_MIN_MATCHES":     1,
+            "AUDIO_SCAN_ENABLED":          True,
+            "AUDIO_SCAN_MAX_CANDIDATES":  100,
+            "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
+            "EXPORT_PREVIEW_CLIPS":       False,
+            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
+            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
+        },
+    },
+    "3080 10GB - qwen3:14b-q4_K_M (discovery) + qwen3.6:35b-a3b (judge)": {
+        "name_short": "qwen3:14b-q4_K_M + qwen3.6:35b-a3b",
+        "description": ("Discovery on qwen3:14b-q4_K_M; judge/verify/titling on "
+                        "qwen3.6:35b-a3b (slow; partial CPU offload). For RTX "
+                        "3080 10GB + 32GB DDR4. The 14B discovery model is a "
+                        "stronger upgrade from qwen3:8b while keeping discovery "
+                        "context and memory use practical."),
+        "values": {
+            "MODEL":                       "qwen3:14b-q4_K_M",
+            "JUDGE_MODEL":                 "qwen3.6:35b-a3b",
+            "DISCOVERY_NUM_CTX":            8192,
+            "JUDGE_NUM_CTX":                 6144,
+            "VERIFY_NUM_PREDICT":          2200,
+            "AUDIO_SCAN_TITLE_NUM_PREDICT":1800,
+            "OLLAMA_RETRIES":              3,
+            "OLLAMA_RETRY_BACKOFF_SECONDS":8.0,
+            "TOP_N":                       50,
+            "JUDGE_POOL_SIZE":             100,
+            "VERIFY_POOL_SIZE":           150,
+            "VERIFY_BATCH_SIZE":           8,
+            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
+            "JUDGE_BATCH_SIZE":           10,
+            "TIMESTAMP_TOLERANCE_SECONDS": 15,
+            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
+            "NOISE_GATE_THRESHOLD_DB":   -35,
+            "NOISE_GATE_RATIO":             8,
+            "NOISE_GATE_ATTACK_MS":        10,
+            "NOISE_GATE_RELEASE_MS":       200,
             "EMOTION_MAX_CANDIDATES":      200,
             "EMOTION_BATCH_SIZE":          2,
             "EMOTION_ENABLED":             True,
@@ -447,7 +518,10 @@ PRESETS = {
             "VERIFY_MIN_COVERAGE_RATIO":   0.5,
             "JUDGE_BATCH_SIZE":           20,
             "TIMESTAMP_TOLERANCE_SECONDS": 15,
-            "VOCAL_ISOLATION_SEGMENT_SECONDS": 20,
+            "TRANSCRIPTION_CHUNK_MINUTES": 30,
+            "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS": 10,
+
+            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
             "NOISE_GATE_THRESHOLD_DB":   -35,
             "NOISE_GATE_RATIO":             8,
             "NOISE_GATE_ATTACK_MS":        10,
@@ -490,7 +564,10 @@ PRESETS = {
             "VERIFY_MIN_COVERAGE_RATIO":   0.5,
             "JUDGE_BATCH_SIZE":           10,
             "TIMESTAMP_TOLERANCE_SECONDS": 15,
-            "VOCAL_ISOLATION_SEGMENT_SECONDS": 20,
+            "TRANSCRIPTION_CHUNK_MINUTES": 30,
+            "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS": 10,
+
+            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
             "NOISE_GATE_THRESHOLD_DB":   -35,
             "NOISE_GATE_RATIO":             8,
             "NOISE_GATE_ATTACK_MS":        10,

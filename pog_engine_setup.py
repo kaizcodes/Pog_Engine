@@ -45,6 +45,8 @@ import json
 import os
 import queue
 import re
+import shutil
+import subprocess
 try:
     import requests
 except ImportError:
