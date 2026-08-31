@@ -4,7 +4,7 @@
 
 Finish your stream, run Pog Engine, and get your best moments without scrubbing through hours of footage.
 
-**100% offline. Your data never leave your PC and will not be used to train AI.**
+**100% offline. Your data never leave your PC and cannot be used to train AI.**
 
 Built by solo content creator, for solo content creators & editors.
 
