@@ -122,6 +122,14 @@ You could buy me a coffee here: https://ko-fi.com/kaizuchaneru
 
 The money will be put into development and maintaining this project.
 
+## TESTING OTHER MODELS:
+You can just change them in the configurator if you have it installed via Ollama
+
+Currently in testing:
+
+Discovery: qwen3:14b-q4_K_M / qwen3.5:9b-q4_K_M
+
+
 ## Tech Stack
 
 - Python 3.11
