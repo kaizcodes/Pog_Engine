@@ -109,8 +109,10 @@ Send Markers from Timeline to Clip
 >Send marker from timeline to clip so when you move the clip to another timeline to edit, the marker follows.
 
 ## Known Issues:
->none at the moment.
 Please report any issues to the issues tab.
+
+- Step 5 is unbearably slow.
+> Open Task Manager and see if your **GPU** is 100% usage, if it says CPU then you need to reinstall Ollama
 
 ## ROADMAP:
 1. Auto clips extraction, cut the middle man and get the clips immediately to use
