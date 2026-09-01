@@ -7,6 +7,8 @@ assignees: ''
 
 ---
 
+Feel free to skip any step that does not apply. Giving me as much info as possible is better to diagnose and fixing whatever issues you are running into.
+
 ## 1. What happened?
 
 **What were you trying to do?** (e.g. "ran 6_RunAllSteps.bat on a 3-hour VOD")
