@@ -76,9 +76,13 @@ Your final result should say OK / Already Downloaded
 6. Watch it works
 
 Files you'll need for Davinci Resolve:
+
 VOD.mp4
+
 VOD**fixed**.srt (must have fixed in name)
+
 highlights.edl (your highlight markers)
+
 
 You are welcomed to use any marker conversion tool to convert Davinci Resolve markers to use in other programs.
 
