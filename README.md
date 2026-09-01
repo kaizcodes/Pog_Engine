@@ -138,3 +138,9 @@ Discovery: qwen3:14b-q4_K_M / qwen3.5:9b-q4_K_M
 - FFmpeg
 - PyTorch
 - DaVinci Resolve
+
+## Special Thanks to Gootecks the inspiration behind the project
+
+<img width="656" height="180" alt="image" src="https://github.com/user-attachments/assets/0e03bcc3-31a0-4f13-be90-3da26305eeac" />
+
+I met him at an event before COVID, genuinely a cool guy.
