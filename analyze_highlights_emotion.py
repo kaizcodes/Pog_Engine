@@ -513,7 +513,7 @@ def build_transcript_blocks_by_part(stream_folder):
             continue
         with open(path, "r", encoding="utf-8") as f:
             transcript = f.read()
-        blocks_by_part[part] = parse_srt_blocks(transcript)
+        blocks_by_part[part_path.name] = parse_srt_blocks(transcript)
     return blocks_by_part
 
 
@@ -1890,7 +1890,7 @@ def run_discovery(stream_folder, parts, prompts):
                         "Score": score,
                         "Title": title.strip(),
                         "Reason": reason.strip(),
-                        "SourcePart": part,
+                        "SourcePart": part_path.name,
                         "Category": pass_name
                     })
 
@@ -1905,7 +1905,7 @@ def run_discovery(stream_folder, parts, prompts):
                     print(f"     [!] Skipped {rejected_malformed} malformed lines")
 
                 if added == 0:
-                    debug_path = os.path.join(step_subdir(stream_folder, 5), f"debug_{part}_{pass_name}.txt")
+                    debug_path = os.path.join(step_subdir(stream_folder, 5), f"debug_{part_path.stem}_{pass_name}.txt")
                     with open(debug_path, "w", encoding="utf-8") as dbg:
                         dbg.write(result)
                     print(f"     [!] 0 candidates parsed - raw response saved to {debug_path}")
@@ -1913,7 +1913,7 @@ def run_discovery(stream_folder, parts, prompts):
                 print()
 
         except Exception as e:
-            print(f"ERROR processing {part}")
+            print(f"ERROR processing {part_path.name}")
             print(e)
             print()
             part_errors += 1
