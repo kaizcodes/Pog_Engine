@@ -2708,7 +2708,7 @@ def run_stage_discovery(stream_folder):
         if not parts:
             print("No transcript_partN.txt files found in stream folder.")
             sys.exit(1)
-        print(f"Found {len(parts)} transcript part(s): {', '.join(parts)}")
+        print(f"Found {len(parts)} transcript part(s): {', '.join(p.name for p in parts)}")
 
         highlights, part_errors = run_discovery(stream_folder, parts, PROMPTS)
 
