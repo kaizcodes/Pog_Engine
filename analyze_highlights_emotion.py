@@ -548,12 +548,68 @@ def ollama_model_loaded(model_name, url):
         pass
     return False
 
+def _memory_status_gb() -> tuple[float, float]:
+    """(available system RAM GB, total RAM GB) via GlobalMemoryStatusEx."""
+    try:
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = _MemStatus()
+        stat.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return stat.ullAvailPhys / 2**30, stat.ullTotalPhys / 2**30
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def _free_vram_gb() -> float:
+    """Free VRAM GB across all GPUs via nvidia-smi; 0.0 when unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return sum(float(line) for line in out.stdout.split() if line.strip().isdigit()) / 1024
+    except Exception:
+        return 0.0
+
+
+def _ollama_model_size_gb(model_name: str) -> float | None:
+    """On-disk size of an installed Ollama model; None when not found."""
+    try:
+        response = requests.get(ollama_base_url(OLLAMA_URL).rstrip("/") + "/api/tags", timeout=5)
+        response.raise_for_status()
+    except Exception:
+        return None
+    base_name = model_name.split(":")[0]
+    for model in response.json().get("models", []):
+        name = model.get("name", "")
+        if name == model_name or name.split(":")[0] == base_name:
+            size = model.get("size")
+            return size / 2**30 if isinstance(size, (int, float)) else None
+    return None
+
+
 def ensure_ollama_model_ready(model_name, url, stage_label):
     """Announce (and force) a stage's LLM model load before its real calls.
     Loading multi-GB weights can silently stall the first API call for a
     minute or more, which looked like a hang in the RunAll live console and
     mini-process cards; probing and warming up here makes that wait
     visible and keeps the slow first call out of the real batch retries.
+
+    Also pre-flights system memory (free RAM + free VRAM vs the model's
+    size) and warns before a load that is likely to fail with a memory
+    error, so the fix (closing apps) happens before the cryptic allocation
+    failure mid-warmup.
 
     For llamacpp there is no per-model load - the single GGUF is resident
     when the server is up - so this just checks /health and reports ready.
@@ -568,6 +624,24 @@ def ensure_ollama_model_ready(model_name, url, stage_label):
     if ollama_model_loaded(model_name, url):
         print(f"[{stage_label}] Ollama model {model_name} already loaded.")
         return
+    # Memory pre-flight: a partially-offloaded multi-GB load needs free RAM
+    # AND free VRAM; when either is short the load dies with a cryptic
+    # allocation error mid-warmup. Warn while there is still time to act.
+    model_size_gb = _ollama_model_size_gb(model_name)
+    if model_size_gb is not None:
+        avail_ram_gb, _total_ram = _memory_status_gb()
+        avail_vram_gb = _free_vram_gb()
+        required_gb = model_size_gb + 2.0  # weights + KV/compute buffer headroom
+        available_gb = avail_ram_gb + avail_vram_gb
+        if available_gb < required_gb:
+            print(
+                f"[{stage_label}] WARNING: {model_name} needs ~{required_gb:.1f} GB of memory "
+                f"({model_size_gb:.1f} GB weights + KV/compute headroom) but only "
+                f"{available_gb:.1f} GB is free ({avail_ram_gb:.1f} GB RAM + {avail_vram_gb:.1f} GB VRAM). "
+                "The load may fail with a memory error - close RAM/VRAM-heavy apps (browser, Discord) "
+                "and rerun if it does."
+            )
+            sys.stdout.flush()
     print(f"[{stage_label}] Loading Ollama model {model_name} (first use; can take a minute)...")
     sys.stdout.flush()
     # Current Ollama reliably 500s the FIRST request that triggers a cold
