@@ -43,6 +43,7 @@ from pathlib import Path
 from pipeline_config import (
     step_subdir,
     MODEL, JUDGE_MODEL, DISCOVERY_NUM_CTX, JUDGE_NUM_CTX, OLLAMA_URL, OLLAMA_CHAT_URL,
+    DISCOVERY_NUM_PREDICT,
     LLM_BACKEND, LLAMA_SERVER_URL, LLAMA_MODEL_PATH, LLAMA_DISCOVERY_MODEL_PATH,
     LLAMA_JUDGE_MODEL_PATH, LLAMA_CONTEXT_SIZE,
     OLLAMA_RETRIES, OLLAMA_RETRY_BACKOFF_SECONDS,
@@ -757,7 +758,8 @@ def ollama_generate(payload, timeout, url=None):
     if LLM_BACKEND == "llamacpp":
         is_chat = "messages" in payload
         opts = payload.get("options") or {}
-        # Discovery (generate) uses a flat "prompt"; wrap as a user message.
+        # Generate-style payloads (flat "prompt", no "messages") get wrapped
+        # as a user message; all current call sites send "messages" already.
         if is_chat:
             messages = payload.get("messages") or []
             think_off = payload.get("think") is False
@@ -1801,22 +1803,30 @@ def run_discovery(stream_folder, parts, prompts):
 
                 print(f"  -> {pass_name} pass")
 
+                # /api/chat + think:false like titling/verify/judge. Discovery
+                # ran /api/generate with thinking on, which worked under
+                # qwen3:8b, but under qwen3.5 the reasoning burns the whole
+                # generation budget inside Ollama's separate `thinking` field
+                # and `response` comes back empty - every pass parsed 0
+                # candidates (same failure the judge stage hit 2026-08-05).
                 payload = {
                     "model": MODEL,
-                    "prompt": prompt_text + "\n\n" + transcript,
+                    "messages": [{"role": "user", "content": prompt_text + "\n\n" + transcript}],
+                    "think": False,
                     "stream": False,
                     "options": {
                         "temperature": 0,
-                        "num_ctx": DISCOVERY_NUM_CTX
+                        "num_ctx": DISCOVERY_NUM_CTX,
+                        "num_predict": DISCOVERY_NUM_PREDICT
                     }
                 }
 
                 start_time = time.time()
-                response = ollama_generate(payload, timeout=1800)
+                response = ollama_generate(payload, timeout=1800, url=OLLAMA_CHAT_URL)
                 elapsed = time.time() - start_time
                 print(f"     Response received in {elapsed:.1f} seconds")
 
-                result = response.json().get("response", "")
+                result = response.json().get("message", {}).get("content", "")
 
                 added = 0
                 rejected_hallucinated = 0
@@ -2702,7 +2712,7 @@ def run_stage_discovery(stream_folder):
         else:
             if MODEL.strip() != JUDGE_MODEL.strip():
                 unload_ollama_model(JUDGE_MODEL, stage)
-            ensure_ollama_model_ready(MODEL, OLLAMA_URL, stage)
+            ensure_ollama_model_ready(MODEL, OLLAMA_CHAT_URL, stage)
 
         parts = list_transcript_parts(stream_folder)
         if not parts:

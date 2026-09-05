@@ -82,8 +82,9 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 # (ollama/ollama#14793) and newer Ollama emits its reasoning into a separate
 # `thinking` field that counts against num_predict, leaving "response" empty.
 # Every JUDGE_MODEL call needing thinking OFF (titling, verify, judge) must
-# therefore use OLLAMA_CHAT_URL with top-level think:false - see the call
-# sites in analyze_highlights_emotion.py.
+# therefore use OLLAMA_CHAT_URL with top-level think:false - and since the
+# discovery default switched to qwen3.5:9b, the MODEL discovery calls do too.
+# See the call sites in analyze_highlights_emotion.py.
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 OLLAMA_RETRIES = _env_int("OLLAMA_RETRIES", 2)
 OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
@@ -96,6 +97,10 @@ OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
 # the judge window to reduce memory pressure.
 DISCOVERY_NUM_CTX = _env_int("HIGHLIGHT_DISCOVERY_NUM_CTX", 8192)
 JUDGE_NUM_CTX = _env_int("HIGHLIGHT_JUDGE_NUM_CTX", 8192)
+# Discovery's generation cap. With think:false the model goes straight to CSV
+# rows, but a finite cap still bounds a runaway so one stuck pass can't spin
+# forever; VERIFY_NUM_PREDICT covers the same risk on the judge-side calls.
+DISCOVERY_NUM_PREDICT = _env_int("HIGHLIGHT_DISCOVERY_NUM_PREDICT", 2000)
 
 # --- LLM backend toggle ------------------------------------------------------
 # "ollama" (default) talks to an Ollama daemon at OLLAMA_URL/OLLAMA_CHAT_URL.
@@ -379,6 +384,9 @@ EDITABLE_PARAMS = [
     {"key": "JUDGE_NUM_CTX",     "env": "HIGHLIGHT_JUDGE_NUM_CTX",     "kind": "int", "stage": "Ollama",
      "label": "Judge context window (JUDGE_NUM_CTX, tokens)",
      "help": "Max prompt+output tokens for audio titling, verification, and final judging. Keep lower for qwen3.6:35b-a3b to reduce CPU/GPU memory pressure."},
+    {"key": "DISCOVERY_NUM_PREDICT", "env": "HIGHLIGHT_DISCOVERY_NUM_PREDICT", "kind": "int", "stage": "Ollama",
+     "label": "Discovery max output tokens (DISCOVERY_NUM_PREDICT)",
+     "help": "Per discovery pass. If discovery keeps parsing 0 candidates while responses arrive, raise this - the model is running out of output budget before finishing its CSV rows."},
     {"key": "VERIFY_NUM_PREDICT","env": "HIGHLIGHT_VERIFY_NUM_PREDICT","kind": "int",  "stage": "Ollama",
      "label": "Verify max output tokens (VERIFY_NUM_PREDICT)",
      "help": "Per verify batch. If you see '0 coverage' warnings, raise this - the model is running out of output budget before reaching the PASS/FAIL lines."},
