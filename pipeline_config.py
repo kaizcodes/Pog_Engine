@@ -10,6 +10,7 @@ below can still be overridden per-run via env var without editing this file
 
 import os
 import re
+import requests
 import subprocess
 from pathlib import Path
 
@@ -54,18 +55,13 @@ def _env_list(name, default):
 MODEL = os.environ.get("HIGHLIGHT_MODEL", "qwen3:8b")
 JUDGE_MODEL = os.environ.get("HIGHLIGHT_JUDGE_MODEL", "qwen3.5:9b-q4_K_M")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
-# qwen3.5 moved thinking control to Ollama's renderer/parser instead of the
-# old "/no_think"-in-prompt Jinja template. Confirmed Ollama 0.17.7 bug
-# (ollama/ollama#14793): /api/generate ignores think:false for qwen3.5, so
-# the model burns the whole num_predict budget on hidden reasoning and
-# "response" comes back empty. /api/chat with top-level think:false works.
-# Any JUDGE_MODEL call needing thinking OFF (title_audio_candidates,
-# verify_candidates, run_judge_batch) must use this URL - see
-# ollama_generate(..., url=...). run_judge_batch used to be the exception
-# (deliberately thinking ON for comparative ranking), but newer Ollama
-# returns qwen3.5's reasoning in a separate `thinking` field that eats the
-# whole num_predict budget, leaving "response" empty - so judging needs it
-# off too.
+# qwen3.5 thinking is controlled via Ollama's renderer, not the old
+# "/no_think" prompt tag. /api/generate ignores think:false for qwen3.5
+# (ollama/ollama#14793) and newer Ollama emits its reasoning into a separate
+# `thinking` field that counts against num_predict, leaving "response" empty.
+# Every JUDGE_MODEL call needing thinking OFF (titling, verify, judge) must
+# therefore use OLLAMA_CHAT_URL with top-level think:false - see the call
+# sites in analyze_highlights_emotion.py.
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 OLLAMA_RETRIES = _env_int("OLLAMA_RETRIES", 2)
 OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
@@ -78,6 +74,35 @@ OLLAMA_RETRY_BACKOFF_SECONDS = _env_float("OLLAMA_RETRY_BACKOFF_SECONDS", 5)
 # the judge window to reduce memory pressure.
 DISCOVERY_NUM_CTX = _env_int("HIGHLIGHT_DISCOVERY_NUM_CTX", 8192)
 JUDGE_NUM_CTX = _env_int("HIGHLIGHT_JUDGE_NUM_CTX", 8192)
+
+# --- LLM backend toggle ------------------------------------------------------
+# "ollama" (default) talks to an Ollama daemon at OLLAMA_URL/OLLAMA_CHAT_URL.
+# "llamacpp" talks to a llama.cpp `llama-server` process at LLAMA_SERVER_URL
+# (OpenAI-style endpoints). The backend is a single toggle: with llamacpp the
+# same ONE GGUF model serves every role (discovery, titling, verify, judge) -
+# llama-server hosts exactly one model per process, so the two-tier Ollama
+# model split collapses. Launch llama-server before Step 5; the analyzer only
+# preflights /health and never starts or stops the server itself (same policy
+# as Ollama since 2026-08-21).
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama").strip().lower()
+LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://localhost:8080")
+# Two-model support for llama.cpp: discovery and judge can use different GGUFs.
+# The server is managed by the pipeline - it starts with the discovery model,
+# stops to free VRAM for the emotion stage, then restarts with the judge model
+# for audioscan/verify/judge - matching Ollama's sequential load/unload pattern.
+# LLAMA_MODEL_PATH is kept for backward compat and as a fallback when the
+# per-role path is empty (single-GGUF mode).
+LLAMA_MODEL_PATH = os.environ.get("LLAMA_MODEL_PATH", "")
+LLAMA_DISCOVERY_MODEL_PATH = os.environ.get("LLAMA_DISCOVERY_MODEL_PATH", LLAMA_MODEL_PATH)
+LLAMA_JUDGE_MODEL_PATH = os.environ.get("LLAMA_JUDGE_MODEL_PATH", LLAMA_MODEL_PATH)
+# Server-launch context window. Unlike Ollama's per-request options.num_ctx,
+# llama.cpp's context is fixed at launch (-c), so DISCOVERY_NUM_CTX and
+# JUDGE_NUM_CTX do not apply on this backend; this value drives the generated
+# Start_LlamaServer.bat(s) and the configurator's guidance text. A single value
+# is used for both roles to keep the toggle simple; per-role ctx can be added
+# later if VRAM tuning needs it.
+LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
+
 # --- Transcription -----------------------------------------------------------
 # Long uninterrupted Whisper runs can enter a repeated-text decoding loop.
 # Independent chunks reset the decoder context; overlap protects words at
@@ -90,6 +115,11 @@ TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECO
 # completes successfully. Keep this opt-in so an unattended run never sleeps
 # the machine unless the user explicitly enables it in the configurator.
 AUTO_SLEEP_AFTER_PIPELINE = _env_bool("AUTO_SLEEP_AFTER_PIPELINE", False)
+# Grace period between the pipeline finishing and Windows actually suspending.
+# Any mouse movement or keystroke during the countdown cancels the auto-sleep
+# entirely (the PC stays awake and the GUI returns to its normal Done state).
+# Only used when AUTO_SLEEP_AFTER_PIPELINE is enabled; default 30 seconds.
+AUTO_SLEEP_DELAY_SECONDS = _env_int("AUTO_SLEEP_DELAY_SECONDS", 30)
 
 
 # --- Output size / selection ------------------------------------------------
@@ -276,13 +306,36 @@ BIG_STEP_LABELS = (
 #
 # Keeping the registry here gives the GUI one source for fields, labels,
 # presets, and the environment names used by the save-back code.
-
-
 # kind controls the editor shown by the GUI. stage controls grouping.
 # env is the environment variable used by the corresponding definition above.
 # Keep environment names unique.
 EDITABLE_PARAMS = [
+    # --- LLM backend ---
+    {"key": "LLM_BACKEND", "env": "LLM_BACKEND", "kind": "backend", "stage": "LLM backend",
+     "label": "LLM backend (LLM_BACKEND)",
+     "help": "ollama = Ollama daemon with separate discovery/judge models. llamacpp = managed llama-server that hot-swaps GGUFs (discovery GGUF then judge GGUF, matching Ollama's unload/load)."},
+    {"key": "LLAMA_SERVER_URL", "env": "LLAMA_SERVER_URL", "kind": "text", "stage": "LLM backend",
+     "label": "llama.cpp server URL (LLAMA_SERVER_URL)",
+     "help": "Base URL for the managed llama-server. The pipeline starts/stops the server itself, so this is just the host:port it binds to (default http://localhost:8080). Only used when LLM_BACKEND is llamacpp."},
+    {"key": "LLAMA_DISCOVERY_MODEL_PATH", "env": "LLAMA_DISCOVERY_MODEL_PATH", "kind": "text", "stage": "LLM backend",
+     "label": "llama.cpp discovery GGUF (LLAMA_DISCOVERY_MODEL_PATH)",
+     "help": "GGUF for discovery passes. Falls back to LLAMA_MODEL_PATH if empty (single-GGUF mode). Pipeline starts the server with this before discovery, then restarts with the judge GGUF for verify/judge."},
+    {"key": "LLAMA_JUDGE_MODEL_PATH", "env": "LLAMA_JUDGE_MODEL_PATH", "kind": "text", "stage": "LLM backend",
+     "label": "llama.cpp judge GGUF (LLAMA_JUDGE_MODEL_PATH)",
+     "help": "GGUF for audioscan/verify/judge. Falls back to LLAMA_MODEL_PATH/discovery path if empty. Pipeline hot-swaps to this after the emotion stage to free VRAM."},
+    {"key": "LLAMA_MODEL_PATH", "env": "LLAMA_MODEL_PATH", "kind": "text", "stage": "LLM backend",
+     "label": "llama.cpp GGUF fallback (LLAMA_MODEL_PATH)",
+     "help": "Legacy single-GGUF path. Used when per-role paths are empty. Kept for backward compat."},
+    {"key": "LLAMA_CONTEXT_SIZE", "env": "LLAMA_CONTEXT_SIZE", "kind": "int", "stage": "LLM backend",
+     "label": "llama.cpp context size (LLAMA_CONTEXT_SIZE, tokens)",
+     "help": "Server-launch context window (-c) for both roles. Only used when LLM_BACKEND is llamacpp."},
     # --- General pipeline behavior ---
+    {"key": "AUTO_SLEEP_AFTER_PIPELINE", "env": "AUTO_SLEEP_AFTER_PIPELINE", "kind": "bool", "stage": "General",
+     "label": "Put PC to sleep after pipeline completes",
+     "help": "When ON, the RunAll GUI puts this Windows PC to sleep after all five pipeline steps finish successfully. Moving the mouse or pressing any key during the countdown cancels the sleep. Default: OFF."},
+    {"key": "AUTO_SLEEP_DELAY_SECONDS", "env": "AUTO_SLEEP_DELAY_SECONDS", "kind": "int", "stage": "General",
+     "label": "Seconds to wait before sleep",
+     "help": "How long the RunAll GUI waits after the pipeline finishes before putting the PC to sleep. Any mouse movement or keystroke during the countdown cancels the sleep. Default: 30."},
     # --- Transcription ---
     {"key": "TRANSCRIPTION_CHUNK_MINUTES", "env": "TRANSCRIPTION_CHUNK_MINUTES", "kind": "int", "stage": "Transcription",
      "label": "Whisper chunk length (minutes)",
@@ -290,10 +343,6 @@ EDITABLE_PARAMS = [
     {"key": "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", "env": "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", "kind": "int", "stage": "Transcription",
      "label": "Whisper chunk overlap (seconds)",
      "help": "Overlap between adjacent audio chunks so speech at boundaries is not lost. 10 seconds is the default."},
-
-    {"key": "AUTO_SLEEP_AFTER_PIPELINE", "env": "AUTO_SLEEP_AFTER_PIPELINE", "kind": "bool", "stage": "General",
-     "label": "Put PC to sleep after pipeline completes",
-     "help": "When ON, the RunAll GUI puts this Windows PC to sleep after all five pipeline steps finish successfully. Default: OFF."},
     # --- Models (per-step role assignment) ---
     {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
      "label": "Discovery model (MODEL)",
@@ -400,194 +449,140 @@ EDITABLE_PARAMS = [
 ]
 
 
-# Presets target an RTX 3080 with 10GB VRAM and 32GB system RAM.
+# --- Per-role model tunings (replaces combo PRESETS) ----------------------------
+# Each installed Ollama model has separate tunings for when it's used as
+# discovery vs judge. The GUI auto-fills role-specific values on selection
+# so switching qwen3:8b on discovery fills discovery-optimal values, and
+# switching the same tag on judge fills judge-optimal values. Values are
+# derived from the old combo presets but split per role; heavy 35B MoE
+# (23 GB) must offload to CPU on a 10 GB 3080, so judge needs 6144 ctx,
+# larger num_predict, higher retries/backoff, smaller batches and lower
+# emotion caps. Light models (8b/9b/14b) fit fully at 8192 ctx.
 #
-# The 35B qwen3.6 model is larger than the card, so Ollama must offload part
-# of it to system memory. Its preset lowers JUDGE_NUM_CTX and uses larger
-# output budgets for the structured verify/judge responses. Discovery stays on
-# qwen3:8b with its own DISCOVERY_NUM_CTX.
-PRESETS = {
-    "3080 10GB - qwen3:8b (discovery) + qwen3.6:35b-a3b (judge)": {
-        "name_short": "qwen3.6:35b-a3b",
-        "description": ("Discovery on qwen3:8b; judge/verify/titling on qwen3.6:35b-a3b "
-                        "(slow; partial CPU offload). For RTX 3080 10GB + 32GB DDR4. "
-                        "Better ranking; expect longer per-call latency from the "
-                        "judge/verify stages."),
-        "values": {
-            "MODEL":                       "qwen3:8b",
-            "JUDGE_MODEL":                 "qwen3.6:35b-a3b",
-            "DISCOVERY_NUM_CTX":            8192,
-            "JUDGE_NUM_CTX":                 6144,
-            "VERIFY_NUM_PREDICT":          2200,
-            "AUDIO_SCAN_TITLE_NUM_PREDICT":1800,
-            "OLLAMA_RETRIES":              3,
-            "OLLAMA_RETRY_BACKOFF_SECONDS":8.0,
-            "TOP_N":                       50,
-            "JUDGE_POOL_SIZE":             100,
-            "VERIFY_POOL_SIZE":           150,
-            "VERIFY_BATCH_SIZE":           8,
-            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
-            "JUDGE_BATCH_SIZE":           10,
-            "TIMESTAMP_TOLERANCE_SECONDS": 15,
-            "TRANSCRIPTION_CHUNK_MINUTES": 30,
-            "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS": 10,
+# DISCOVERY_ROLE_KEYS and JUDGE_ROLE_KEYS enumerate which editable keys
+# belong to each role; changing a model's assignment updates only its role.
+DISCOVERY_ROLE_KEYS = ["DISCOVERY_NUM_CTX"]
+JUDGE_ROLE_KEYS = [
+    "JUDGE_NUM_CTX",
+    "VERIFY_NUM_PREDICT",
+    "AUDIO_SCAN_TITLE_NUM_PREDICT",
+    "OLLAMA_RETRIES",
+    "OLLAMA_RETRY_BACKOFF_SECONDS",
+    "JUDGE_BATCH_SIZE",
+    "VERIFY_BATCH_SIZE",
+    "EMOTION_MAX_CANDIDATES",
+    "EMOTION_BATCH_SIZE",
+    "AUDIO_SCAN_MAX_CANDIDATES",
+    "AUDIO_SCAN_TITLE_BATCH_SIZE",
+]
 
-            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
-            "NOISE_GATE_THRESHOLD_DB":   -35,
-            "NOISE_GATE_RATIO":             8,
-            "NOISE_GATE_ATTACK_MS":        10,
-            "NOISE_GATE_RELEASE_MS":       200,
-
-            "EMOTION_MAX_CANDIDATES":      200,
-            "EMOTION_BATCH_SIZE":          2,
-            "EMOTION_ENABLED":             True,
-            "HYPE_PHRASES_ENABLED":        True,
-            "HYPE_PHRASE_WINDOW_SECONDS":  15,
-            "HYPE_PHRASE_BOOST":           1.5,
-            "HYPE_PHRASE_MIN_MATCHES":     1,
-            "AUDIO_SCAN_ENABLED":          True,
-            "AUDIO_SCAN_MAX_CANDIDATES":  100,
-            "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
-            "EXPORT_PREVIEW_CLIPS":       False,
-            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
-            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
-        },
-    },
-    "3080 10GB - qwen3:14b-q4_K_M (discovery) + qwen3.6:35b-a3b (judge)": {
-        "name_short": "qwen3:14b-q4_K_M + qwen3.6:35b-a3b",
-        "description": ("Discovery on qwen3:14b-q4_K_M; judge/verify/titling on "
-                        "qwen3.6:35b-a3b (slow; partial CPU offload). For RTX "
-                        "3080 10GB + 32GB DDR4. The 14B discovery model is a "
-                        "stronger upgrade from qwen3:8b while keeping discovery "
-                        "context and memory use practical."),
-        "values": {
-            "MODEL":                       "qwen3:14b-q4_K_M",
-            "JUDGE_MODEL":                 "qwen3.6:35b-a3b",
-            "DISCOVERY_NUM_CTX":            8192,
-            "JUDGE_NUM_CTX":                 6144,
-            "VERIFY_NUM_PREDICT":          2200,
-            "AUDIO_SCAN_TITLE_NUM_PREDICT":1800,
-            "OLLAMA_RETRIES":              3,
-            "OLLAMA_RETRY_BACKOFF_SECONDS":8.0,
-            "TOP_N":                       50,
-            "JUDGE_POOL_SIZE":             100,
-            "VERIFY_POOL_SIZE":           150,
-            "VERIFY_BATCH_SIZE":           8,
-            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
-            "JUDGE_BATCH_SIZE":           10,
-            "TIMESTAMP_TOLERANCE_SECONDS": 15,
-            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
-            "NOISE_GATE_THRESHOLD_DB":   -35,
-            "NOISE_GATE_RATIO":             8,
-            "NOISE_GATE_ATTACK_MS":        10,
-            "NOISE_GATE_RELEASE_MS":       200,
-            "EMOTION_MAX_CANDIDATES":      200,
-            "EMOTION_BATCH_SIZE":          2,
-            "EMOTION_ENABLED":             True,
-            "HYPE_PHRASES_ENABLED":        True,
-            "HYPE_PHRASE_WINDOW_SECONDS":  15,
-            "HYPE_PHRASE_BOOST":           1.5,
-            "HYPE_PHRASE_MIN_MATCHES":     1,
-            "AUDIO_SCAN_ENABLED":          True,
-            "AUDIO_SCAN_MAX_CANDIDATES":  100,
-            "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
-            "EXPORT_PREVIEW_CLIPS":       False,
-            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
-            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
-        },
-    },
-    "3080 10GB - qwen3:8b (discovery) + qwen3.5:9b-q4_K_M (judge)": {
-        "name_short": "qwen3.5:9b-q4_K_M",
-        "description": ("Discovery on qwen3:8b; judge/verify/titling on "
-                        "qwen3.5:9b-q4_K_M (fast, fully resident in 10GB). For "
-                        "RTX 3080 10GB + 32GB DDR4. The balanced default; judge "
-                        "in ~4-6s per batch."),
-        "values": {
-            "MODEL":                       "qwen3:8b",
-            "JUDGE_MODEL":                 "qwen3.5:9b-q4_K_M",
-            "DISCOVERY_NUM_CTX":            8192,
-            "JUDGE_NUM_CTX":                 8192,
-            "VERIFY_NUM_PREDICT":          1500,
-            "AUDIO_SCAN_TITLE_NUM_PREDICT":1200,
-            "OLLAMA_RETRIES":              2,
-            "OLLAMA_RETRY_BACKOFF_SECONDS":5.0,
-            "TOP_N":                       50,
-            "JUDGE_POOL_SIZE":             100,
-            "VERIFY_POOL_SIZE":           150,
-            "VERIFY_BATCH_SIZE":          10,
-            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
-            "JUDGE_BATCH_SIZE":           20,
-            "TIMESTAMP_TOLERANCE_SECONDS": 15,
-            "TRANSCRIPTION_CHUNK_MINUTES": 30,
-            "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS": 10,
-
-            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
-            "NOISE_GATE_THRESHOLD_DB":   -35,
-            "NOISE_GATE_RATIO":             8,
-            "NOISE_GATE_ATTACK_MS":        10,
-            "NOISE_GATE_RELEASE_MS":       200,
-            "EMOTION_MAX_CANDIDATES":      250,
-            "EMOTION_BATCH_SIZE":          4,
-            "EMOTION_ENABLED":             True,
-            "HYPE_PHRASES_ENABLED":        True,
-            "HYPE_PHRASE_WINDOW_SECONDS":  15,
-            "HYPE_PHRASE_BOOST":           1.5,
-            "HYPE_PHRASE_MIN_MATCHES":     1,
-            "AUDIO_SCAN_ENABLED":          True,
-            "AUDIO_SCAN_MAX_CANDIDATES":  120,
-            "AUDIO_SCAN_TITLE_BATCH_SIZE":10,
-            "EXPORT_PREVIEW_CLIPS":       False,
-            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
-            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
-        },
-    },
-    "3080 10GB - qwen3.5:9b-q4_K_M (discovery) + qwen3.6:35b-a3b (judge)": {
-        "name_short": "qwen3.5:9b-q4_K_M + qwen3.6:35b-a3b",
-        "description": ("Discovery and judge/verify/titling on qwen3.5:9b-q4_K_M "
-                        "and qwen3.6:35b-a3b respectively (slow; partial CPU "
-                        "offload). For RTX 3080 10GB + 32GB DDR4. Uses the "
-                        "stronger qwen3.5 discovery model while retaining the "
-                        "larger qwen3.6 judge."),
-        "values": {
-            "MODEL":                       "qwen3.5:9b-q4_K_M",
-            "JUDGE_MODEL":                 "qwen3.6:35b-a3b",
-            "DISCOVERY_NUM_CTX":            8192,
-            "JUDGE_NUM_CTX":                 6144,
-            "VERIFY_NUM_PREDICT":          2200,
-            "AUDIO_SCAN_TITLE_NUM_PREDICT":1800,
-            "OLLAMA_RETRIES":              3,
-            "OLLAMA_RETRY_BACKOFF_SECONDS":8.0,
-            "TOP_N":                       50,
-            "JUDGE_POOL_SIZE":             100,
-            "VERIFY_POOL_SIZE":           150,
-            "VERIFY_BATCH_SIZE":           8,
-            "VERIFY_MIN_COVERAGE_RATIO":   0.5,
-            "JUDGE_BATCH_SIZE":           10,
-            "TIMESTAMP_TOLERANCE_SECONDS": 15,
-            "TRANSCRIPTION_CHUNK_MINUTES": 30,
-            "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS": 10,
-
-            "VOCAL_ISOLATION_SEGMENT_SECONDS": 7,
-            "NOISE_GATE_THRESHOLD_DB":   -35,
-            "NOISE_GATE_RATIO":             8,
-            "NOISE_GATE_ATTACK_MS":        10,
-            "NOISE_GATE_RELEASE_MS":       200,
-            "EMOTION_MAX_CANDIDATES":      200,
-            "EMOTION_BATCH_SIZE":          2,
-            "EMOTION_ENABLED":             True,
-            "HYPE_PHRASES_ENABLED":        True,
-            "HYPE_PHRASE_WINDOW_SECONDS":  15,
-            "HYPE_PHRASE_BOOST":           1.5,
-            "HYPE_PHRASE_MIN_MATCHES":     1,
-            "AUDIO_SCAN_ENABLED":          True,
-            "AUDIO_SCAN_MAX_CANDIDATES":  100,
-            "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
-            "EXPORT_PREVIEW_CLIPS":       False,
-            "PREVIEW_CLIP_SECONDS_BEFORE": 5.0,
-            "PREVIEW_CLIP_SECONDS_AFTER":  10.0,
-        },
-    },
+# Discovery tunings: only DISCOVERY_NUM_CTX varies today, but keep as dict
+# so future per-model discovery tuning (e.g. prompt size) can be added.
+DISCOVERY_MODEL_TUNINGS: dict[str, dict] = {
+    "qwen3:8b":                               {"DISCOVERY_NUM_CTX": 8192},
+    "qwen3:14b-q4_K_M":                       {"DISCOVERY_NUM_CTX": 8192},
+    "richardyoung/qwen3-14b-abliterated:IQ4_XS": {"DISCOVERY_NUM_CTX": 8192},
+    "qwen3.5:9b-q4_K_M":                      {"DISCOVERY_NUM_CTX": 8192},
+    "qwen3.6:35b-a3b":                        {"DISCOVERY_NUM_CTX": 6144},
+    "qwen3.5:35b-a3b-q4_K_M":                 {"DISCOVERY_NUM_CTX": 6144},
 }
+
+_JUDGE_LIGHT = {
+    "JUDGE_NUM_CTX": 8192,
+    "VERIFY_NUM_PREDICT": 1500,
+    "AUDIO_SCAN_TITLE_NUM_PREDICT": 1200,
+    "OLLAMA_RETRIES": 2,
+    "OLLAMA_RETRY_BACKOFF_SECONDS": 5.0,
+    "JUDGE_BATCH_SIZE": 20,
+    "VERIFY_BATCH_SIZE": 10,
+    "EMOTION_MAX_CANDIDATES": 250,
+    "EMOTION_BATCH_SIZE": 4,
+    "AUDIO_SCAN_MAX_CANDIDATES": 120,
+    "AUDIO_SCAN_TITLE_BATCH_SIZE": 10,
+}
+_JUDGE_MEDIUM = {
+    "JUDGE_NUM_CTX": 8192,
+    "VERIFY_NUM_PREDICT": 1600,
+    "AUDIO_SCAN_TITLE_NUM_PREDICT": 1300,
+    "OLLAMA_RETRIES": 2,
+    "OLLAMA_RETRY_BACKOFF_SECONDS": 5.0,
+    "JUDGE_BATCH_SIZE": 16,
+    "VERIFY_BATCH_SIZE": 10,
+    "EMOTION_MAX_CANDIDATES": 230,
+    "EMOTION_BATCH_SIZE": 3,
+    "AUDIO_SCAN_MAX_CANDIDATES": 110,
+    "AUDIO_SCAN_TITLE_BATCH_SIZE": 9,
+}
+_JUDGE_HEAVY = {
+    "JUDGE_NUM_CTX": 6144,
+    "VERIFY_NUM_PREDICT": 2200,
+    "AUDIO_SCAN_TITLE_NUM_PREDICT": 1800,
+    "OLLAMA_RETRIES": 3,
+    "OLLAMA_RETRY_BACKOFF_SECONDS": 8.0,
+    "JUDGE_BATCH_SIZE": 10,
+    "VERIFY_BATCH_SIZE": 8,
+    "EMOTION_MAX_CANDIDATES": 200,
+    "EMOTION_BATCH_SIZE": 2,
+    "AUDIO_SCAN_MAX_CANDIDATES": 100,
+    "AUDIO_SCAN_TITLE_BATCH_SIZE": 8,
+}
+
+JUDGE_MODEL_TUNINGS: dict[str, dict] = {
+    "qwen3:8b":                               dict(_JUDGE_LIGHT),
+    "qwen3:14b-q4_K_M":                       dict(_JUDGE_MEDIUM),
+    "richardyoung/qwen3-14b-abliterated:IQ4_XS": dict(_JUDGE_MEDIUM),
+    "qwen3.5:9b-q4_K_M":                      dict(_JUDGE_LIGHT),
+    "qwen3.6:35b-a3b":                        dict(_JUDGE_HEAVY),
+    "qwen3.5:35b-a3b-q4_K_M":                 dict(_JUDGE_HEAVY),
+}
+
+# Fallback tunings for models not explicitly listed (e.g. future pulls).
+_FALLBACK_DISCOVERY_TUNING = {"DISCOVERY_NUM_CTX": 8192}
+_FALLBACK_JUDGE_TUNING = dict(_JUDGE_LIGHT)
+
+
+def tuning_for_role(model: str, role: str) -> dict:
+    """Return role-specific tuning dict for *model*.
+
+    *role* is ``"discovery"`` (MODEL) or ``"judge"`` (JUDGE_MODEL).
+    Lookup is exact, then case-insensitive. Unknown models return a
+    generic fallback that fits a 10 GB card.
+    """
+    name = str(model or "").strip()
+    if not name:
+        return {}
+    if role == "discovery":
+        for table in (DISCOVERY_MODEL_TUNINGS,):
+            if name in table:
+                return dict(table[name])
+            low = name.lower()
+            for key, val in table.items():
+                if key.lower() == low:
+                    return dict(val)
+        return dict(_FALLBACK_DISCOVERY_TUNING)
+    if role == "judge":
+        for table in (JUDGE_MODEL_TUNINGS,):
+            if name in table:
+                return dict(table[name])
+            low = name.lower()
+            for key, val in table.items():
+                if key.lower() == low:
+                    return dict(val)
+        return dict(_FALLBACK_JUDGE_TUNING)
+    return {}
+
+
+def discovery_tuning_for(model: str) -> dict:
+    return tuning_for_role(model, "discovery")
+
+
+def judge_tuning_for(model: str) -> dict:
+    return tuning_for_role(model, "judge")
+
+
+# Back-compat: old code imported PRESETS. Keep an empty mapping so
+# ``cfg.PRESETS`` access does not crash; the GUI no longer uses it.
+PRESETS: dict[str, dict] = {}
 
 
 # --- Model detection ---------------------------------------------------------
@@ -611,6 +606,60 @@ def list_ollama_models() -> tuple[list[str], str | None]:
             names.append(name)
     return names, None
 
+def llm_base_url(url: str | None = None) -> str:
+    """Server base URL for the active LLM backend (health probes, /api/ps)."""
+    if LLM_BACKEND == "llamacpp":
+        return (url or LLAMA_SERVER_URL).rstrip("/")
+    return ollama_base_url(url or OLLAMA_URL)
+
+
+def llm_is_reachable(base_url: str, timeout: float = 3) -> bool:
+    """True only when the active backend's server answers its health endpoint:
+    Ollama /api/version, llama-server /health."""
+    try:
+        if LLM_BACKEND == "llamacpp":
+            response = requests.get(base_url.rstrip("/") + "/health", timeout=timeout)
+        else:
+            response = requests.get(base_url.rstrip("/") + "/api/version", timeout=timeout)
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+def llm_not_ready_message(base_url: str) -> str:
+    if LLM_BACKEND == "llamacpp":
+        return (
+            f"llama-server is not active at {base_url}.\n"
+            "Close the RunAll GUI, launch llama-server (double-click Start_LlamaServer.bat "
+            "in the VOD folder, or run it from the install folder), wait for it to finish "
+            "starting, then run 6_RunAllSteps.bat again."
+        )
+    return ollama_not_ready_message(base_url)
+
+
+def ollama_base_url(url: str) -> str:
+    """Strip the /api/... path off an Ollama endpoint to get the server base."""
+    return url.split("/api/", 1)[0]
+
+
+def ollama_is_reachable(base_url: str, timeout: float = 3) -> bool:
+    """True only when the Ollama server answers /api/version."""
+    try:
+        response = requests.get(base_url.rstrip("/") + "/api/version", timeout=timeout)
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+def ollama_not_ready_message(base_url: str) -> str:
+    return (
+        f"Ollama is not active at {base_url}.\n"
+        "Close the RunAll GUI, launch Ollama manually, wait for it to finish "
+        "starting, then run 6_RunAllSteps.bat again."
+    )
+
 
 # --- Save-back ---------------------------------------------------------------
 # Rewrite only the default literal on definitions listed in EDITABLE_PARAMS.
@@ -624,7 +673,7 @@ def _coerce_for_write(kind: str, value):
         return str(int(value)) if value not in (None, "") else "0"
     if kind == "float":
         return repr(float(value)) if value not in (None, "") else "0.0"
-    if kind == "model":
+    if kind in ("model", "backend"):
         return f'"{value}"'
     if value in (None, ""):
         return "None"
@@ -643,6 +692,7 @@ def _phrase_defaults_source(value, indent: str, newline: str) -> str:
             seen.add(key)
     rows = "".join(f"{indent}    {phrase!r},{newline}" for phrase in phrases)
     return f"{indent}DEFAULT_HYPE_PHRASES = [{newline}{rows}{indent}]{newline}"
+
 
 def apply_config_values(values: dict, file_path: str | None = None) -> tuple[bool, str]:
     """Write the supplied defaults to the config file.

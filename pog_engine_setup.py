@@ -318,14 +318,10 @@ def sha256_file(path: Path) -> str:
 def download_file(url: str, dest_path: Path, reporter: Reporter, description: str) -> bool:
     """Stream download with progress, skip-if-exists, atomic rename via temp file.
 
-    Skip-if-exists is not blind: the origin's content-length (HEAD) is
-    compared against the local file, and a mismatched size re-downloads
-    instead of trusting a truncated/partial file as complete. When the
-    origin publishes a SHA-256 (HF LFS / pinned GitHub asset), the local
-    file must match it too. Fresh downloads are likewise rejected (temp
-    deleted) when the received byte count doesn't match the announced
-    length or the bytes don't match the origin's sha256, so a bad
-    first download can't be renamed over the destination.
+    Skip-if-exists and fresh downloads are both verified against the origin:
+    content-length (HEAD) and, when published (HF LFS / pinned GitHub asset),
+    SHA-256. Mismatched files re-download; a bad fresh download is never
+    renamed over the destination.
     """
     if dest_path.is_file():
         local_size = dest_path.stat().st_size
@@ -421,69 +417,46 @@ def download_emotion_model_files(models_dir: Path, reporter: Reporter) -> bool:
 
 
 def download_whisper_cpp_cublas(models_dir: Path, reporter: Reporter) -> bool:
-    """Download whisper.cpp cublas release ZIP and extract whisper-cli.exe to models/Release/"""
+    """Download the whisper.cpp cublas release ZIP (via download_file()'s
+    size/sha256-verified fetch) and extract whisper-cli.exe to models/Release/."""
     dest_exe = models_dir / "Release" / "whisper-cli.exe"
     if dest_exe.is_file():
         reporter.log(f"  [OK]     whisper-cli.exe already exists at {dest_exe}")
         reporter.status("whisper-cli.exe", "Already downloaded")
         return True
 
-    reporter.log(f"  [INFO]   Downloading whisper.cpp cublas release...")
     reporter.status("whisper.cpp cublas", "Downloading...")
     dest_exe.parent.mkdir(parents=True, exist_ok=True)
     url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip"
     tmp_zip = models_dir / "whisper-cublas.zip.tmp"
-    try:
-        with requests.get(url, stream=True, timeout=300) as r:
-            r.raise_for_status()
-            cl = r.headers.get("content-length")
-            total = int(cl) if cl and cl.isdigit() else 0
-            if total == 0:
-                total = remote_file_size(url) or 0
-            downloaded = 0
-            with open(tmp_zip, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = downloaded * 100 // total
-                            if pct % 10 == 0:
-                                reporter.log(f"    {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
-        if total > 0 and downloaded != total:
-            raise IOError(f"download truncated: got {downloaded} bytes, expected {total}")
-        sha_expected = origin_sha256(url)
-        if sha_expected is not None:
-            actual = sha256_file(tmp_zip)
-            if actual != sha_expected:
-                raise IOError(f"checksum mismatch: got {actual[:12]}..., expected {sha_expected[:12]}...")
-            reporter.log(f"    sha256 verified ({sha_expected[:12]}...)")
+    if not download_file(url, tmp_zip, reporter, "whisper.cpp cublas release"):
+        reporter.status("whisper.cpp cublas", "Failed")
+        return False
 
-        reporter.log(f"  [INFO]   Extracting whisper.cpp release...")
-        import shutil
-        tmp_extract = models_dir / "whisper-cublas-extract.tmp"
+    reporter.log(f"  [INFO]   Extracting whisper.cpp release...")
+    tmp_extract = models_dir / "whisper-cublas-extract.tmp"
+    try:
         with zipfile.ZipFile(tmp_zip, 'r') as z:
             z.extractall(tmp_extract)
         # The ZIP contains a top-level Release/ folder; move its contents to models/Release/
         inner_release = tmp_extract / "Release"
-        if inner_release.is_dir():
-            for item in inner_release.iterdir():
-                shutil.move(str(item), str(dest_exe.parent / item.name))
-            reporter.log(f"  [OK]     Extracted whisper.cpp release to {dest_exe.parent}")
-            reporter.status("whisper.cpp cublas", "Downloaded")
-            tmp_zip.unlink(missing_ok=True)
-            shutil.rmtree(tmp_extract, ignore_errors=True)
-            return True
-        else:
+        if not inner_release.is_dir():
             reporter.log(f"  [WARN] Release folder not found in ZIP")
             reporter.status("whisper.cpp cublas", "Failed")
             return False
+        for item in inner_release.iterdir():
+            shutil.move(str(item), str(dest_exe.parent / item.name))
     except Exception as exc:
-        reporter.log(f"  [WARN] whisper.cpp cublas download/extract failed: {exc}")
+        reporter.log(f"  [WARN] whisper.cpp cublas extract failed: {exc}")
         reporter.status("whisper.cpp cublas", "Failed")
-        if tmp_zip.exists():
-            tmp_zip.unlink(missing_ok=True)
         return False
+    finally:
+        tmp_zip.unlink(missing_ok=True)
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+
+    reporter.log(f"  [OK]     Extracted whisper.cpp release to {dest_exe.parent}")
+    reporter.status("whisper.cpp cublas", "Downloaded")
+    return True
 
 
 def download_all_models(models_dir: Path, reporter: Reporter) -> None:
@@ -527,10 +500,17 @@ def download_ffmpeg(pog_dir: Path, reporter: Reporter) -> bool:
         if not zip_path.is_file():
             with requests.get(url, stream=True, timeout=300) as response:
                 response.raise_for_status()
+                total = int(response.headers["content-length"]) \
+                    if response.headers.get("content-length", "").isdigit() else 0
+                downloaded = 0
                 with open(zip_path, "wb") as output:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             output.write(chunk)
+                            downloaded += len(chunk)
+                if total > 0 and downloaded != total:
+                    zip_path.unlink(missing_ok=True)
+                    raise IOError(f"download truncated: got {downloaded} bytes, expected {total}")
         shutil.rmtree(extract_dir, ignore_errors=True)
         extract_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path) as archive:
@@ -1007,19 +987,93 @@ def install_dependencies(reporter: Reporter, models_dir: Path) -> None:
 # ============================================================================
 
 def check_ollama(pog_dir: Path, reporter: Reporter) -> bool:
-    reporter.section("Checking Ollama + models")
-    all_ok = True
-
+    # Backend-aware: when LLM_BACKEND is llamacpp this checks llama-server +
+    # the GGUF file and /health; otherwise the original Ollama checks.
+    backend = "ollama"
     model_name = judge_model_name = None
+    cfg = None
     try:
         sys.path.insert(0, str(pog_dir))
         import pipeline_config as cfg  # noqa: F401  (local import, path set above)
+        backend = str(getattr(cfg, "LLM_BACKEND", "ollama") or "ollama").strip().lower()
         model_name = getattr(cfg, "MODEL", None)
         judge_model_name = getattr(cfg, "JUDGE_MODEL", None)
-        ollama_url = getattr(cfg, "OLLAMA_URL", "http://localhost:11434/api/generate")
     except Exception as exc:
         reporter.log(f"  [WARN] couldn't read pipeline_config.py for model names: {exc}")
-        ollama_url = "http://localhost:11434/api/generate"
+        cfg = None
+
+    if backend == "llamacpp":
+        reporter.section("Checking llama.cpp llama-server + GGUFs (managed hot-swap)")
+        all_ok = True
+        llama_url = getattr(cfg, "LLAMA_SERVER_URL", "http://localhost:8080") if cfg is not None else "http://localhost:8080"
+        # Resolve per-role paths with same fallback logic as pipeline_config
+        disc_raw = str(getattr(cfg, "LLAMA_DISCOVERY_MODEL_PATH", "") or "").strip() if cfg is not None else ""
+        judge_raw = str(getattr(cfg, "LLAMA_JUDGE_MODEL_PATH", "") or "").strip() if cfg is not None else ""
+        fallback_raw = str(getattr(cfg, "LLAMA_MODEL_PATH", "") or "").strip() if cfg is not None else ""
+        if not disc_raw:
+            disc_raw = fallback_raw
+        if not judge_raw:
+            judge_raw = disc_raw or fallback_raw
+        llama_server_url_display = str(llama_url).strip()
+
+        reporter.status("llama-server", "Checking...")
+        llama_found = shutil.which("llama-server") is not None or shutil.which("llama-server.exe") is not None
+        reporter.log(f"  {mark(llama_found)} llama-server command available on PATH")
+        reporter.status("llama-server", "OK" if llama_found else "Missing")
+        if not llama_found:
+            reporter.log("      -> install it yourself from https://github.com/ggml-org/llama.cpp/releases,")
+            reporter.log("         ensure llama-server is on PATH, then re-run this installer.")
+            all_ok = False
+        else:
+            reporter.add_row("llama-server", "llama-server", "llama-server on PATH")
+
+        # Check each unique GGUF
+        seen: set[str] = set()
+        for label, gguf_path in (("Discovery GGUF", disc_raw), ("Judge GGUF", judge_raw)):
+            if not gguf_path:
+                reporter.log(f"  [WARN]   {label} is empty - set LLAMA_{'DISCOVERY' if 'Discovery' in label else 'JUDGE'}_MODEL_PATH (or LLAMA_MODEL_PATH) in the configurator.")
+                reporter.status(label, "Not set")
+                continue
+            if gguf_path in seen:
+                reporter.log(f"  [OK]     {label} same as discovery: {gguf_path} (single-GGUF mode)")
+                continue
+            seen.add(gguf_path)
+            reporter.add_row("llama-server", gguf_path, f"{label}: {gguf_path}")
+            reporter.status(label, "Checking...")
+            gguf_exists = Path(gguf_path).exists()
+            reporter.log(f"  {mark(gguf_exists)} {label} exists: {gguf_path}")
+            reporter.status(label, "OK" if gguf_exists else "Missing")
+            if not gguf_exists:
+                reporter.log(f"      -> place the GGUF at that path or update the path, then re-run.")
+                all_ok = False
+        reporter.status("llama-server", "Checking...")
+        host_root = llama_server_url_display.rstrip("/")
+        # llama-server health endpoint is /health, not /api/version
+        health_url = host_root.rstrip("/") + "/health"
+        try:
+            urllib.request.urlopen(health_url, timeout=3)
+            reporter.log(f"  [OK]     llama-server responding at {health_url}")
+            reporter.status("llama-server", "OK")
+        except Exception:
+            try:
+                urllib.request.urlopen(host_root, timeout=3)
+                reporter.log(f"  [OK]     llama-server responding at {host_root} (no /health, but host is up)")
+                reporter.status("llama-server", "OK")
+            except Exception:
+                reporter.log(f"  [INFO]   llama-server isn't responding at {health_url} right now.")
+                reporter.log("           That's fine if it's just not running yet - double-click")
+                reporter.log("           Start_LlamaServer.bat (in the VOD folder) to launch it,")
+                reporter.log("           then re-run this installer or just run the pipeline;")
+                reporter.log("           Step 5 will refuse until the server answers /health.")
+                reporter.status("llama-server", "Not running")
+                all_ok = False
+        return all_ok
+
+    # --- Ollama path (default) ---
+    reporter.section("Checking Ollama + models")
+    all_ok = True
+
+    ollama_url = getattr(cfg, "OLLAMA_URL", "http://localhost:11434/api/generate") if cfg is not None else "http://localhost:11434/api/generate"
 
     reporter.status("ollama", "Checking...")
     ollama_found = shutil.which("ollama") is not None
@@ -1087,6 +1141,7 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
     expected_emotion_model_dir = str(models_dir.resolve())
     expected_emotion_model_file = str((models_dir / "speech-emotion-recognition-with-openai-whisper-large-v3.safetensors").resolve())
     expected_torch_cache = str((models_dir / "torch_cache").resolve())
+    expected_hf_cache = str((models_dir / "hf_cache").resolve())
     
     def check_var(content: str, var_name: str, expected: str) -> bool:
         # Check for both raw string and regular string formats
@@ -1131,15 +1186,19 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
     
     if isolate_vocals_py.is_file():
         content = isolate_vocals_py.read_text(encoding="utf-8")
-        
-        if check_var(content, "TORCH_CACHE_DIR", expected_torch_cache):
-            reporter.log(f"  [OK]     {isolate_vocals_py.name}: TORCH_CACHE_DIR already correct")
-            reporter.status("TORCH_CACHE_DIR", "OK")
-        else:
-            reporter.log(f"  [WARN] {isolate_vocals_py.name}: TORCH_CACHE_DIR needs patching")
-            reporter.status("TORCH_CACHE_DIR", "Warn")
-            all_ok = False
-    
+
+        for var_name, expected in [
+            ("TORCH_CACHE_DIR", expected_torch_cache),
+            ("HF_CACHE_DIR", expected_hf_cache),
+        ]:
+            if check_var(content, var_name, expected):
+                reporter.log(f"  [OK]     {isolate_vocals_py.name}: {var_name} already correct")
+                reporter.status(var_name, "OK")
+            else:
+                reporter.log(f"  [WARN] {isolate_vocals_py.name}: {var_name} needs patching")
+                reporter.status(var_name, "Warn")
+                all_ok = False
+
     return all_ok
 
 
@@ -1470,7 +1529,8 @@ def run_gui(default_dir_str: str) -> int:
 
     config_frame = make_section("config", "Configuration (machine-specific paths)")
     for var_name in ["WHISPER_CLI", "WHISPER_MODEL", "WHISPER_VAD", "GALLERY_DIR",
-                     "EMOTION_LOCAL_MODEL_DIR", "EMOTION_LOCAL_MODEL_FILE", "TORCH_CACHE_DIR"]:
+                     "EMOTION_LOCAL_MODEL_DIR", "EMOTION_LOCAL_MODEL_FILE",
+                     "TORCH_CACHE_DIR", "HF_CACHE_DIR"]:
         add_row_widget("config", var_name, var_name)
 
     packages_frame = make_section("packages", "Python Packages")

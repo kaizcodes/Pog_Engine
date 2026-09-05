@@ -1,51 +1,28 @@
 """Emotion-enhanced highlight analyzer - discovery, full-file audio scan,
-speech-emotion scoring, content verification, judging, and export, all in
-one file/process.
+speech-emotion scoring, content verification, judging, and export.
 
-Walks 6 checkpointed sub-stages (discovery -> audioscan -> emotion ->
-verify -> judge -> export). Each saves its result to a JSON checkpoint in
-the stream folder before the next, so a run that dies partway (crash,
-Ollama timeout, Stop in the RunAll GUI) resumes with no wasted work:
+Runs 6 checkpointed sub-stages (discovery -> audioscan -> emotion -> verify
+-> judge -> export). Each saves checkpoint_<N>_<stage>.json in the stream
+folder before the next, so a killed run resumes with no wasted work:
 
-  python analyze_highlights_emotion.py <folder>
-      Runs every non-checkpointed stage in order through export. Used by
-      5_AnalyzeHighlights.bat and 6_RunAllSteps.bat - safe to re-run.
-
+  python analyze_highlights_emotion.py <folder>          # run remaining stages
   python analyze_highlights_emotion.py <folder> --stage verify
-      Force-reruns ONE stage (used by the 5a-5f debug bats), clearing
-      every checkpoint after it (else stale). For testing a prompt/logic
-      change to one stage without redoing everything before it.
+      # force-rerun ONE stage (5a-5f debug bats), clearing downstream
+      # checkpoints; export always reruns (no checkpoint of its own)
 
-Checkpoint files (in the stream folder):
-  checkpoint_1_discovery.json  - after discovery (raw, deduped/filtered)
-  checkpoint_2_audioscan.json  - after audio scan (+ candidates, merged)
-  checkpoint_3_emotion.json    - after emotion scoring (+ scores, sorted)
-  checkpoint_4_verified.json   - after content verification
-  checkpoint_5_judged.json     - after judging (final ranked top N)
-  pipeline_stats.json          - running Ollama call/timing totals + the
-                                  last-completed-stage marker, read by
-                                  export for the final run summary.
-  log_<stage>.txt              - full console output for that stage,
-                                  appended across every run/resume.
+Also written per-run: pipeline_stats.json (Ollama call/timing totals + the
+last-completed-stage marker) and log_<stage>.txt (per-stage console output).
 
-discovery, audioscan, and verify each sanity-check their result before
-checkpointing: if it looks like a broken run (Ollama unreachable, a
-response that stopped parsing entirely) rather than a stream that
-legitimately had nothing to offer, the stage exits WITHOUT writing its
-checkpoint, so the next run retries instead of treating a bad result as
-done. Only guards future runs - a pre-existing empty checkpoint from
-before this check won't retroactively clear, so a stuck folder still
-needs one manual nudge (delete the checkpoint_*.json, or run its 5a/5b/5d
-debug bat).
+discovery/audioscan/verify sanity-check their result before checkpointing:
+a broken run (Ollama unreachable, unparseable responses) exits WITHOUT a
+checkpoint so the next run retries, instead of being treated as done. A
+pre-existing empty checkpoint needs a manual nudge (delete it, or run the
+stage's debug bat).
 
-pipeline_run_history.csv is NOT in the stream folder - it lives next to
-this script (SCRIPT_DIR) and gets one row per normal (non --stage) run
-that reaches the end, accumulating per-stage/total timing across every
-stream processed. See record_pipeline_run_history().
-
-See STAGE_ORDER / STAGE_FUNCS near the bottom for stage dispatch, and
-invalidate_downstream() for how forced single-stage reruns keep the
-checkpoint chain consistent.
+pipeline_run_history.csv lives next to this script (SCRIPT_DIR), not in the
+stream folder, so timings accumulate across every VOD - see
+record_pipeline_run_history(). Stage dispatch: STAGE_ORDER / STAGE_FUNCS;
+forced-rerun checkpoint hygiene: invalidate_downstream().
 """
 
 import re
@@ -56,6 +33,7 @@ import sys
 import time
 import json
 import subprocess
+import atexit
 import contextlib
 import bisect
 import difflib
@@ -63,9 +41,10 @@ import io
 import argparse
 from datetime import datetime
 from pathlib import Path
-
 from pipeline_config import (
     MODEL, JUDGE_MODEL, DISCOVERY_NUM_CTX, JUDGE_NUM_CTX, OLLAMA_URL, OLLAMA_CHAT_URL,
+    LLM_BACKEND, LLAMA_SERVER_URL, LLAMA_MODEL_PATH, LLAMA_DISCOVERY_MODEL_PATH,
+    LLAMA_JUDGE_MODEL_PATH, LLAMA_CONTEXT_SIZE,
     OLLAMA_RETRIES, OLLAMA_RETRY_BACKOFF_SECONDS,
     TOP_N, JUDGE_POOL_SIZE, VERIFY_POOL_SIZE, VERIFY_BATCH_SIZE, VERIFY_MIN_COVERAGE_RATIO,
     VERIFY_NUM_PREDICT, JUDGE_BATCH_SIZE,
@@ -81,6 +60,8 @@ from pipeline_config import (
     AUDIO_SCAN_RATE_WEIGHT, AUDIO_SCAN_TITLE_BATCH_SIZE, AUDIO_SCAN_TITLE_NUM_PREDICT,
     EXPORT_PREVIEW_CLIPS, PREVIEW_CLIP_SECONDS_BEFORE, PREVIEW_CLIP_SECONDS_AFTER,
     RUN_INFO_FILENAME, RUN_HISTORY_FILENAME,
+    ollama_base_url, ollama_is_reachable, ollama_not_ready_message,
+    llm_base_url, llm_is_reachable, llm_not_ready_message,
 )
 
 # Folder this script lives in (vs stream_folder, the VOD folder passed on
@@ -103,7 +84,226 @@ EMOTION_LOCAL_MODEL_FILE = r"G:\pog_dev\models\speech-emotion-recognition-with-o
 # pipeline_stats.json at the end - see record_stage_stats().
 CALL_STATS = {"ollama_calls": 0, "ollama_seconds": 0.0, "ollama_retries": 0}
 AUDIO_SCAN_STATS = {"candidates_found": 0, "candidates_kept": 0}
-PROCESS_START_TIME = time.time()
+
+# --- Managed llama-server (llamacpp two-model hot-swap) --------------------
+_LLAMA_PROC: subprocess.Popen | None = None
+_LLAMA_CURRENT_MODEL: str | None = None
+
+def _llama_resolve_model(role: str) -> str:
+    """Resolve GGUF path for a role ('discovery' or 'judge')."""
+    role = (role or "").strip().lower()
+    if role == "discovery":
+        p = (LLAMA_DISCOVERY_MODEL_PATH or "").strip()
+        if p:
+            return p
+        p2 = (LLAMA_MODEL_PATH or "").strip()
+        if p2:
+            return p2
+        return ""
+    # judge / audioscan / verify
+    p = (LLAMA_JUDGE_MODEL_PATH or "").strip()
+    if p:
+        return p
+    p2 = (LLAMA_DISCOVERY_MODEL_PATH or "").strip()
+    if p2:
+        return p2
+    return (LLAMA_MODEL_PATH or "").strip()
+
+def _llama_parse_host_port(url: str) -> tuple[str, str]:
+    url = (url or "").strip()
+    host = "127.0.0.1"
+    port = "8080"
+    try:
+        without_scheme = url.split("://", 1)[-1]
+        host_port = without_scheme.split("/", 1)[0]
+        if ":" in host_port:
+            h, p = host_port.rsplit(":", 1)
+            if h:
+                host = "127.0.0.1" if h in ("localhost", "0.0.0.0", "") else h
+            if p.isdigit():
+                port = p
+        elif host_port:
+            host = "127.0.0.1" if host_port in ("localhost", "0.0.0.0", "") else host_port
+    except Exception:
+        pass
+    return host, port
+
+def _llama_wait_for_health(base_url: str, timeout: float = 90) -> bool:
+    deadline = time.time() + timeout
+    base_url = base_url.rstrip("/")
+    while time.time() < deadline:
+        try:
+            resp = requests.get(base_url + "/health", timeout=3)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        # also try root as liveness fallback
+        try:
+            resp = requests.get(base_url, timeout=3)
+            if resp.status_code < 500:
+                # some builds lack /health but respond on /
+                return True
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return False
+
+def _stop_llama_server(label: str = "pipeline") -> None:
+    global _LLAMA_PROC, _LLAMA_CURRENT_MODEL
+    proc = _LLAMA_PROC
+    if proc is None:
+        return
+    _LLAMA_PROC = None
+    _LLAMA_CURRENT_MODEL = None
+    try:
+        if proc.poll() is None:
+            print(f"[{label}] Stopping llama-server (PID {proc.pid})...")
+            stopped = False
+            # Windows: taskkill the tree — may return Access is denied if already dying / elevated
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True, timeout=10, text=True,
+                )
+                if result.returncode == 0:
+                    stopped = True
+                elif "Access is denied" in (result.stderr or "") + (result.stdout or ""):
+                    # Fall back to direct handle — proc owns the handle, taskkill privilege is not required
+                    pass
+            except Exception:
+                pass
+            if not stopped:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            print(f"[{label}] llama-server stopped.")
+        else:
+            print(f"[{label}] llama-server already exited.")
+    except Exception as exc:
+        print(f"[{label}] Could not stop llama-server: {exc}")
+
+def _start_llama_server(model_path: str, label: str = "pipeline") -> bool:
+    global _LLAMA_PROC, _LLAMA_CURRENT_MODEL
+    model_path = (model_path or "").strip()
+    if not model_path:
+        print(f"[{label}] No GGUF path configured for this role (LLAMA_*_MODEL_PATH empty).")
+        return False
+    if not Path(model_path).exists():
+        print(f"[{label}] GGUF not found: {model_path}")
+        print(f"[{label}] Set the per-role path in pipeline_config.py or the configurator.")
+        return False
+    # already running with same model?
+    if _LLAMA_PROC is not None and _LLAMA_PROC.poll() is None and _LLAMA_CURRENT_MODEL == model_path:
+        if llm_is_reachable(LLAMA_SERVER_URL.rstrip("/")):
+            print(f"[{label}] llama-server already running with {Path(model_path).name}")
+            return True
+        # process exists but not reachable -> stale, restart
+        _stop_llama_server(label)
+    # need fresh start - ensure old is gone
+    if _LLAMA_PROC is not None:
+        _stop_llama_server(label)
+    host, port = _llama_parse_host_port(LLAMA_SERVER_URL)
+    ctx = int(LLAMA_CONTEXT_SIZE) if str(LLAMA_CONTEXT_SIZE).strip().isdigit() else 8192
+    # Try progressively fewer GPU layers on OOM — 99 fills 10GB with a 23GB Q4_K_M
+    # (your qwen3.6:35b-a3b). Ollama does this automatically; llama-server does not.
+    candidates = [99, 45, 30, 18, 0]
+    last_detail = ""
+    for ngl in candidates:
+        cmd = [
+            "llama-server",
+            "--model", model_path,
+            "-c", str(ctx),
+            "--host", host,
+            "--port", port,
+            "--n-gpu-layers", str(ngl),
+        ]
+        print(f"[{label}] Starting llama-server: {Path(model_path).name} -c {ctx} --n-gpu-layers {ngl} --port {port} (can take 30-60s)...")
+        sys.stdout.flush()
+        stderr_path = None
+        try:
+            # capture stderr to detect CUDA OOM vs other failure
+            stderr_file = None
+            try:
+                tmpdir = Path(os.environ.get("TEMP", ".")) 
+                stderr_path = tmpdir / f"pog_llama_{port}.log"
+                stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
+            except Exception:
+                stderr_file = subprocess.DEVNULL  # type: ignore
+                stderr_path = None
+            _LLAMA_PROC = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file if stderr_file is not subprocess.DEVNULL else subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            _LLAMA_CURRENT_MODEL = model_path
+        except FileNotFoundError:
+            print(f"[{label}] llama-server not found on PATH. Install from https://github.com/ggml-org/llama.cpp/releases")
+            _LLAMA_PROC = None
+            _LLAMA_CURRENT_MODEL = None
+            return False
+        except Exception as exc:
+            print(f"[{label}] Failed to launch llama-server: {exc}")
+            _LLAMA_PROC = None
+            _LLAMA_CURRENT_MODEL = None
+            return False
+        if _llama_wait_for_health(LLAMA_SERVER_URL.rstrip("/"), timeout=120):
+            print(f"[{label}] llama-server ready with {Path(model_path).name} (layers={ngl})")
+            return True
+        # health failed — inspect log for OOM to decide retry
+        detail = ""
+        if stderr_path is not None:
+            try:
+                if stderr_path.exists():
+                    detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                    last_detail = detail
+            except Exception:
+                pass
+        is_oom = "out of memory" in detail.lower() or "cuda error" in detail.lower() or "oom" in detail.lower()
+        # clean up failed process before retry
+        _stop_llama_server(label)
+        if is_oom and ngl != candidates[-1]:
+            print(f"[{label}] CUDA OOM at --n-gpu-layers {ngl}, retrying with fewer GPU layers...")
+            time.sleep(2)
+            continue
+        # non-OOM failure or exhausted candidates
+        if detail.strip():
+            print(f"[{label}] llama-server failed to become healthy. Last log tail:")
+            print(detail.strip()[-2000:])
+        else:
+            print(f"[{label}] llama-server did not become healthy in time (check GGUF path / VRAM).")
+        if is_oom:
+            print(f"[{label}] All GPU offload levels OOM'd — try lowering LLAMA_CONTEXT_SIZE (now {ctx}) to 4096 or 6144, or use a smaller judge GGUF (e.g. qwen3.5:9b).")
+        return False
+    # exhausted
+    if last_detail:
+        print(f"[{label}] llama-server startup failed before projector CPU offload retry: {last_detail[-2000:].strip()}")
+    return False
+
+def _ensure_llama_server_for_role(role: str, stage_label: str) -> bool:
+    """Ensure managed server is running with the GGUF for this role. Returns True if ready."""
+    if LLM_BACKEND != "llamacpp":
+        return True
+    model_path = _llama_resolve_model(role)
+    if not model_path:
+        print(f"[{stage_label}] No GGUF configured for role '{role}'. Set LLAMA_*_MODEL_PATH.")
+        return False
+    # reuse helper that handles identity + restart
+    return _start_llama_server(model_path, label=stage_label)
+
 
 
 # --- Checkpoint I/O -----------------------------------------------------
@@ -195,7 +395,7 @@ def invalidate_downstream(stream_folder, from_stage):
         print(f"Invalidated {len(removed)} stale downstream file(s): {', '.join(removed)}")
 
 # --- Pipeline-wide stats (Ollama calls, per-stage timing) ----------------
-# Persisted across stages/processes so stage 10 (export) can report a full
+# Persisted across stages/processes so export can report a full
 # run summary even though no single process saw the whole pipeline.
 
 def load_pipeline_stats(stream_folder):
@@ -306,45 +506,244 @@ def build_transcript_blocks_by_part(stream_folder):
         blocks_by_part[part] = parse_srt_blocks(transcript)
     return blocks_by_part
 
-def _ollama_base_url(url):
-    """Strip the /api/... path off an Ollama endpoint to get the server
-    base (http://host:port) used for health checks."""
-    return url.split("/api/", 1)[0]
-
-
-def ollama_is_reachable(base_url, timeout=3):
-    """True if an Ollama server answers /api/version successfully."""
-    try:
-        response = requests.get(base_url.rstrip("/") + "/api/version", timeout=timeout)
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException:
-        return False
-
-
-def ollama_startup_message(base_url):
-    return (
-        f"Ollama is not active at {base_url}.\n"
-        "Close the RunAll GUI, launch Ollama manually, wait for it to finish "
-        "starting, then run 6_RunAllSteps.bat again."
-    )
-
 
 def require_ollama_ready(url):
-    """Report the manual startup workflow and refuse to begin without Ollama."""
-    base_url = _ollama_base_url(url)
+    """Refuse to begin when the active LLM server is not reachable.
+
+    Works for both backends: Ollama (/api/version) and llama.cpp
+    llama-server (/health). The name is kept for call-site compatibility.
+    """
+    if LLM_BACKEND == "llamacpp":
+        base_url = LLAMA_SERVER_URL.rstrip("/")
+        if llm_is_reachable(base_url):
+            return True
+        print(f"     [ERROR] {llm_not_ready_message(base_url)}")
+        return False
+    base_url = ollama_base_url(url)
     if ollama_is_reachable(base_url):
         return True
-    print(f"     [ERROR] {ollama_startup_message(base_url)}")
+    print(f"     [ERROR] {ollama_not_ready_message(base_url)}")
     return False
 
+def ollama_model_loaded(model_name, url):
+    """True when model_name currently shows as resident.
+
+    For llamacpp the single GGUF is resident whenever the server itself is
+    reachable, so this returns True when /health answers (no /api/ps).
+    """
+    if LLM_BACKEND == "llamacpp":
+        try:
+            return llm_is_reachable(LLAMA_SERVER_URL.rstrip("/"))
+        except Exception:
+            return False
+    try:
+        response = requests.get(ollama_base_url(url).rstrip("/") + "/api/ps", timeout=5)
+        response.raise_for_status()
+        wanted = str(model_name).strip().lower()
+        for entry in response.json().get("models", []):
+            for field in ("name", "model", "Name", "Model"):
+                value = str(entry.get(field, "")).strip().lower()
+                if value == wanted or value.startswith(wanted + ":"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+def ensure_ollama_model_ready(model_name, url, stage_label):
+    """Announce (and force) a stage's LLM model load before its real calls.
+    Loading multi-GB weights can silently stall the first API call for a
+    minute or more, which looked like a hang in the RunAll live console and
+    mini-process cards; probing and warming up here makes that wait
+    visible and keeps the slow first call out of the real batch retries.
+
+    For llamacpp there is no per-model load - the single GGUF is resident
+    when the server is up - so this just checks /health and reports ready.
+    """
+    if LLM_BACKEND == "llamacpp":
+        if not llm_is_reachable(LLAMA_SERVER_URL.rstrip("/")):
+            return  # require_ollama_ready()/ollama_generate() already report this path.
+        print(f"[{stage_label}] llama-server model ready (llamacpp backend - single GGUF resident).")
+        return
+    if not ollama_is_reachable(ollama_base_url(url)):
+        return  # require_ollama_ready()/ollama_generate() already report this path.
+    if ollama_model_loaded(model_name, url):
+        print(f"[{stage_label}] Ollama model {model_name} already loaded.")
+        return
+    print(f"[{stage_label}] Loading Ollama model {model_name} (first use; can take a minute)...")
+    sys.stdout.flush()
+    # Current Ollama reliably 500s the FIRST request that triggers a cold
+    # load of a partially-offloaded model (reproduced 2026-08-26); the real
+    # batches were only surviving this via ollama_generate()'s retries.
+    last_exc = None
+    last_response = None
+    for attempt in range(OLLAMA_RETRIES + 1):
+        response = None
+        try:
+            start = time.time()
+            if url.rstrip("/").endswith("/api/chat"):
+                payload = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                    "think": False,
+                    "options": {"num_predict": 1},
+                }
+            else:
+                payload = {"model": model_name, "prompt": "", "stream": False, "options": {"num_predict": 1}}
+            response = requests.post(url, json=payload, timeout=600)
+            response.raise_for_status()
+            print(f"[{stage_label}] Ollama model {model_name} ready in {time.time() - start:.0f}s.")
+            return
+        except Exception as exc:
+            last_exc = exc
+            last_response = response
+            detail = _http_error_detail(exc, response)
+            if attempt < OLLAMA_RETRIES:
+                print(
+                    f"[{stage_label}] Model load request failed ({exc}{detail}); "
+                    f"retrying in {OLLAMA_RETRY_BACKOFF_SECONDS:.0f}s..."
+                )
+                time.sleep(OLLAMA_RETRY_BACKOFF_SECONDS)
+    detail = _http_error_detail(last_exc, last_response)
+    print(f"[{stage_label}] Could not pre-warm Ollama model {model_name} ({last_exc}{detail}); the real call will retry.")
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> reasoning leakage from model output."""
+    if not text:
+        return text
+    # llama.cpp qwen3 templates may inline reasoning in <think> tags even when
+    # enable_thinking is False on some builds/quantizations.
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    return cleaned
+
+def _http_error_detail(exc, response=None):
+    """Extract Ollama/llama-server body for a failed HTTP call.
+
+    `requests` HTTPError string is just '500 Server Error...' - the real
+    cause (VRAM OOM, model not found, KV cache, etc.) lives in the response
+    body, usually as JSON {"error": "..."}. Return ' — <body>' or '' so call
+    sites can do f\"({exc}{detail})\" and the log tells VRAM vs refusal apart.
+    """
+    r = response if response is not None else getattr(exc, "response", None)
+    if r is None:
+        return ""
+    try:
+        body = getattr(r, "text", None)
+        if body is None:
+            body = ""
+        body = body.strip()
+        if not body:
+            return ""
+        # Prefer Ollama's JSON error field when present; fall back to raw text.
+        try:
+            data = r.json()
+            if isinstance(data, dict):
+                err = data.get("error")
+                if isinstance(err, str) and err.strip():
+                    body = err.strip()
+        except Exception:
+            pass
+        body = " ".join(body.split())  # collapse newlines/tabs
+        if len(body) > 800:
+            body = body[:800] + "…"
+        return f" — {body}"
+    except Exception:
+        return ""
+
+class _LlamaShimResponse:
+    """Minimal response shim so llamacpp results look like Ollama to call sites."""
+    def __init__(self, payload: dict):
+        self._payload = payload
+        self.status_code = 200
+    def raise_for_status(self):
+        return None
+    def json(self):
+        return self._payload
 
 def ollama_generate(payload, timeout, url=None):
-    """POST to an Ollama endpoint (default /api/generate) with retries."""
+    """POST to the active LLM backend (Ollama or llama.cpp) with retries.
+
+    Every call site stays Ollama-shaped; when LLM_BACKEND is "llamacpp" this
+    translates the payload to llama-server's OpenAI-compatible
+    /v1/chat/completions and normalizes the response back to Ollama's shape
+    so the existing parsers need no changes.
+    """
+    if LLM_BACKEND == "llamacpp":
+        is_chat = "messages" in payload
+        opts = payload.get("options") or {}
+        # Discovery (generate) uses a flat "prompt"; wrap as a user message.
+        if is_chat:
+            messages = payload.get("messages") or []
+            think_off = payload.get("think") is False
+        else:
+            messages = [{"role": "user", "content": payload.get("prompt", "")}]
+            think_off = False
+        body: dict = {
+            "model": "default",
+            "messages": messages,
+            "stream": False,
+            "temperature": opts.get("temperature", 0),
+        }
+        if think_off:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+            body["reasoning_budget"] = 0
+        n_pred = opts.get("num_predict")
+        if isinstance(n_pred, int) and n_pred > 0:
+            body["max_tokens"] = n_pred
+        # Passthrough a few optional knobs when present.
+        for key in ("top_p", "top_k", "stop", "seed"):
+            if key in payload:
+                body[key] = payload[key]
+            elif key in opts:
+                body[key] = opts[key]
+        llama_url = LLAMA_SERVER_URL.rstrip("/") + "/v1/chat/completions"
+        last_exc = None
+        last_response = None
+        for attempt in range(OLLAMA_RETRIES + 1):
+            response = None
+            start = time.time()
+            try:
+                response = requests.post(llama_url, json=body, timeout=timeout)
+                response.raise_for_status()
+                data = response.json()
+                # OpenAI shape: choices[0].message.content (+ possible reasoning_content)
+                try:
+                    choice = (data.get("choices") or [{}])[0]
+                    msg = choice.get("message") or {}
+                    content = msg.get("content") or choice.get("text") or ""
+                    # Some builds put reasoning in a separate field; ignore it.
+                    if not content and isinstance(msg.get("reasoning_content"), str):
+                        content = ""
+                except Exception:
+                    content = ""
+                content = _strip_think_blocks(content)
+                shim_payload = {"message": {"content": content}} if is_chat else {"response": content}
+                CALL_STATS["ollama_calls"] += 1
+                CALL_STATS["ollama_seconds"] += time.time() - start
+                return _LlamaShimResponse(shim_payload)
+            except Exception as exc:
+                last_exc = exc
+                last_response = response
+                detail = _http_error_detail(exc, response)
+                if isinstance(exc, requests.exceptions.ConnectionError) and attempt == OLLAMA_RETRIES:
+                    print(f"     [ERROR] {llm_not_ready_message(LLAMA_SERVER_URL.rstrip('/'))}")
+                if attempt < OLLAMA_RETRIES:
+                    CALL_STATS["ollama_retries"] += 1
+                    print(f"     [!] llama-server call failed ({exc}{detail}); retrying in {OLLAMA_RETRY_BACKOFF_SECONDS:.0f}s...")
+                    time.sleep(OLLAMA_RETRY_BACKOFF_SECONDS * (attempt + 1))
+        if last_exc is not None:
+            detail = _http_error_detail(last_exc, last_response)
+            if detail:
+                raise type(last_exc)(f"{last_exc}{detail}") from last_exc
+        raise last_exc
     if url is None:
         url = OLLAMA_URL
     last_exc = None
+    last_response = None
     for attempt in range(OLLAMA_RETRIES + 1):
+        response = None
         start = time.time()
         try:
             response = requests.post(url, json=payload, timeout=timeout)
@@ -354,12 +753,18 @@ def ollama_generate(payload, timeout, url=None):
             return response
         except Exception as exc:
             last_exc = exc
+            last_response = response
+            detail = _http_error_detail(exc, response)
             if isinstance(exc, requests.exceptions.ConnectionError) and attempt == OLLAMA_RETRIES:
-                print(f"     [ERROR] {ollama_startup_message(_ollama_base_url(url))}")
+                print(f"     [ERROR] {ollama_not_ready_message(ollama_base_url(url))}")
             if attempt < OLLAMA_RETRIES:
                 CALL_STATS["ollama_retries"] += 1
-                print(f"     [!] Ollama call failed ({exc}); retrying in {OLLAMA_RETRY_BACKOFF_SECONDS:.0f}s...")
+                print(f"     [!] Ollama call failed ({exc}{detail}); retrying in {OLLAMA_RETRY_BACKOFF_SECONDS:.0f}s...")
                 time.sleep(OLLAMA_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    if last_exc is not None:
+        detail = _http_error_detail(last_exc, last_response)
+        if detail:
+            raise type(last_exc)(f"{last_exc}{detail}") from last_exc
     raise last_exc
 
 
@@ -434,17 +839,33 @@ def export_preview_clips(stream_folder, highlights, before_seconds, after_second
     if exported:
         print(f"[preview] Saved {exported} preview clip(s) to: {clips_dir}")
 
-def unload_ollama_model(model_name):
-    """Ask Ollama to unload a model so CUDA VRAM is available for emotion scoring."""
+def unload_ollama_model(model_name, label="emotion"):
+    """Ask the LLM server to unload a model so its VRAM is released.
+
+    For the managed llama.cpp server this actually stops the process to free
+    VRAM (matching Ollama's keep_alive:0 unload before the emotion stage).
+    """
+    if LLM_BACKEND == "llamacpp":
+        _stop_llama_server(label)
+        return
     try:
         requests.post(
-            "http://localhost:11434/api/generate",
+            OLLAMA_URL,
             json={"model": model_name, "prompt": "", "keep_alive": 0},
             timeout=30,
         )
-        print(f"[emotion] Requested Ollama unload for {model_name}")
+        print(f"[{label}] Requested Ollama unload for {model_name}")
     except Exception as exc:
-        print(f"[emotion] Could not unload Ollama model {model_name}: {exc}")
+        print(f"[{label}] Could not unload Ollama model {model_name}: {exc}")
+
+def unload_all_ollama_models(label="pipeline"):
+    """Unload pipeline models once all steps are finished."""
+    if LLM_BACKEND == "llamacpp":
+        _stop_llama_server(label)
+        return
+    print(f"[{label}] All steps finished - unloading Ollama models to free VRAM")
+    unload_ollama_model(MODEL, label)
+    unload_ollama_model(JUDGE_MODEL, label)
 
 def emotion_boost(label, confidence):
     label = (label or "").strip().lower()
@@ -1040,13 +1461,8 @@ STRICT OUTPUT FORMAT:
             signal_desc = describe_audio_signal(c["LoudnessZ"], c["RateZ"])
             prompt += f"{i}. Signal: {signal_desc} | Transcript: {snippet_text}\n"
 
-        # /api/chat + top-level think:false, not /api/generate + "/no_think"
-        # in the prompt: qwen3.5 handles thinking via Ollama's own renderer/
-        # parser, and /api/generate ignores think:false outright for it
-        # (confirmed Ollama bug ollama/ollama#14793) - it just thinks until
-        # num_predict runs out and "response" comes back empty (the "0/10
-        # titles parsed" failure this used to produce for every batch).
-        # /api/chat + think:false is the combination Ollama confirms works.
+        # /api/chat + think:false, per the qwen3.5 note on OLLAMA_CHAT_URL in
+        # pipeline_config.py.
         payload = {
             "model": JUDGE_MODEL,
             "messages": [{"role": "user", "content": prompt}],
@@ -1258,7 +1674,7 @@ def is_low_content_title(title):
 
     return False
 
-# --- Stage 5: Discovery --------------------------------------------------
+# --- Discovery -----------------------------------------------------------
 
 def run_discovery(stream_folder, parts, prompts):
     """Runs the LLM discovery passes across every transcript_partN.txt,
@@ -1439,7 +1855,7 @@ def run_discovery(stream_folder, parts, prompts):
 
     return highlights, part_errors
 
-# --- Stage 8: Content verification ---------------------------------------
+# --- Content verification ------------------------------------------------
 
 def verify_candidates(highlights, transcript_blocks_by_part, verify_prompt_header, stream_folder, batch_size=None):
     """A timestamp can be "real" (it exists in the transcript) while the
@@ -1469,21 +1885,15 @@ def verify_candidates(highlights, transcript_blocks_by_part, verify_prompt_heade
         batch = highlights[batch_start:batch_start + batch_size]
         total_items += len(batch)
 
-        # Thinking must be OFF here: JUDGE_MODEL is thinking-capable, and
-        # without this it can burn the whole num_predict budget on an
-        # internal reasoning trace before emitting ItemNumber,VERDICT lines
-        # - every batch silently returning 0 parsed verdicts. qwen3.5
-        # handles thinking via Ollama's own renderer/parser, not the old
-        # "/no_think"-in-prompt convention, and /api/generate ignores
-        # think:false for it entirely (confirmed Ollama bug
-        # ollama/ollama#14793) - only /api/chat + top-level think:false
-        # actually disables it, so that's what's used below.
+        # Thinking must be OFF: JUDGE_MODEL is thinking-capable and would burn
+        # the num_predict budget before emitting ItemNumber,VERDICT lines.
+        # /api/chat + think:false, per the qwen3.5 note on OLLAMA_CHAT_URL in
+        # pipeline_config.py.
         verify_prompt = verify_prompt_header
         for i, h in enumerate(batch, start=1):
             blocks = transcript_blocks_by_part.get(h.get("SourcePart"), [])
             target_seconds = timestamp_to_seconds(h["Timestamp"])
             snippet = get_snippet(blocks, target_seconds, window=20)
-
             if not snippet:
                 snippet = "(no transcript text found near this timestamp)"
 
@@ -1554,19 +1964,15 @@ def verify_candidates(highlights, transcript_blocks_by_part, verify_prompt_heade
 
     return verified_highlights, total_items, total_verdicts_parsed
 
-# --- Stage 9: Judging -----------------------------------------------------
+# --- Judging --------------------------------------------------------------
 
 def run_judge_batch(pool, keep_n, judge_instructions):
     """Sends a batch of candidates to the judge model and returns the
     ranked subset (as highlight dicts), preserving model-assigned order.
     judge_instructions must contain a {keep_n} placeholder.
 
-    Uses /api/chat + think:false, like verify and audio-scan titling. The
-    judge originally ran on /api/generate with thinking enabled, but newer
-    Ollama (>= 0.3.x) counts the reasoning against num_predict and returns
-    it in a separate `thinking` JSON field instead of inline in `response` -
-    the model burns the whole budget mid-thought and the CSV rows never
-    appear, silently reducing judging to a score sort.
+    Uses /api/chat + think:false, like verify and audio-scan titling (see the
+    qwen3.5 note on OLLAMA_CHAT_URL in pipeline_config.py).
     """
     prompt = judge_instructions.format(keep_n=keep_n)
 
@@ -1643,10 +2049,7 @@ def run_judge_batch(pool, keep_n, judge_instructions):
 
     if not ranked:
         # Total parse failure: surface it instead of silently degrading to a
-        # score sort. This used to happen on every run with newer Ollama,
-        # where /api/generate with thinking enabled returned an empty
-        # response (the whole output budget went into a separate `thinking`
-        # field) - see the JUDGE_INSTRUCTIONS comment above.
+        # score sort.
         print(f"     [!] Judge returned no parseable CSV rows for {len(pool)} candidate(s) - falling back to score order")
         print(f"     [!] Raw response: {result[:400]!r}")
 
@@ -1703,7 +2106,7 @@ def run_judge_tournament(judge_pool, judge_instructions, top_n, judge_batch_size
     else:
         return highlights_by_score[:top_n]
 
-# --- Stage 10: Export -----------------------------------------------------
+# --- Export ---------------------------------------------------------------
 
 def final_score_cap_for_rank(rank: int) -> int:
     if rank == 1:
@@ -1908,17 +2311,61 @@ def record_pipeline_run_history(stream_folder):
 # ============================================================================
 # Discovery prompts (Emotion / Gameplay / Viral passes)
 # ============================================================================
-PROMPTS = [
-("""/no_think
-You are an expert short-form content scout for TikTok/Reels/YouTube Shorts.
-
+DISCOVERY_COMMON_RULES = """\
 CRITICAL RULE: Only return moments that are explicitly present in the
 transcript text below. Every Timestamp you return MUST be copied directly
 from a timestamp that appears in the transcript - never estimate, round,
 or invent a timestamp. Every Title and Reason must be based on dialogue or
 events that are actually written in the transcript, not assumed or imagined.
 If you are not sure a moment exists at a specific timestamp, do not include it.
+"""
 
+DISCOVERY_COMMON_FORMAT = """\
+STRICT OUTPUT FORMAT:
+- Exactly one moment per line
+- Exactly 4 comma-separated fields per line: Timestamp,Score,Title,Reason
+- Timestamp must be plain HH:MM:SS with NO brackets, NO extra text
+- There must be a comma (not a space) immediately after the timestamp,
+  and a comma (not a space) immediately after the score
+- Wrap Title and Reason in double quotes since they may contain commas
+- Do not add any extra commentary, headers, or explanation - CSV rows only
+"""
+
+DISCOVERY_COMMON_SCORING = """\
+Use the FULL 1-10 range, but be harsh. Most valid moments should land in
+4-7. An 8 is already a strong clip. A 9 is rare. A 10 means a near-perfect,
+standalone viral moment that would be obvious to strangers with no context.
+Across an entire stream, expect zero or one 10. If many moments feel like 9
+or 10, lower them until only the truly exceptional outliers remain.
+"""
+
+DISCOVERY_EXCLUSION = """\
+AUTOMATIC LOW SCORE (1-2) or EXCLUDE:
+- Singing, humming, or musical moments
+- A single word or short phrase repeated multiple times with no other content
+"""
+
+DISCOVERY_LIMIT = """\
+Return up to 25 moments - fewer, well-chosen moments are better than
+padding the list with weak ones just to reach the limit.
+"""
+
+DISCOVERY_GOOD_EXAMPLE = """\
+Example of a moment worth including (score shown is just an example, not a
+target - use whatever score actually fits this specific moment):
+{good_example}
+"""
+
+DISCOVERY_BAD_EXAMPLE = """\
+Example of a moment that should NOT appear in your output at all: {bad_example}
+leave moments like this out entirely rather than including them at a low score.
+"""
+
+PROMPTS = [
+("""/no_think
+You are an expert short-form content scout for TikTok/Reels/YouTube Shorts.
+
+""" + DISCOVERY_COMMON_RULES + """
 Find emotional moments from this Twitch transcript - reactions raw or
 intense enough that someone scrolling a feed would stop and watch.
 
@@ -1946,12 +2393,7 @@ Score each moment 1-10 using this rubric:
 - 3-5: Genuine reaction, but needs backstory or stream knowledge to land
 - 1-2: Only meaningful if you were already watching live
 
-Use the FULL 1-10 range, but be harsh. Most valid moments should land in
-4-7. An 8 is already a strong clip. A 9 is rare. A 10 means a near-perfect,
-standalone viral moment that would be obvious to strangers with no context.
-Across an entire stream, expect zero or one 10. If many moments feel like 9
-or 10, lower them until only the truly exceptional outliers remain.
-
+""" + DISCOVERY_COMMON_SCORING + """
 In the Reason field, describe SPECIFICALLY what happens at this exact
 moment, in your own words, based on the actual transcript text. Do not
 copy or rephrase the category descriptions or criteria from these
@@ -1959,34 +2401,14 @@ instructions (e.g. do not write "Setup -> twist -> payoff" or "did that
 just happen moment" as the reason) - that is not a real reason, it is just
 repeating the instructions. Write what is ACTUALLY said or happening.
 
-AUTOMATIC LOW SCORE (1-2) or EXCLUDE:
-- Singing, humming, or musical moments
-- A single word or short phrase repeated multiple times with no other content
-  (e.g. "no no no no", "what what what", screaming the same word repeatedly)
+""" + DISCOVERY_EXCLUSION + """  (e.g. "no no no no", "what what what", screaming the same word repeatedly)
 - Reactions with no actual identifiable trigger or moment behind them
 
-Return up to 25 moments - fewer, well-chosen moments are better than
-padding the list with weak ones just to reach the limit.
-
-STRICT OUTPUT FORMAT:
-- Exactly one moment per line
-- Exactly 4 comma-separated fields per line: Timestamp,Score,Title,Reason
-- Timestamp must be plain HH:MM:SS with NO brackets, NO extra text
-- There must be a comma (not a space) immediately after the timestamp,
-  and a comma (not a space) immediately after the score
-- Wrap Title and Reason in double quotes since they may contain commas
-- Do not add any extra commentary, headers, or explanation - CSV rows only
-
-Example of a moment worth including (score shown is just an example, not a
-target - use whatever score actually fits this specific moment):
-03:17:37,6,"Uhhh, so sad","Expresses deep disappointment after a loss"
-
-Example of a moment that should NOT appear in your output at all: a
-teammate calmly says "yeah I guess that's fine" and the streamer just moves
-on. No emotional intensity, no reaction a stranger would stop scrolling for
-- leave moments like this out entirely rather than including them at a low
-score.
-
+""" + DISCOVERY_LIMIT + "\n" + DISCOVERY_COMMON_FORMAT + "\n"
++ DISCOVERY_GOOD_EXAMPLE.format(good_example='03:17:37,6,"Uhhh, so sad","Expresses deep disappointment after a loss"') + "\n"
++ DISCOVERY_BAD_EXAMPLE.format(
+    bad_example='a teammate calmly says "yeah I guess that\'s fine" and the streamer just moves on. '
+                'No emotional intensity, no reaction a stranger would stop scrolling for -') + """
 Format:
 Timestamp,Score,Title,Reason
 """, "Emotion"),
@@ -1994,13 +2416,7 @@ Timestamp,Score,Title,Reason
 ("""/no_think
 You are an expert short-form content scout for TikTok/Reels/YouTube Shorts.
 
-CRITICAL RULE: Only return moments that are explicitly present in the
-transcript text below. Every Timestamp you return MUST be copied directly
-from a timestamp that appears in the transcript - never estimate, round,
-or invent a timestamp. Every Title and Reason must be based on dialogue or
-events that are actually written in the transcript, not assumed or imagined.
-If you are not sure a moment exists at a specific timestamp, do not include it.
-
+""" + DISCOVERY_COMMON_RULES + """
 Find gameplay moments from this Twitch transcript that would impress or
 entertain someone watching as a short clip.
 
@@ -2028,45 +2444,21 @@ Score each moment 1-10 using this rubric:
 - 3-5: Impressive only to people who understand this game's mechanics
 - 1-2: Only meaningful to viewers who were already watching live
 
-Use the FULL 1-10 range, but be harsh. Most valid moments should land in
-4-7. An 8 is already a strong clip. A 9 is rare. A 10 means a near-perfect,
-standalone viral moment that would be obvious to strangers with no context.
-Across an entire stream, expect zero or one 10. If many moments feel like 9
-or 10, lower them until only the truly exceptional outliers remain.
-
+""" + DISCOVERY_COMMON_SCORING + """
 In the Reason field, describe SPECIFICALLY what happens at this exact
 moment, in your own words, based on the actual transcript text. Do not
 copy or rephrase the category descriptions or criteria from these
 instructions - that is not a real reason, it is just repeating the
 instructions. Write what is ACTUALLY said or happening.
 
-AUTOMATIC LOW SCORE (1-2) or EXCLUDE:
-- Singing, humming, or musical moments
-- A single word or short phrase repeated multiple times with no other content
+""" + DISCOVERY_EXCLUSION + """
 - Moments with no clear, identifiable gameplay action behind them
 
-Return up to 25 moments - fewer, well-chosen moments are better than
-padding the list with weak ones just to reach the limit.
-
-STRICT OUTPUT FORMAT:
-- Exactly one moment per line
-- Exactly 4 comma-separated fields per line: Timestamp,Score,Title,Reason
-- Timestamp must be plain HH:MM:SS with NO brackets, NO extra text
-- There must be a comma (not a space) immediately after the timestamp,
-  and a comma (not a space) immediately after the score
-- Wrap Title and Reason in double quotes since they may contain commas
-- Do not add any extra commentary, headers, or explanation - CSV rows only
-
-Example of a moment worth including (score shown is just an example, not a
-target - use whatever score actually fits this specific moment):
-03:17:37,6,"Clean 1v3 clutch","Wins the round alone after teammates die early"
-
-Example of a moment that should NOT appear in your output at all: the
-streamer picks up a routine kill in a lopsided fight with no real risk or
-skill on display. Ordinary gameplay a stranger would scroll right past -
-leave moments like this out entirely rather than including them at a low
-score.
-
+""" + DISCOVERY_LIMIT + "\n" + DISCOVERY_COMMON_FORMAT + "\n"
++ DISCOVERY_GOOD_EXAMPLE.format(good_example='03:17:37,6,"Clean 1v3 clutch","Wins the round alone after teammates die early"') + "\n"
++ DISCOVERY_BAD_EXAMPLE.format(
+    bad_example='the streamer picks up a routine kill in a lopsided fight with no real risk or '
+                'skill on display. Ordinary gameplay a stranger would scroll right past -') + """
 Format:
 Timestamp,Score,Title,Reason
 """, "Gameplay"),
@@ -2074,13 +2466,7 @@ Timestamp,Score,Title,Reason
 ("""/no_think
 You are an expert short-form content scout for TikTok/Reels/YouTube Shorts.
 
-CRITICAL RULE: Only return moments that are explicitly present in the
-transcript text below. Every Timestamp you return MUST be copied directly
-from a timestamp that appears in the transcript - never estimate, round,
-or invent a timestamp. Every Title and Reason must be based on dialogue or
-events that are actually written in the transcript, not assumed or imagined.
-If you are not sure a moment exists at a specific timestamp, do not include it.
-
+""" + DISCOVERY_COMMON_RULES + """
 Your job is to find moments from this Twitch transcript that could go VIRAL
 as a standalone clip, watched by someone who has never seen this streamer
 or this game before.
@@ -2109,20 +2495,11 @@ Score each moment 1-10 using this rubric:
 - 3-5: Funny to channel regulars, but needs game/streamer knowledge
 - 1-2: Only really funny if you were already watching live
 
-Use the FULL 1-10 range, but be harsh. Most valid moments should land in
-4-7. An 8 is already a strong clip. A 9 is rare. A 10 means a near-perfect,
-standalone viral moment that would be obvious to strangers with no context.
-Across an entire stream, expect zero or one 10. If many moments feel like 9
-or 10, lower them until only the truly exceptional outliers remain.
-
-AUTOMATIC LOW SCORE (1-2) or EXCLUDE:
-- Singing, humming, or musical moments
-- A single word or short phrase repeated multiple times with no other content
+""" + DISCOVERY_COMMON_SCORING + "\n"
++ DISCOVERY_EXCLUSION + """
 - Moments with no clear story, trigger, or punchline behind them
 
-Return up to 25 moments - fewer, well-chosen moments are better than
-padding the list with weak ones just to reach the limit.
-
+""" + DISCOVERY_LIMIT + """
 In the Reason field, write a SPECIFIC one-line hook/caption based on what
 actually happens at this exact moment (e.g. "He didn't even see it coming"
 only makes sense if someone genuinely got caught off guard - replace it
@@ -2131,25 +2508,11 @@ explanation of why THIS SPECIFIC moment has viral potential. Do not reuse
 the category names or criteria wording above as the reason - describe the
 actual transcript content in your own words.
 
-STRICT OUTPUT FORMAT:
-- Exactly one moment per line
-- Exactly 4 comma-separated fields per line: Timestamp,Score,Title,Reason
-- Timestamp must be plain HH:MM:SS with NO brackets, NO extra text
-- There must be a comma (not a space) immediately after the timestamp,
-  and a comma (not a space) immediately after the score
-- Wrap Title and Reason in double quotes since they may contain commas
-- Do not add any extra commentary, headers, or explanation - CSV rows only
-
-Example of a moment worth including (score shown is just an example, not a
-target - use whatever score actually fits this specific moment):
-03:17:37,6,"He had ONE job","Hook: he didn't even see it coming. Misses an open shot everyone expected him to make."
-
-Example of a moment that should NOT appear in your output at all: the
-streamer mentions offhand that they're a little tired and want a snack
-soon. No story, no twist, no reaction - nothing here a stranger would ever
-share. Leave moments like this out entirely rather than including them at
-a low score.
-
+""" + DISCOVERY_COMMON_FORMAT + "\n"
++ DISCOVERY_GOOD_EXAMPLE.format(good_example='03:17:37,6,"He had ONE job","Hook: he didn\'t even see it coming. Misses an open shot everyone expected him to make."') + "\n"
++ DISCOVERY_BAD_EXAMPLE.format(
+    bad_example='the streamer mentions offhand that they\'re a little tired and want a snack soon. '
+                'No story, no twist, no reaction - nothing here a stranger would ever share.') + """
 Format:
 Timestamp,Score,Title,Reason
 """, "Viral")
@@ -2190,19 +2553,8 @@ Where VERDICT is either PASS or FAIL. Do not add any other text.
 # ============================================================================
 # Judge prompt
 # ============================================================================
-# Originally this was the only JUDGE_MODEL prompt that deliberately kept
-# thinking ENABLED - judge is comparative (weighing candidates against a
-# 5-factor priority order), which reasoning was supposed to help - and it
-# ran on /api/generate, skipping the OLLAMA_CHAT_URL + think:false treatment
-# used by verify/titling.
-#
-# That no longer works on current Ollama (>= 0.3.x): qwen3.5's reasoning is
-# emitted into a separate `thinking` JSON field that counts against
-# num_predict, so the model spends the whole 3000-token budget mid-thought
-# and "response" comes back empty - the CSV rows never appear and judging
-# silently degrades to a score sort. run_judge_batch() therefore uses the
-# same /api/chat + think:false path as verify/titling (the qwen3.5
-# think:false bug ollama/ollama#14793 only affects /api/generate).
+# run_judge_batch() uses /api/chat + think:false like verify/titling - see the
+# qwen3.5 note on OLLAMA_CHAT_URL in pipeline_config.py.
 #
 # If judging comes up short on parsed items, run_judge_tournament() backfills
 # by score rather than losing candidates - verify has no equivalent
@@ -2258,6 +2610,13 @@ def run_stage_discovery(stream_folder):
     stage = "discovery"
     with stage_log(stream_folder, stage):
         stage_start = time.time()
+        if LLM_BACKEND == "llamacpp":
+            if not _ensure_llama_server_for_role("discovery", stage):
+                sys.exit(1)
+        else:
+            if MODEL.strip() != JUDGE_MODEL.strip():
+                unload_ollama_model(JUDGE_MODEL, stage)
+            ensure_ollama_model_ready(MODEL, OLLAMA_URL, stage)
 
         parts = list_transcript_parts(stream_folder)
         if not parts:
@@ -2287,12 +2646,20 @@ def run_stage_discovery(stream_folder):
         save_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES[stage], highlights)
         record_stage_stats(stream_folder, stage, time.time() - stage_start)
         print(f"Saved {len(highlights)} candidate(s)")
-
 def run_stage_audioscan(stream_folder):
     stage = "audioscan"
     with stage_log(stream_folder, stage):
         stage_start = time.time()
 
+        if LLM_BACKEND == "llamacpp":
+            if not _ensure_llama_server_for_role("judge", stage):
+                sys.exit(1)
+        else:
+            # Titling is this stage's only model use; ensure its (possibly cold) load is visible.
+            # Unload discovery MODEL first when it differs from JUDGE_MODEL - 14b+35b cannot co-reside on 10GB VRAM (2026-09-04 OOM).
+            if MODEL.strip() != JUDGE_MODEL.strip():
+                unload_ollama_model(MODEL, stage)
+            ensure_ollama_model_ready(JUDGE_MODEL, OLLAMA_CHAT_URL, stage)
         highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["discovery"], stage)
         transcript_blocks_by_part = build_transcript_blocks_by_part(stream_folder)
 
@@ -2344,8 +2711,10 @@ def run_stage_emotion(stream_folder):
     with stage_log(stream_folder, stage):
         stage_start = time.time()
 
-        highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["audioscan"], stage)
+        if LLM_BACKEND == "llamacpp":
+            _stop_llama_server(stage)
 
+        highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["audioscan"], stage)
         transcript_blocks_by_part = build_transcript_blocks_by_part(stream_folder)
 
         apply_emotion_scores_to_highlights(highlights, stream_folder)
@@ -2354,13 +2723,19 @@ def run_stage_emotion(stream_folder):
 
         save_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES[stage], highlights)
         record_stage_stats(stream_folder, stage, time.time() - stage_start)
-        print(f"Saved {len(highlights)} candidate(s)")
-
 def run_stage_verify(stream_folder):
     stage = "verify"
     with stage_log(stream_folder, stage):
         stage_start = time.time()
 
+        if LLM_BACKEND == "llamacpp":
+            if not _ensure_llama_server_for_role("judge", stage):
+                sys.exit(1)
+        else:
+            # Emotion freed VRAM, but a forced --stage verify rerun may still have MODEL resident - free it before loading JUDGE.
+            if MODEL.strip() != JUDGE_MODEL.strip():
+                unload_ollama_model(MODEL, stage)
+            ensure_ollama_model_ready(JUDGE_MODEL, OLLAMA_CHAT_URL, stage)
         highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["emotion"], stage)
 
         before_trim = len(highlights)
@@ -2398,6 +2773,13 @@ def run_stage_judge(stream_folder):
     with stage_log(stream_folder, stage):
         stage_start = time.time()
 
+        if LLM_BACKEND == "llamacpp":
+            if not _ensure_llama_server_for_role("judge", stage):
+                sys.exit(1)
+        else:
+            if MODEL.strip() != JUDGE_MODEL.strip():
+                unload_ollama_model(MODEL, stage)
+            ensure_ollama_model_ready(JUDGE_MODEL, OLLAMA_CHAT_URL, stage)
         highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["verify"], stage)
 
         judge_pool = highlights[:JUDGE_POOL_SIZE]
@@ -2495,6 +2877,12 @@ def run_all_remaining_stages(stream_folder):
 
     record_pipeline_run_history(stream_folder)
 
+    # Every step finished (export always runs last) - release the Ollama VRAM
+    # this run reserved. The emotion model is already freed in-process by
+    # classify_candidate_emotions(); only the Ollama server keeps weights
+    # resident after we exit, so explicitly unload those.
+    unload_all_ollama_models()
+
 def run_single_stage_forced(stream_folder, stage):
     """Debug mode (--stage flag, used by the 5a-5f debug bats): force this
     ONE stage to run even if its checkpoint already exists, invalidate
@@ -2536,8 +2924,26 @@ def main():
     print("Stream Folder:", stream_folder)
     print()
 
-    if not require_ollama_ready(OLLAMA_URL):
-        return 1
+    # Export needs no LLM, so a forced --stage export (5f) must run even when
+    # the LLM server is down; every other path still requires the server (or
+    # its GGUF files) up front. For llamacpp the server is managed per-stage,
+    # so just check that the GGUF paths exist rather than requiring /health.
+    if args.stage != "export":
+        if LLM_BACKEND == "llamacpp":
+            roles = ["discovery", "judge"] if args.stage is None else (["discovery"] if args.stage == "discovery" else ["judge"])
+            missing = []
+            for role in roles:
+                needed = _llama_resolve_model(role)
+                if not needed or not Path(needed).exists():
+                    missing.append((role, needed or "(empty)"))
+            if missing:
+                for role, needed in missing:
+                    print(f"     [ERROR] llama.cpp GGUF not found for role '{role}': {needed}")
+                print("             Set LLAMA_DISCOVERY_MODEL_PATH / LLAMA_JUDGE_MODEL_PATH (or LLAMA_MODEL_PATH) in pipeline_config.py")
+                # dedupe single-GGUF mode where both roles resolve to same missing path
+                return 1
+        elif not require_ollama_ready(OLLAMA_URL):
+            return 1
 
     if args.stage:
         run_single_stage_forced(stream_folder, args.stage)

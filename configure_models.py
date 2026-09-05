@@ -16,29 +16,16 @@ import pipeline_config as cfg  # noqa: E402
 
 
 def _current_values() -> dict:
-    return {
-        param["key"]: getattr(cfg, param["key"], None)
-        for param in cfg.EDITABLE_PARAMS
-    }
+    return {param["key"]: getattr(cfg, param["key"], None) for param in cfg.EDITABLE_PARAMS}
 
 
-def _find_matching_preset(discovery_model: str, judge_model: str) -> tuple[str, dict] | None:
-    """Return the preset for an exact discovery/judge model pairing."""
-    discovery_model = str(discovery_model or "").strip()
-    judge_model = str(judge_model or "").strip()
-    if not discovery_model or not judge_model:
-        return None
-    for name, preset in cfg.PRESETS.items():
-        values = preset.get("values", {})
-        if (
-            str(values.get("MODEL", "")).strip() == discovery_model
-            and str(values.get("JUDGE_MODEL", "")).strip() == judge_model
-        ):
-            return name, preset
-    return None
-
-
-
+def _apply_role_tuning(role: str, model: str, set_state_value, log) -> None:
+    tuning = cfg.tuning_for_role(model, role)
+    if not tuning:
+        return
+    for key, value in tuning.items():
+        set_state_value(key, value)
+    log(f"Applied {role} tuning for {model}: " + ", ".join(f"{k}={v}" for k, v in tuning.items()))
 
 def run_gui() -> int:
     import tkinter as tk
@@ -69,8 +56,8 @@ def run_gui() -> int:
     phrase_editors: dict[str, tk.Text] = {}
     installed_models: list[str] = []
     config_path = Path(cfg.__file__).resolve()
+    last_discovery_model = str(getattr(cfg, "MODEL", "") or "").strip()
     last_judge_model = str(getattr(cfg, "JUDGE_MODEL", "") or "").strip()
-
 
     def phrase_text(value) -> str:
         if isinstance(value, (list, tuple)):
@@ -142,7 +129,7 @@ def run_gui() -> int:
     ttk.Label(top, text="Configure Pog Engine", font=("Segoe UI", 16, "bold")).pack(anchor="w")
     ttk.Label(
         top,
-        text=("Choose the Ollama models, apply a preset for this machine, then save. "
+        text=("Choose the LLM backend and models. Switching a model auto-fills role-optimal values for that role; review then save. "
               "Changes go directly to pipeline_config.py."),
     ).pack(anchor="w", pady=(2, 8))
     general_params = [param for param in cfg.EDITABLE_PARAMS if param["stage"] == "General"]
@@ -213,23 +200,6 @@ def run_gui() -> int:
     ttk.Button(scan_row, text="Scan models", command=refresh_models).pack(side="left")
     ttk.Label(scan_row, textvariable=models_status_var, width=80, anchor="w").pack(side="left", padx=10)
 
-    preset_row = ttk.Frame(root, padding=(12, 4, 12, 4))
-    preset_row.pack(fill="x")
-    ttk.Label(preset_row, text="Preset:").pack(side="left")
-    preset_names = list(cfg.PRESETS)
-    preset_var = tk.StringVar()
-    preset_cb = ttk.Combobox(
-        preset_row,
-        textvariable=preset_var,
-        values=preset_names,
-        width=72,
-        state="readonly",
-    )
-    preset_cb.pack(side="left", padx=(6, 6))
-
-    recommendation_var = tk.StringVar(value="")
-
-
     def set_state_value(key: str, value) -> None:
         editor = phrase_editors.get(key)
         if editor is not None:
@@ -238,52 +208,58 @@ def run_gui() -> int:
         else:
             var_state[key].set(value)
 
-    def apply_preset() -> None:
+    def _log_early(message: str) -> None:
+        try:
+            log_box.configure(state="normal")
+            log_box.insert("end", message.rstrip("\n") + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+        except Exception:
+            pass
+
+    def on_discovery_model_selected(_event=None) -> None:
+        nonlocal last_discovery_model
+        model = str(var_state["MODEL"].get()).strip()
+        if model == last_discovery_model:
+            return
+        last_discovery_model = model
+        if not model:
+            return
+        _apply_role_tuning("discovery", model, set_state_value, _log_early)
+
+    def on_judge_model_selected(_event=None) -> None:
         nonlocal last_judge_model
-        name = preset_var.get()
-        if not name:
-            messagebox.showinfo("Pog_Engine", "Pick a preset first.", parent=root)
+        model = str(var_state["JUDGE_MODEL"].get()).strip()
+        if model == last_judge_model:
             return
-        if name not in cfg.PRESETS:
-            messagebox.showerror("Pog_Engine", f"Unknown preset: {name}", parent=root)
+        last_judge_model = model
+        if not model:
             return
-        values = cfg.PRESETS[name].get("values", {})
-        for key, value in values.items():
-            if key in var_state or key in phrase_editors:
-                set_state_value(key, value)
-        last_judge_model = str(var_state["JUDGE_MODEL"].get()).strip()
-        recommendation_var.set("")
-        preset = cfg.PRESETS[name]
-        log(f"Loaded preset '{preset.get('name_short', name)}' into the form.")
-        log(preset.get("description", ""))
-        log("Review the values, then click Save.")
+        _apply_role_tuning("judge", model, set_state_value, _log_early)
 
+    # Bottom-anchored chrome is packed FIRST so Tk reserves its space from
+    # the window's bottom edge; the scrolling parameter list then expands
+    # into whatever remains. Packing these after an expanding widget let the
+    # scroller and log push the Save bar off-screen unless the window was
+    # maximized.
+    status_var = tk.StringVar(value="Ready.")
+    ttk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", side="bottom")
+    save_bar = ttk.Frame(root, padding=(12, 4, 12, 0))
+    save_bar.pack(fill="x", side="bottom")
 
-    ttk.Button(
-        preset_row,
-        text="Apply preset to form",
-        style="Accent.TButton",
-        command=apply_preset,
-    ).pack(side="left", padx=(0, 6))
-
-    recommendation_row = ttk.Frame(root, padding=(12, 0, 12, 4))
-    recommendation_row.pack(fill="x")
-    ttk.Label(
-        recommendation_row,
-        textvariable=recommendation_var,
-        foreground="#d8b86a",
-        wraplength=1040,
-        justify="left",
-    ).pack(fill="x")
-
-    current_preset = _find_matching_preset(
-        str(var_state["MODEL"].get()).strip(),
-        str(var_state["JUDGE_MODEL"].get()).strip(),
+    bottom = ttk.Frame(root, padding=(12, 6, 12, 12))
+    bottom.pack(fill="both", side="bottom")
+    ttk.Label(bottom, text="Log").pack(anchor="w")
+    log_box = tk.Text(
+        bottom,
+        height=6,
+        wrap="word",
+        state="disabled",
+        bg="#0f0f0f",
+        fg="#f2f2f2",
+        insertbackground="#f2f2f2",
     )
-    if current_preset is not None:
-        preset_cb.set(current_preset[0])
-    elif preset_names:
-        preset_cb.current(0)
+    log_box.pack(fill="both", expand=True)
 
     middle_container = ttk.Frame(root, padding=(12, 4, 12, 4))
     middle_container.pack(fill="both", expand=True)
@@ -309,7 +285,10 @@ def run_gui() -> int:
 
     section_row = 0
     for stage, params in by_stage.items():
-        if stage == "General":
+        if stage in ("General", "Models"):
+            # General lives in the header block; model pickers render once
+            # up top beside 'Scan models'. A second copy here used to
+            # duplicate every model dropdown in this scrolling list.
             continue
         section = ttk.LabelFrame(params_frame, text=stage, padding=(10, 6))
         section.grid(row=section_row, column=0, sticky="ew", pady=(0, 8))
@@ -324,6 +303,14 @@ def run_gui() -> int:
             kind = param["kind"]
             if kind == "bool":
                 widget = ttk.Checkbutton(section, variable=var_state[param["key"]])
+            elif kind == "backend":
+                widget = ttk.Combobox(
+                    section,
+                    textvariable=var_state[param["key"]],
+                    values=["ollama", "llamacpp"],
+                    state="readonly",
+                    width=14,
+                )
             elif kind == "model":
                 widget = ttk.Combobox(
                     section,
@@ -357,19 +344,6 @@ def run_gui() -> int:
                 row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 4)
             )
 
-    bottom = ttk.Frame(root, padding=(12, 6, 12, 12))
-    bottom.pack(fill="both", expand=False)
-    ttk.Label(bottom, text="Log").pack(anchor="w")
-    log_box = tk.Text(
-        bottom,
-        height=8,
-        wrap="word",
-        state="disabled",
-        bg="#0f0f0f",
-        fg="#f2f2f2",
-        insertbackground="#f2f2f2",
-    )
-    log_box.pack(fill="both", expand=True)
 
     def log(message: str) -> None:
         log_box.configure(state="normal")
@@ -377,47 +351,13 @@ def run_gui() -> int:
         log_box.see("end")
         log_box.configure(state="disabled")
 
-    def on_judge_model_selected(_event=None) -> None:
-        nonlocal last_judge_model
-        judge_model = str(var_state["JUDGE_MODEL"].get()).strip()
-        if judge_model == last_judge_model:
-            return
-        previous_model = last_judge_model
-        last_judge_model = judge_model
-        match = _find_matching_preset(var_state["MODEL"].get(), judge_model)
-        if match is None:
-            recommendation_var.set("")
-            return
-
-        preset_name, preset = match
-        preset_var.set(preset_name)
-        recommendation_var.set(
-            f"Recommended preset for {var_state['MODEL'].get()} + {judge_model}: "
-            f"{preset_name}. Apply it to tune the context and output settings for a better experience."
-        )
-        log(
-            f"Recommended preset '{preset.get('name_short', preset_name)}' after "
-            f"changing the judge model from {previous_model or '(empty)'} to {judge_model}."
-        )
-        messagebox.showinfo(
-            "Recommended preset",
-            f"You changed the judge model to {judge_model}.\n\n"
-            f"A matching discovery + judge preset is available:\n{preset_name}\n\n"
-            "Using this preset is recommended for a better experience because it "
-            "tunes the model context and output settings for this pairing.\n\n"
-            "The preset is selected above; click 'Apply preset to form' to use it.",
-            parent=root,
-        )
-
+    for combo in model_combos.get("MODEL", []):
+        combo.bind("<<ComboboxSelected>>", on_discovery_model_selected, add="+")
     for combo in model_combos.get("JUDGE_MODEL", []):
         combo.bind("<<ComboboxSelected>>", on_judge_model_selected, add="+")
 
 
-    status_var = tk.StringVar(value="Ready.")
-    ttk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", side="bottom")
 
-    save_bar = ttk.Frame(root, padding=(12, 4, 12, 0))
-    save_bar.pack(fill="x")
     ttk.Label(save_bar, text="Target:").pack(side="left")
     ttk.Label(
         save_bar,
@@ -439,6 +379,8 @@ def run_gui() -> int:
                         float(values[key])
                 except (TypeError, ValueError):
                     problems.append(f"{key}: {values[key]!r} is not a valid {kind}")
+            elif kind == "backend" and str(values[key]).strip().lower() not in ("ollama", "llamacpp"):
+                problems.append(f"{key}: choose ollama or llamacpp")
             elif kind == "model" and not values[key]:
                 problems.append(f"{key}: choose a model")
 
@@ -467,11 +409,11 @@ def run_gui() -> int:
             messagebox.showerror("Pog_Engine", f"Save failed:\n{message}", parent=root)
 
     def do_revert() -> None:
-        nonlocal last_judge_model
+        nonlocal last_discovery_model, last_judge_model
         importlib.reload(cfg)
         init_state_from(_current_values())
+        last_discovery_model = str(getattr(cfg, "MODEL", "") or "").strip()
         last_judge_model = str(getattr(cfg, "JUDGE_MODEL", "") or "").strip()
-        recommendation_var.set("")
         log("Reverted to the values currently in pipeline_config.py.")
 
     ttk.Button(
@@ -485,8 +427,7 @@ def run_gui() -> int:
     root.after(80, refresh_models)
     log(f"Loaded {len(cfg.EDITABLE_PARAMS)} editable parameters.")
     log(f"Config: {config_path}")
-    log(f"Presets available: {len(cfg.PRESETS)}")
-
+    log(f"Per-role tunings: {len(cfg.DISCOVERY_MODEL_TUNINGS)} discovery, {len(cfg.JUDGE_MODEL_TUNINGS)} judge (installed models auto-detected via Scan).")
     root.mainloop()
     return 0
 

@@ -1,38 +1,21 @@
-"""Isolates a streamer's voice from a single merged audio track using Demucs
-source separation.
+"""Isolates a streamer's voice from a single merged audio track using Demucs.
 
-Why this exists: a locally recorded OBS VOD has game/desktop audio and mic
-on separate tracks, so getting a clean voice track is just ffmpeg -map. A
-downloaded Twitch VOD has everything - game audio, music, alerts, mic - all
-flattened into one track, so there's no track to pull out; the voice has to
-be separated out of the mix. OrganizeVODAndFixSRT_Emotion.py's
-count_audio_streams() (ffprobe) detects which case a dropped video is and
-only routes here for the single-track case - see
-make_extract_mic_bat_singletrack() there.
+A locally recorded OBS VOD has game/mic on separate tracks (plain ffmpeg
+-map). A downloaded Twitch VOD flattens everything into one track, so
+isolate_vocals.py runs a Demucs separation pass instead;
+OrganizeVODAndFixSRT_Emotion.count_audio_streams() (ffprobe) picks the path.
 
-Not meant to be run standalone in normal use - the auto-generated
-1_ExtractMicAudio.bat calls this after extracting the full mix with ffmpeg:
-
+Not meant to be run standalone in normal use - 1_ExtractMicAudio.bat calls:
   python isolate_vocals.py <mixed_audio.w64> <output_mic.wav>
 
-The runner saves the full-mix Demucs input chunks and the trimmed separated
-mic chunks in persistent folders, concatenates the separated chunks into a
-Wave64 file, then renders <output_mic.wav> at 16kHz mono with the shared noise
-gate. This lets Step 1 finish all separation and rendering before Step 2
-creates its independent Whisper chunks.
+The runner persists Demucs input chunks and trimmed mic chunks, concatenates
+them into a Wave64 file, then renders <output_mic.wav> at 16kHz mono with the
+shared noise gate - Step 1 finishes separation/rendering before Step 2 makes
+its own Whisper chunks.
 
-<mixed_audio.w64> should be the full-quality mixed track (44.1kHz stereo is
-what the .bat extracts, since downsampling before separation would hurt
-separation quality). <output_mic.wav> is written at 16kHz mono, so everything
-downstream (2_TranscribeAudio.bat, the emotion model, the audio-scan sidecar -
-all of which look for *_mic.wav) sees one stable format.
-
-Demucs downloads its pretrained separation model (~80MB, htdemucs by
-default) the first time it runs on a machine - see TORCH_CACHE_DIR below for
-where it's cached. That one download needs internet access; every run after
-that is fully offline. pog_engine_setup.py can also trigger this download
-during setup instead of leaving it for the first real VOD - see
-predownload_demucs_model() there.
+Input should stay separation-grade (44.1kHz stereo). The htdemucs weights
+(~80MB) download on first use - see TORCH_CACHE_DIR below and
+predownload_demucs_model() in pog_engine_setup.py.
 """
 
 from __future__ import annotations
