@@ -18,8 +18,8 @@ Built by solo content creator, for solo content creators & editors.
 - CUDA 12.4 compatible
 - Ollama capable of running:
   - `qwen3.5:9b-q4_K_M`
-  - `qwen3.6:35b-a3b` 
-  >*OPTIONAL, This model is a lot smarter and slower than qwen3.5 but will require some RAM overflow if you have a 10gb card like me,
+ >`qwen3.6:35b-a3b` 
+  >*OPTIONAL, This model is a lot smarter and slower than qwen3.5 but will require some RAM overflow if you have a 10gb card like me, will be mainly used to judge what qwen3.5:9b finds to go viral
 
 
 Built around an RTX 3080 (10GB VRAM). Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
@@ -42,8 +42,6 @@ Install [Ollama](https://ollama.com/download/windows)
 After finish installing Ollama, LOGIN NOT REQUIRED.
 
 Open Command Prompt and type
-
-Download qwen3:8b : ```ollama run qwen3:8b-q4_K_M ```
 
 Download qwen3.5:9b-q4_K_M : ```ollama run qwen3.5:9b-q4_K_M```
 
