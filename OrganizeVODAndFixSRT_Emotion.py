@@ -39,7 +39,6 @@ from pipeline_config import (
     TRANSCRIPTION_CHUNK_MINUTES,
     TRANSCRIPTION_CHUNK_OVERLAP_SECONDS,
     VOCAL_ISOLATION_MODEL,
-    llm_base_url, llm_is_reachable, llm_not_ready_message,
     ollama_base_url,
     ollama_is_reachable,
     ollama_not_ready_message,
@@ -1646,13 +1645,12 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     ``View_Pipeline_Duration_History.csv`` beside this script. The duration viewer
     displays averages from successful attempts.
 
-    Visual world (GUI REDESIGN CONCEPT): black #181818 ground, orange wires,
-    state-colored cells (neon green done / progress green working / pure red
-    failed / progress red waiting), sync bars that light on step handoff, a
-    POG ENGINE FINISH bar that only turns green when everything finished,
-    pulsing glow on every non-waiting cell, staged fade-in, hover tooltips per
-    cell, and a best-of gallery that yields to a screen-saver button when the
-    window is not maximized.
+    Visuals follow the GUI REDESIGN CONCEPT: state-colored cells on black
+    (neon done / progress green working / pure red failed / dark red waiting),
+    sync bars that light on step handoff, a POG ENGINE FINISH bar that only
+    turns green when everything passed, breathing glow on lit cells, hover
+    tooltips and outlines, and a gallery that yields to a screen-saver button
+    when the window is not maximized.
     """
     target_folder = target_folder.resolve()
     steps = build_run_all_steps(target_folder, base_name)
@@ -1899,12 +1897,12 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     glow_geo: dict[str, list[tuple[float, float]]] = {}
     glow_keys: set[str] = set()
     glow_halo_ids: dict[str, list[int]] = {}
-    # Real glow = pre-rendered Gaussian-blur sprites (RGBA) per state color,
-    # pulsing by cross-fading intensity phases. Tk canvas has no per-item
-    # alpha, so blurred PhotoImage sprites are the only clean way to glow.
-    # Per-state glow intensity tables (one entry per pulse phase). Done and
-    # lit cells breathe gently; the IN-PROGRESS cell throbs hard; failed
-    # throbs red. The table is picked by the cell's fill color.
+    # Glow = pre-rendered Gaussian-blur RGBA sprites, cross-faded through the
+    # intensity tables below. Tk canvas has no per-item alpha, so blurred
+    # PhotoImage sprites are the only clean way to do this; they build one per
+    # event-loop tick so the UI never freezes. Intensity is per state: done
+    # and lit cells breathe gently, the in-progress cell throbs hard and
+    # shifts green-to-green, failed throbs red.
     GLOW_MARGIN = 44
     GLOW_PHASES_DEFAULT = (0.8, 0.95, 1.0, 0.95)
     GLOW_PHASES_RUNNING = (0.3, 0.7, 1.0, 0.7)
@@ -3589,8 +3587,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 pass  # the pipeline map itself is the progress display
             elif kind == "failed":
                 exit_code["value"] = 1
-                mark_box_mode = "failed"
-                box_mode["value"] = mark_box_mode
+                box_mode["value"] = "failed"
                 index = current_box_step["index"] if current_box_step["index"] is not None else 0
                 code, _state = _active_mini(index)
                 name = dict(_mini_stages_for_step(index, target_folder)).get(code, "")

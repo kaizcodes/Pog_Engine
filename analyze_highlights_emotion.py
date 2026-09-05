@@ -33,7 +33,6 @@ import sys
 import time
 import json
 import subprocess
-import atexit
 import contextlib
 import bisect
 import difflib
@@ -61,7 +60,7 @@ from pipeline_config import (
     EXPORT_PREVIEW_CLIPS, PREVIEW_CLIP_SECONDS_BEFORE, PREVIEW_CLIP_SECONDS_AFTER,
     RUN_INFO_FILENAME, RUN_HISTORY_FILENAME,
     ollama_base_url, ollama_is_reachable, ollama_not_ready_message,
-    llm_base_url, llm_is_reachable, llm_not_ready_message,
+    llm_is_reachable, llm_not_ready_message,
 )
 
 # Folder this script lives in (vs stream_folder, the VOD folder passed on
@@ -1257,12 +1256,12 @@ def get_snippet(blocks, target_seconds, window=20):
 # no dialogue) could never become one, no matter how loud, since there was
 # no transcript text for the model to read.
 #
-# This closes that gap by scanning the *entire* mic track directly:
+# The audio scan fills that gap by scanning the whole mic track directly:
 #   1. Cheap, model-free signal processing (loudness + a speech-rate proxy)
 #      sweeps the file for energetic/fast moments.
 #   2. Peaks not already close to an LLM-discovered candidate become new
 #      candidates in their own right.
-#   3. New candidates merge into `highlights` *before*
+#   3. New candidates merge into `highlights` before
 #      apply_emotion_scores_to_highlights() runs, so the existing
 #      speech-emotion model scores them too automatically - no changes
 #      needed there, it just sees more timestamps.

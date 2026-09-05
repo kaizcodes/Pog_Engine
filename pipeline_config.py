@@ -606,13 +606,6 @@ def list_ollama_models() -> tuple[list[str], str | None]:
             names.append(name)
     return names, None
 
-def llm_base_url(url: str | None = None) -> str:
-    """Server base URL for the active LLM backend (health probes, /api/ps)."""
-    if LLM_BACKEND == "llamacpp":
-        return (url or LLAMA_SERVER_URL).rstrip("/")
-    return ollama_base_url(url or OLLAMA_URL)
-
-
 def llm_is_reachable(base_url: str, timeout: float = 3) -> bool:
     """True only when the active backend's server answers its health endpoint:
     Ollama /api/version, llama-server /health."""
