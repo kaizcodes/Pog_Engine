@@ -17,7 +17,6 @@ Built by solo content creator, for solo content creators & editors.
 - NVIDIA GPU (8GB+ VRAM, 10GB recommended)
 - CUDA 12.4 compatible
 - Ollama capable of running:
-  - `qwen3:8b-q4_K_M`
   - `qwen3.5:9b-q4_K_M`
   - `qwen3.6:35b-a3b` 
   >*OPTIONAL, This model is a lot smarter and slower than qwen3.5 but will require some RAM overflow if you have a 10gb card like me,
