@@ -491,6 +491,11 @@ DISCOVERY_MODEL_TUNINGS: dict[str, dict] = {
     # discovery window trimmed to leave room for KV cache. Pull it first:
     # ollama pull phi4:14b
     "phi4:14b":                               {"DISCOVERY_NUM_CTX": 6144},
+    # qwen3.6-35b-a3b:iq4_xs is the lighter IQ4_XS quant of the 35B MoE
+    # (~17 GB vs the 23 GB Q4/Q5 tag) - partial offload needs meaningfully
+    # less system RAM than the bigger tag. Same MoE profile as the 35B
+    # entries; matching is case-insensitive.
+    "qwen3.6-35b-a3b:iq4_xs":                 {"DISCOVERY_NUM_CTX": 6144},
 }
 
 _JUDGE_LIGHT = {
@@ -543,6 +548,7 @@ JUDGE_MODEL_TUNINGS: dict[str, dict] = {
     # phi4:14b judge uses the same VRAM-pressure profile as the 35B MoE:
     # smaller batches + more retries so the dense 14B's KV cache fits.
     "phi4:14b":                               dict(_JUDGE_HEAVY),
+    "qwen3.6-35b-a3b:iq4_xs":                 dict(_JUDGE_HEAVY),
 }
 
 # Fallback tunings for models not explicitly listed (e.g. future pulls).
