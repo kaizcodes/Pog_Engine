@@ -45,6 +45,26 @@ def _env_list(name, default):
     return unique
 
 
+# --- Per-step VOD folder layout ----------------------------------------------
+# The RunAll GUI organizes each step's artifacts into its own subfolder so the
+# VOD folder stays readable: the runner bat, the big run log, and the two
+# DaVinci hand-off files (fixed SRT + marker EDL) stay at the root; everything
+# a step generates (including its debug bats for step 5) lives in that step's
+# folder. Helper shared by the organizer and the analyzer.
+STEP_FOLDER_NAMES = {
+    1: "step1_extract_mic_audio",
+    2: "step2_transcribe_audio",
+    3: "step3_fix_srt",
+    4: "step4_split_srt",
+    5: "step5_analyze_highlights",
+}
+
+
+def step_subdir(stream_folder, step: int):
+    """Per-step subfolder inside a VOD folder (created on demand)."""
+    return Path(stream_folder) / STEP_FOLDER_NAMES[step]
+
+
 # --- Ollama models ---------------------------------------------------------
 # JUDGE_MODEL is separate from MODEL: discovery just reads a transcript chunk
 # and proposes candidates; verify/judge/titling need more careful structured

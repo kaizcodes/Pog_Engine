@@ -22,6 +22,8 @@ from typing import Iterable
 
 from pipeline_config import (
     AUTO_SLEEP_AFTER_PIPELINE,
+    STEP_FOLDER_NAMES,
+    step_subdir,
     AUTO_SLEEP_DELAY_SECONDS,
     BIG_STEP_LABELS,
     EMOTION_ENABLED,
@@ -519,10 +521,10 @@ def split_caption_block(block: str, start_index: int) -> list[str]:
 
     return [make_srt_block(start_index, start_ms, end_ms, subtitle_text)]
 
-def fix_srt(input_path: Path) -> Path:
+def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
     """Fix bad Whisper SRT timestamps, collapse adjacent repeats, and renumber."""
     input_path = input_path.resolve()
-    output_path = input_path.with_name(f"{input_path.stem}_fixed.srt")
+    output_path = (out_dir or input_path.parent) / f"{input_path.stem}_fixed.srt"
 
     fixed_blocks: list[str] = []
     previous_end_ms = 0
@@ -647,7 +649,7 @@ def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, 
 
     return merged
 
-def split_srt_into_chunks(input_path: Path, chunk_minutes: int = DEFAULT_CHUNK_MINUTES) -> list[Path]:
+def split_srt_into_chunks(input_path: Path, chunk_minutes: int = DEFAULT_CHUNK_MINUTES, out_dir: Path | None = None) -> list[Path]:
     """Create transcript_partN.txt files grouped into N-minute chunks."""
     entries: list[SubtitleEntry] = []
 
@@ -682,7 +684,7 @@ def split_srt_into_chunks(input_path: Path, chunk_minutes: int = DEFAULT_CHUNK_M
     output_paths: list[Path] = []
     print("\nCreated:")
     for index, chunk in enumerate(chunks, start=1):
-        part_path = input_path.resolve().parent / f"transcript_part{index}.txt"
+        part_path = (out_dir or input_path.resolve().parent) / f"transcript_part{index}.txt"
         write_text_crlf(part_path, "\r\n\r\n".join(chunk), encoding="utf-8")
         output_paths.append(part_path)
         print(f"  {part_path.name}")
@@ -732,7 +734,7 @@ def make_extract_mic_bat_multitrack(target_folder: Path, base_name: str, video_s
     """
     mic_wav_name = f"{base_name}_mic.wav"
     video_path = target_folder / f"{base_name}{video_suffix}"
-    wav_path = target_folder / mic_wav_name
+    wav_path = step_subdir(target_folder, 1) / mic_wav_name
     organizer_script = SCRIPT_DIR / "OrganizeVODAndFixSRT_Emotion.py"
     audio_filters = (
         f"agate=threshold={NOISE_GATE_THRESHOLD_DB}dB:"
@@ -783,11 +785,12 @@ def make_extract_mic_bat_singletrack(target_folder: Path, base_name: str, video_
     demucs_chunk_dir_name = f"{base_name}_demucs_chunks"
     mic_chunk_dir_name = f"{base_name}_mic_demucs_chunks"
     video_path = target_folder / f"{base_name}{video_suffix}"
-    mixed_wav_path = target_folder / mixed_wav_name
-    mic_wav_path = target_folder / mic_wav_name
-    combined_wav_path = target_folder / combined_wav_name
-    demucs_chunk_dir = target_folder / demucs_chunk_dir_name
-    mic_chunk_dir = target_folder / mic_chunk_dir_name
+    step1_dir = step_subdir(target_folder, 1)
+    mixed_wav_path = step1_dir / mixed_wav_name
+    mic_wav_path = step1_dir / mic_wav_name
+    combined_wav_path = step1_dir / combined_wav_name
+    demucs_chunk_dir = step1_dir / demucs_chunk_dir_name
+    mic_chunk_dir = step1_dir / mic_chunk_dir_name
     organizer_script = SCRIPT_DIR / "OrganizeVODAndFixSRT_Emotion.py"
     return f'''@echo off
 echo This VOD has one merged audio track (Twitch-style).
@@ -983,7 +986,9 @@ def _make_srt_step_bat(
     error_label: str,
     done_message: str,
     next_message: str,
+    out_dir: Path | None = None,
 ) -> str:
+    out_dir_line = f" --out-dir \"{batch_quote(str(out_dir))}\"" if out_dir is not None else ""
     return f'''@echo off
 if "%~1"=="" (
     echo {missing_message}
@@ -995,7 +1000,7 @@ set SRT=%~1
 
 echo {progress_message}: %~nx1
 echo.
-python "{batch_quote(script_path)}" {command} "%SRT%" --no-pause
+python "{batch_quote(script_path)}" {command} "%SRT%"{out_dir_line} --no-pause
 
 if errorlevel 1 (
     echo.
@@ -1012,7 +1017,7 @@ exit /b 0
 '''
 
 
-def make_fix_srt_bat(script_path: Path) -> str:
+def make_fix_srt_bat(script_path: Path, target_folder: Path) -> str:
     return _make_srt_step_bat(
         script_path,
         missing_message="Drag your .srt file onto this script.",
@@ -1021,10 +1026,11 @@ def make_fix_srt_bat(script_path: Path) -> str:
         error_label="SRT fix",
         done_message="Done! Fixed SRT saved next to the original as *_fixed.srt.",
         next_message="Next: drag the *_fixed.srt file onto 4_SplitSRT.bat",
+        out_dir=target_folder,
     )
 
 
-def make_split_srt_bat(script_path: Path) -> str:
+def make_split_srt_bat(script_path: Path, target_folder: Path) -> str:
     return _make_srt_step_bat(
         script_path,
         missing_message="Drag your fixed .srt file onto this script.",
@@ -1032,7 +1038,8 @@ def make_split_srt_bat(script_path: Path) -> str:
         command="--split-srt",
         error_label="SRT split",
         done_message="Done! transcript_part files are ready in the folder.",
-        next_message="Double-click 5_AnalyzeHighlights.bat or 6_RunAllSteps.bat to find highlights.",
+        next_message="Double-click 5_AnalyzeHighlights.bat or Run_Pog_Engine.bat to find highlights.",
+        out_dir=step_subdir(target_folder, 4),
     )
 
 def make_analyze_bat(target_folder: Path) -> str:
@@ -1055,16 +1062,17 @@ if not "%RUN_ALL%"=="1" pause
 exit /b 0
 '''
 
-def make_debug_stage_bat(stage_key: str, step_label: str) -> str:
+def make_debug_stage_bat(target_folder: Path, stage_key: str, step_label: str) -> str:
     """5a-5f: force-reruns exactly one internal stage, for debugging (e.g.
     after tweaking a prompt). NOT part of the main 1-6 sequence and not
     tracked by the RunAll GUI - double-click these directly when you want
     to. Forcing a stage clears every checkpoint after it, since they'd
     otherwise be stale leftovers from before the change."""
+    vod_root = batch_quote(str(target_folder))
     return f'''@echo off
-echo Force-running {step_label} on "%~dp0" (debug - clears later checkpoints)...
+echo Force-running {step_label} on "{vod_root}" (debug - clears later checkpoints)...
 echo.
-python -u "{batch_quote(ANALYZE_HIGHLIGHTS)}" "%~dp0" --stage {stage_key}
+python -u "{batch_quote(ANALYZE_HIGHLIGHTS)}" "{vod_root}" --stage {stage_key}
 if errorlevel 1 (
     echo.
     echo ERROR: {step_label} failed.
@@ -1297,46 +1305,66 @@ def newest_file(paths: Iterable[Path]) -> Path | None:
     return max(existing_paths, key=lambda path: path.stat().st_mtime)
 
 def run_all_file_info(target_folder: Path, base_name: str, kind: str) -> tuple[Path | None, str]:
+    """Locate a step's input/output file. New-layout artifacts live in the
+    step's own folder; legacy VOD folders kept them at the root, so both are
+    checked (step folder wins)."""
+    step_dirs = {n: step_subdir(target_folder, n) for n in (1, 2, 3, 4, 5)}
+
+    def newest_in(bases, pattern):
+        """Newest match inside the given folders (step folder wins)."""
+        found = []
+        for base in bases:
+            if base.is_dir():
+                found.extend(base.glob(pattern))
+        return newest_file(found) if found else None
+
     if kind == "mic_wav":
-        exact_path = target_folder / f"{base_name}_mic.wav"
-        candidates = target_folder.glob("*_mic.wav")
+        exact_path = step_dirs[1] / f"{base_name}_mic.wav"
+        candidates = newest_in((step_dirs[1], target_folder), "*_mic.wav")
         description = f"{exact_path} or newest *_mic.wav"
     elif kind == "prepared_chunks":
-        exact_path = target_folder / f"{base_name}_mic_transcription_chunks"
-        manifest_path = exact_path / "chunk_manifest.json"
-        mic_path = target_folder / f"{base_name}_mic.wav"
-        description = f"{mic_path} plus saved chunks in {exact_path}"
-        if mic_path.is_file() and manifest_path.is_file():
+        # the chunk set lives in the step 1 folder; legacy folders kept it at
+        # the root - validate whichever exists (mic wav + manifest present)
+        for chunks_dir, mic_dir in (
+            (step_dirs[1] / f"{base_name}_mic_transcription_chunks", step_dirs[1]),
+            (target_folder / f"{base_name}_mic_transcription_chunks", target_folder),
+        ):
+            mic_path = mic_dir / f"{base_name}_mic.wav"
+            if not (mic_path.is_file() and (chunks_dir / "chunk_manifest.json").is_file()):
+                continue
             try:
                 _load_prepared_audio_chunks(mic_path)
             except (OSError, RuntimeError, ValueError, TypeError):
-                pass
-            else:
-                return exact_path, description
-        return None, description
+                continue
+            return chunks_dir, f"{mic_path} plus saved chunks in {chunks_dir}"
+        return None, "prepared chunks not found (run step 1 first)"
     elif kind == "raw_srt":
-        exact_path = target_folder / f"{base_name}_mic.srt"
-        candidates = (
-            path for path in target_folder.glob("*.srt")
+        exact_path = step_dirs[2] / f"{base_name}_mic.srt"
+        raw_candidates = [
+            path
+            for base in (step_dirs[2], target_folder) if base.is_dir()
+            for path in base.glob("*.srt")
             if not path.stem.casefold().endswith("_fixed")
-        )
+        ]
+        candidates = newest_file(raw_candidates) if raw_candidates else None
         description = f"{exact_path} or newest non-fixed *.srt"
     elif kind == "fixed_srt":
         exact_path = target_folder / f"{base_name}_mic_fixed.srt"
-        candidates = target_folder.glob("*_fixed.srt")
+        raw_candidates = list(target_folder.glob("*_fixed.srt"))
+        candidates = newest_file(raw_candidates) if raw_candidates else None
         description = f"{exact_path} or newest *_fixed.srt"
     elif kind == "transcript_part":
-        exact_path = target_folder / "transcript_part1.txt"
-        candidates = target_folder.glob("transcript_part*.txt")
+        exact_path = step_dirs[4] / "transcript_part1.txt"
+        candidates = newest_in((step_dirs[4], target_folder), "transcript_part*.txt")
         description = f"{exact_path} or newest transcript_part*.txt"
     elif kind == "highlights_csv":
         exact_path = None
-        candidates = target_folder.glob("top*_highlights.csv")
-        description = f"{target_folder} / top*_highlights.csv"
+        candidates = newest_in((step_dirs[5], target_folder), "top*_highlights.csv")
+        description = f"{step_dirs[5]} / top*_highlights.csv"
     else:
         raise ValueError(f"Unknown run-all file kind: {kind}")
 
-    path = exact_path if exact_path is not None and exact_path.exists() else newest_file(candidates)
+    path = exact_path if exact_path is not None and exact_path.exists() else candidates
     return path, description
 
 def gallery_image_paths(gallery_dir: Path = GALLERY_DIR) -> list[Path]:
@@ -1638,6 +1666,55 @@ class _GhostButton(tk.Frame):
             super().configure(highlightbackground=ring_color, highlightcolor=ring_color)
 
 
+def migrate_legacy_vod_folder(target_folder: Path, events: "queue.Queue | None" = None) -> None:
+    """One-time layout migration for VOD folders created by older builds.
+
+    Moves each step's artifacts from the folder root into its step folder.
+    The big run log (step6_run_*.log), the fixed SRT, and the marker EDL stay
+    at the root, as do the runner and step bats. Also renames
+    6_RunAllSteps.bat to Run_Pog_Engine.bat for pre-redesign folders."""
+    moves = {
+        1: ("*_mic.wav", "*_mixed_full.w64", "*_mic_combined.w64",
+            "*_demucs_chunks", "*_mic_demucs_chunks"),
+        2: ("*_mic.srt", "*_mic_transcription_chunks"),
+        4: ("transcript_part*.txt",),
+        5: ("checkpoint_*.json", "log_discovery.txt", "log_audioscan.txt",
+            "log_emotion.txt", "log_verify.txt", "log_judge.txt", "log_export.txt",
+            "emotion_scores.csv", "top*_highlights.csv", "run_info.json",
+            "pipeline_stats.json", "5a_Discovery.bat", "5b_AudioScan.bat",
+            "5c_EmotionScoring.bat", "5d_Verify.bat", "5e_Judge.bat",
+            "5f_Export.bat"),
+    }
+
+    def announce(message: str) -> None:
+        print(message, flush=True)
+        if events is not None:
+            events.put(("log", message + "\n"))
+
+    moved = 0
+    for step, patterns in moves.items():
+        step_dir = step_subdir(target_folder, step)
+        for pattern in patterns:
+            for path in target_folder.glob(pattern):
+                if not path.is_file() and not path.is_dir():
+                    continue
+                step_dir.mkdir(parents=True, exist_ok=True)
+                destination = step_dir / path.name
+                if destination.exists():
+                    continue
+                shutil.move(str(path), str(destination))
+                moved += 1
+                announce(f"[layout] Moved {path.name} -> {STEP_FOLDER_NAMES[step]}/")
+
+    old_runner = target_folder / "6_RunAllSteps.bat"
+    new_runner = target_folder / "Run_Pog_Engine.bat"
+    if old_runner.is_file() and not new_runner.exists():
+        old_runner.rename(new_runner)
+        announce("[layout] Renamed 6_RunAllSteps.bat -> Run_Pog_Engine.bat")
+    if moved:
+        announce(f"[layout] Migration complete: {moved} item(s) organized into step folders.")
+
+
 def run_all_gui(target_folder: Path, base_name: str) -> int:
     """Run the five pipeline steps and record each attempt's wall time.
 
@@ -1684,6 +1761,41 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     # "Failed"), and the last fully-completed step for the status bar.
     current_process: dict[str, subprocess.Popen | None] = {"popen": None}
     stop_requested = {"value": False}
+
+    # Per-step logs: steps 1-4 each get their own log file inside their step
+    # folder, fed from the captured subprocess output while that step runs
+    # (the combined step6_run_*.log stays at the VOD root; step 5 writes its
+    # own per-sub-stage logs).
+    step_log_file: dict = {"handle": None, "index": None}
+
+    def open_step_log(index: int) -> None:
+        close_step_log()
+        log_path = step_subdir(target_folder, index + 1) / f"log_step{index + 1}.txt"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        step_log_file["handle"] = open(log_path, "a", encoding="utf-8")
+        step_log_file["handle"].write(
+            f"\n{'=' * 60}\nRun started: {datetime.now().isoformat(timespec='seconds')}\n{'=' * 60}\n"
+        )
+        step_log_file["index"] = index
+
+    def close_step_log() -> None:
+        handle = step_log_file["handle"]
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        step_log_file["handle"] = None
+        step_log_file["index"] = None
+
+    def write_step_log(index: int, line: str) -> None:
+        handle = step_log_file["handle"]
+        if handle is not None and step_log_file["index"] == index:
+            try:
+                handle.write(line)
+                handle.flush()
+            except Exception:
+                pass
 
     def write_run_log(text: str) -> None:
         if run_log_closed["value"]:
@@ -3598,6 +3710,10 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             if kind == "status":
                 index, value = payload
                 set_step_status(index, value)
+                if value == "Running":
+                    open_step_log(index)
+                elif value in {"Done", "Failed", "Stopped", "Skipped"}:
+                    close_step_log()
                 append_log(
                     f"[STATUS] {steps[index].label}: {value}\n",
                     "success" if value in {"Done", "Skipped"} else _console_log_tag(value),
@@ -3610,6 +3726,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             elif kind == "output":
                 index, line = payload
                 append_log(line)
+                write_step_log(index, line)
                 update_step_from_output(index, line)
             elif kind == "log":
                 append_log(payload)
@@ -3634,11 +3751,11 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 set_status_box(
                     "STOPPED BY USER", "", "", "STOPPED", GUI_ORANGE,
                     f"Last fully completed step: {last_done}. "
-                    "Run 6_RunAllSteps.bat again to continue from there.",
+                    "Run Run_Pog_Engine.bat again to continue from there.",
                 )
                 append_log(
                     f"\nStopped by user. Last fully completed step: {last_done}.\n"
-                    "Ollama models unloaded. Run 6_RunAllSteps.bat again to continue.\n",
+                    "Ollama models unloaded. Run Run_Pog_Engine.bat again to continue.\n",
                     "warning",
                 )
                 _disable_stop("STOPPED", GUI_ORANGE)
@@ -3739,6 +3856,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
 
     def on_window_close() -> None:
         glow_clock["running"] = False
+        close_step_log()
         if gallery_render_after["id"] is not None:
             root.after_cancel(gallery_render_after["id"])
         if gallery_rotation_after["id"] is not None:
@@ -3759,6 +3877,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     show_gallery_image()
     if len(gallery_paths) > 1:
         gallery_rotation_after["id"] = root.after(8000, rotate_gallery)
+
+    # One-time layout migration for pre-redesign VOD folders.
+    migrate_legacy_vod_folder(target_folder, events)
 
     threading.Thread(target=worker, daemon=True).start()
     root.after(80, drain_events)
@@ -3838,27 +3959,30 @@ def organize_video(video_file: Path) -> Path:
         print(f"[!] Could not write vod_audio_info.json: {exc}")
 
     script_path = Path(__file__).resolve()
+    step5_dir = step_subdir(target_folder, 5)
+    step5_dir.mkdir(parents=True, exist_ok=True)
     bat_files = {
         "1_ExtractMicAudio.bat": make_extract_mic_bat(target_folder, base_name, video_suffix, is_single_track),
         "2_TranscribeAudio.bat": make_transcribe_bat(script_path),
         "3_FixSRT.bat": make_fix_srt_bat(script_path),
         "4_SplitSRT.bat": make_split_srt_bat(script_path),
         "5_AnalyzeHighlights.bat": make_analyze_bat(target_folder),
-        "6_RunAllSteps.bat": make_run_all_bat(target_folder, base_name, script_path),
+        "Run_Pog_Engine.bat": make_run_all_bat(target_folder, base_name, script_path),
         "Start_LlamaServer.bat": make_llama_server_bat(),
-        # Debug-only sub-steps: not in the main numbered sequence or tracked
-        # by the RunAll GUI. Force-rerun one internal stage in isolation
-        # (e.g. after tweaking a prompt) without redoing everything before it.
-        "5a_Discovery.bat": make_debug_stage_bat("discovery", "Discovery"),
-        "5b_AudioScan.bat": make_debug_stage_bat("audioscan", "Audio Scan"),
-        "5c_EmotionScoring.bat": make_debug_stage_bat("emotion", "Emotion Scoring"),
-        "5d_Verify.bat": make_debug_stage_bat("verify", "Verification"),
-        "5e_Judge.bat": make_debug_stage_bat("judge", "Judging"),
-        "5f_Export.bat": make_debug_stage_bat("export", "Export"),
+        # Debug-only sub-steps live inside the step 5 folder, next to the
+        # checkpoints and logs they operate on. Not in the main numbered
+        # sequence or tracked by the RunAll GUI.
+        "5a_Discovery.bat": make_debug_stage_bat(target_folder, "discovery", "Discovery"),
+        "5b_AudioScan.bat": make_debug_stage_bat(target_folder, "audioscan", "Audio Scan"),
+        "5c_EmotionScoring.bat": make_debug_stage_bat(target_folder, "emotion", "Emotion Scoring"),
+        "5d_Verify.bat": make_debug_stage_bat(target_folder, "verify", "Verification"),
+        "5e_Judge.bat": make_debug_stage_bat(target_folder, "judge", "Judging"),
+        "5f_Export.bat": make_debug_stage_bat(target_folder, "export", "Export"),
     }
 
     for name, content in bat_files.items():
-        write_text_crlf(target_folder / name, content, encoding="ascii")
+        out_path = step5_dir / name if name.startswith("5") and name[1].isalpha() else target_folder / name
+        write_text_crlf(out_path, content, encoding="ascii")
 
     print(f"Created helper scripts in '{target_folder}':")
     if is_single_track:
@@ -3871,7 +3995,7 @@ def organize_video(video_file: Path) -> Path:
     print("   3_FixSRT.bat            <- drag stitched .srt onto this to fix repeats/timestamps")
     print("   4_SplitSRT.bat          <- drag *_fixed.srt onto this to create transcript_part files")
     print("   5_AnalyzeHighlights.bat <- double-click for emotion-enhanced highlights")
-    print("   6_RunAllSteps.bat       <- double-click to run steps 1 through 5 in order")
+    print("   Run_Pog_Engine.bat      <- double-click to run steps 1 through 5 in order")
     print("   Start_LlamaServer.bat   <- manual llama-server launcher (optional, pipeline manages hot-swap in llamacpp mode)")
     print("\n   Debug only (not part of the main sequence, not tracked by RunAll):")
     print("   5a_Discovery.bat        <- force-rerun just the LLM discovery passes")
@@ -3880,9 +4004,10 @@ def organize_video(video_file: Path) -> Path:
     print("   5d_Verify.bat           <- force-rerun just the content verification pass")
     print("   5e_Judge.bat            <- force-rerun just the final ranking")
     print("   5f_Export.bat           <- rewrite the CSV + Resolve EDL from the last judged result")
+    print("   (5a-5f debug bats are inside step5_analyze_highlights/)")
     print("\nStep 5 checkpoints internally after each of its sub-stages, so if it dies or")
     print("you hit Stop in the RunAll GUI partway through, running it again (or")
-    print("6_RunAllSteps.bat) picks up exactly where it stopped instead of starting over.")
+    print("Run_Pog_Engine.bat) picks up exactly where it stopped instead of starting over.")
     print("Forcing a debug sub-step (5a-5f) clears any later checkpoints, since they'd")
     print("otherwise be stale leftovers from before whatever you changed.")
     print("\nDone.")

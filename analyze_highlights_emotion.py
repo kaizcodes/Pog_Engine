@@ -41,6 +41,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from pipeline_config import (
+    step_subdir,
     MODEL, JUDGE_MODEL, DISCOVERY_NUM_CTX, JUDGE_NUM_CTX, OLLAMA_URL, OLLAMA_CHAT_URL,
     LLM_BACKEND, LLAMA_SERVER_URL, LLAMA_MODEL_PATH, LLAMA_DISCOVERY_MODEL_PATH,
     LLAMA_JUDGE_MODEL_PATH, LLAMA_CONTEXT_SIZE,
@@ -311,7 +312,7 @@ def _ensure_llama_server_for_role(role: str, stage_label: str) -> bool:
 # on the same files to decide what to skip.
 
 def checkpoint_path(stream_folder, name):
-    return os.path.join(stream_folder, f"checkpoint_{name}.json")
+    return os.path.join(step_subdir(stream_folder, 5), f"checkpoint_{name}.json")
 
 def checkpoint_exists(stream_folder, name):
     return os.path.exists(checkpoint_path(stream_folder, name))
@@ -383,7 +384,7 @@ def invalidate_downstream(stream_folder, from_stage):
                 os.remove(path)
                 removed.append(os.path.basename(path))
 
-    for path in Path(stream_folder).glob("top*_highlights.csv"):
+    for path in Path(step_subdir(stream_folder, 5)).glob("top*_highlights.csv"):
         path.unlink()
         removed.append(path.name)
     for path in Path(stream_folder).glob("top*_markers.edl"):
@@ -398,7 +399,7 @@ def invalidate_downstream(stream_folder, from_stage):
 # run summary even though no single process saw the whole pipeline.
 
 def load_pipeline_stats(stream_folder):
-    path = os.path.join(stream_folder, "pipeline_stats.json")
+    path = os.path.join(step_subdir(stream_folder, 5), "pipeline_stats.json")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -409,7 +410,7 @@ def load_pipeline_stats(stream_folder):
     }
 
 def save_pipeline_stats(stream_folder, stats):
-    _write_json_atomically(os.path.join(stream_folder, "pipeline_stats.json"), stats)
+    _write_json_atomically(os.path.join(step_subdir(stream_folder, 5), "pipeline_stats.json"), stats)
 
 def record_stage_stats(stream_folder, stage_name, stage_seconds):
     """Call at the end of every stage that finishes successfully: folds this
@@ -466,7 +467,7 @@ def stage_log(stream_folder, stage_name):
     still there even after the console window that ran it is long closed,
     whether that stage was invoked via RunAll, a debug bat, or the GUI.
     """
-    log_path = os.path.join(stream_folder, f"log_{stage_name}.txt")
+    log_path = os.path.join(step_subdir(stream_folder, 5), f"log_{stage_name}.txt")
     f = open(log_path, "a", encoding="utf-8")
     f.write(f"\n{'=' * 60}\nRun started: {datetime.now().isoformat(timespec='seconds')}\n{'=' * 60}\n")
     f.flush()
@@ -488,16 +489,26 @@ def stage_log(stream_folder, stage_name):
 # of VOD length).
 
 def list_transcript_parts(stream_folder):
-    parts = sorted(
-        [f for f in os.listdir(stream_folder) if re.match(r'^transcript_part\d+\.txt$', f)],
-        key=lambda f: int(re.search(r'\d+', f).group())
-    )
-    return parts
+    """Full paths of the transcript_part files, in order. They live in the
+    step 4 folder; legacy folders kept them at the VOD root."""
+    pattern = re.compile(r'^transcript_part\d+\.txt$')
+    found: list[Path] = []
+    seen: set[str] = set()
+    for base in (step_subdir(stream_folder, 4), Path(stream_folder)):
+        if not base.is_dir():
+            continue
+        for name in os.listdir(base):
+            if pattern.match(name):
+                path = base / name
+                if str(path) not in seen:
+                    seen.add(str(path))
+                    found.append(path)
+    return sorted(found, key=lambda p: int(re.search(r"\d+", p.name).group()))
 
 def build_transcript_blocks_by_part(stream_folder):
     blocks_by_part = {}
-    for part in list_transcript_parts(stream_folder):
-        path = os.path.join(stream_folder, part)
+    for part_path in list_transcript_parts(stream_folder):
+        path = str(part_path)
         if not os.path.exists(path):
             continue
         with open(path, "r", encoding="utf-8") as f:
@@ -842,13 +853,15 @@ def ollama_generate(payload, timeout, url=None):
 
 
 def find_mic_wav(stream_folder):
-    """Find the mic WAV produced by step 1."""
+    """Find the mic WAV produced by step 1 (step 1 folder first, then any
+    legacy copy at the VOD root)."""
     candidates = []
-    for name in os.listdir(stream_folder):
-        lowered = name.lower()
-        if lowered.endswith("_mic.wav"):
-            path = os.path.join(stream_folder, name)
-            candidates.append(path)
+    for base in (step_subdir(stream_folder, 1), Path(stream_folder)):
+        if not base.is_dir():
+            continue
+        for name in os.listdir(base):
+            if name.lower().endswith("_mic.wav"):
+                candidates.append(base / name)
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
@@ -878,7 +891,7 @@ def export_preview_clips(stream_folder, highlights, before_seconds, after_second
         print("[preview] No source video (.mp4/.mkv/.mov) found in folder; skipping preview clip export.")
         return
 
-    clips_dir = os.path.join(stream_folder, "clips")
+    clips_dir = os.path.join(step_subdir(stream_folder, 5), "clips")
     os.makedirs(clips_dir, exist_ok=True)
 
     exported = 0
@@ -974,7 +987,7 @@ def load_existing_emotion_scores(csv_path):
 
 def classify_candidate_emotions(stream_folder, highlights):
     """Classify audio around candidate timestamps and write emotion_scores.csv."""
-    csv_path = os.path.join(stream_folder, EMOTION_SCORES_CSV)
+    csv_path = os.path.join(step_subdir(stream_folder, 5), EMOTION_SCORES_CSV)
     existing = load_existing_emotion_scores(csv_path)
     if existing:
         print(f"Loaded existing emotion scores: {csv_path}")
@@ -1591,7 +1604,7 @@ STRICT OUTPUT FORMAT:
             added_this_batch += 1
 
         if added_this_batch == 0:
-            debug_path = os.path.join(stream_folder, f"debug_audioscan_titles_batch_{batch_start}.txt")
+            debug_path = os.path.join(step_subdir(stream_folder, 5), f"debug_audioscan_titles_batch_{batch_start}.txt")
             try:
                 with open(debug_path, "w", encoding="utf-8") as dbg:
                     dbg.write("PROMPT:\n")
@@ -1766,14 +1779,14 @@ def run_discovery(stream_folder, parts, prompts):
     highlights = []
     part_errors = 0
 
-    for idx, part in enumerate(parts, start=1):
-        path = os.path.join(stream_folder, part)
+    for idx, part_path in enumerate(parts, start=1):
+        path = str(part_path)
 
         if not os.path.exists(path):
-            print(f"[{idx}/{len(parts)}] Missing: {part}")
+            print(f"[{idx}/{len(parts)}] Missing: {part_path}")
             continue
 
-        print(f"[{idx}/{len(parts)}] Analyzing {part}")
+        print(f"[{idx}/{len(parts)}] Analyzing {part_path}")
 
         with open(path, "r", encoding="utf-8") as f:
             transcript = f.read()
@@ -1892,7 +1905,7 @@ def run_discovery(stream_folder, parts, prompts):
                     print(f"     [!] Skipped {rejected_malformed} malformed lines")
 
                 if added == 0:
-                    debug_path = os.path.join(stream_folder, f"debug_{part}_{pass_name}.txt")
+                    debug_path = os.path.join(step_subdir(stream_folder, 5), f"debug_{part}_{pass_name}.txt")
                     with open(debug_path, "w", encoding="utf-8") as dbg:
                         dbg.write(result)
                     print(f"     [!] 0 candidates parsed - raw response saved to {debug_path}")
@@ -2009,7 +2022,7 @@ def verify_candidates(highlights, transcript_blocks_by_part, verify_prompt_heade
             coverage = len(verdicts) / len(batch) if batch else 1
             if coverage < 0.8:
                 print(f"     [!] Verification only returned {len(verdicts)}/{len(batch)} verdicts for this batch - response may have been cut off")
-                debug_path = os.path.join(stream_folder, f"debug_verify_batch_{batch_start}.txt")
+                debug_path = os.path.join(step_subdir(stream_folder, 5), f"debug_verify_batch_{batch_start}.txt")
                 with open(debug_path, "w", encoding="utf-8") as dbg:
                     dbg.write("PROMPT:\n")
                     dbg.write(verify_prompt)
@@ -2224,7 +2237,7 @@ def sanitize_marker_text(text):
     return cleaned
 
 def write_highlights_csv(stream_folder, final_highlights, top_n):
-    csv_path = os.path.join(stream_folder, f"top{top_n}_highlights.csv")
+    csv_path = os.path.join(step_subdir(stream_folder, 5), f"top{top_n}_highlights.csv")
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -2255,7 +2268,7 @@ def write_highlights_csv(stream_folder, final_highlights, top_n):
     return csv_path
 
 def write_highlights_edl(stream_folder, final_highlights, top_n):
-    edl_path = os.path.join(stream_folder, f"top{top_n}_markers.edl")
+    edl_path = os.path.join(stream_folder, f"top{top_n}_markers.edl")  # VOD root: DaVinci hand-off file
 
     with open(edl_path, "w", encoding="utf-8", newline="") as f:
         f.write(f"TITLE: TOP{top_n}_HIGHLIGHTS\n")
@@ -2319,7 +2332,7 @@ def write_run_info(stream_folder, final_highlights):
         "stage_seconds": stats.get("stage_seconds", {}),
         "total_pipeline_seconds": round(sum(stats.get("stage_seconds", {}).values()), 1),
     }
-    run_info_path = os.path.join(stream_folder, RUN_INFO_FILENAME)
+    run_info_path = os.path.join(step_subdir(stream_folder, 5), RUN_INFO_FILENAME)
     try:
         with open(run_info_path, "w", encoding="utf-8") as f:
             json.dump(run_info, f, indent=2)
@@ -2360,7 +2373,7 @@ def record_pipeline_run_history(stream_folder):
     row["ollama_retries"] = stats.get("ollama_retries", 0)
 
     final_highlight_count = ""
-    run_info_path = os.path.join(stream_folder, RUN_INFO_FILENAME)
+    run_info_path = os.path.join(step_subdir(stream_folder, 5), RUN_INFO_FILENAME)
     if os.path.exists(run_info_path):
         try:
             with open(run_info_path, "r", encoding="utf-8") as f:
