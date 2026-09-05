@@ -479,9 +479,25 @@ def find_whisper_cli(pog_dir: Path, reporter: Reporter) -> Path | None:
     reporter.status("whisper-cli.exe", "Missing")
     return None
 
-def download_ffmpeg(pog_dir: Path, reporter: Reporter) -> bool:
+FFMPEG_SOURCES = (
+    # gyan.dev is a single personal host that fails for some users (region,
+    # ISP, antivirus interference), so every download attempt falls through
+    # these mirrors in order until one produces a working bundle.
+    ("gyan.dev", "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"),
+    ("GitHub mirror (GyanD/codexffmpeg)",
+     "https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-essentials_build.zip"),
+    ("GitHub mirror (BtbN/FFmpeg-Builds)",
+     "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"),
+)
 
-    """Download the Windows ffmpeg/ffprobe bundle when neither is available."""
+
+def download_ffmpeg(pog_dir: Path, reporter: Reporter) -> bool:
+    """Download the Windows ffmpeg/ffprobe bundle when neither is available.
+
+    Walks FFMPEG_SOURCES in order until one source downloads an archive that
+    extracts to ffmpeg.exe + ffprobe.exe; each failed source is logged and
+    cleaned up before the next is tried.
+    """
     local_bin = pog_dir / "ffmpeg" / "bin"
     local_ffmpeg = local_bin / "ffmpeg.exe"
     local_ffprobe = local_bin / "ffprobe.exe"
@@ -493,15 +509,16 @@ def download_ffmpeg(pog_dir: Path, reporter: Reporter) -> bool:
         return True
 
     reporter.section("Downloading ffmpeg / ffprobe")
-    url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
     zip_path = pog_dir / "ffmpeg-release-essentials.zip.tmp"
     extract_dir = pog_dir / "ffmpeg-release-essentials.extract.tmp"
-    try:
-        if not zip_path.is_file():
+    last_error = "no download source was attempted"
+    for source_index, (source_name, url) in enumerate(FFMPEG_SOURCES, start=1):
+        reporter.log(f"  [..]     source {source_index}/{len(FFMPEG_SOURCES)}: {source_name}")
+        try:
+            zip_path.unlink(missing_ok=True)
             with requests.get(url, stream=True, timeout=300) as response:
                 response.raise_for_status()
-                total = int(response.headers["content-length"]) \
-                    if response.headers.get("content-length", "").isdigit() else 0
+                total = int(response.headers["content-length"])                     if response.headers.get("content-length", "").isdigit() else 0
                 downloaded = 0
                 with open(zip_path, "wb") as output:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -509,31 +526,34 @@ def download_ffmpeg(pog_dir: Path, reporter: Reporter) -> bool:
                             output.write(chunk)
                             downloaded += len(chunk)
                 if total > 0 and downloaded != total:
-                    zip_path.unlink(missing_ok=True)
                     raise IOError(f"download truncated: got {downloaded} bytes, expected {total}")
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as archive:
-            archive.extractall(extract_dir)
-        ffmpeg_candidates = list(extract_dir.rglob("ffmpeg.exe"))
-        ffprobe_candidates = list(extract_dir.rglob("ffprobe.exe"))
-        if not ffmpeg_candidates or not ffprobe_candidates:
-            raise IOError("the archive did not contain ffmpeg.exe and ffprobe.exe")
-        local_bin.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ffmpeg_candidates[0], local_ffmpeg)
-        shutil.copy2(ffprobe_candidates[0], local_ffprobe)
-        os.environ["PATH"] = str(local_bin) + os.pathsep + os.environ.get("PATH", "")
-        zip_path.unlink(missing_ok=True)
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        persist_ffmpeg_path(local_bin)
-        reporter.status("ffmpeg download", "Downloaded")
-        return True
-    except Exception as exc:
-        reporter.log(f"  [WARN] ffmpeg download failed: {exc}")
-        reporter.status("ffmpeg download", "Failed")
-        zip_path.unlink(missing_ok=True)
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        return False
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path) as archive:
+                archive.extractall(extract_dir)
+            ffmpeg_candidates = list(extract_dir.rglob("ffmpeg.exe"))
+            ffprobe_candidates = list(extract_dir.rglob("ffprobe.exe"))
+            if not ffmpeg_candidates or not ffprobe_candidates:
+                raise IOError("the archive did not contain ffmpeg.exe and ffprobe.exe")
+            local_bin.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ffmpeg_candidates[0], local_ffmpeg)
+            shutil.copy2(ffprobe_candidates[0], local_ffprobe)
+            os.environ["PATH"] = str(local_bin) + os.pathsep + os.environ.get("PATH", "")
+            zip_path.unlink(missing_ok=True)
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            persist_ffmpeg_path(local_bin)
+            reporter.status("ffmpeg download", "Downloaded")
+            return True
+        except Exception as exc:
+            last_error = f"{source_name}: {exc}"
+            tail = "; trying the next mirror..." if source_index < len(FFMPEG_SOURCES) else " (no mirrors left)"
+            reporter.log(f"  [WARN]   {source_name} failed: {exc}{tail}")
+            zip_path.unlink(missing_ok=True)
+            shutil.rmtree(extract_dir, ignore_errors=True)
+    reporter.log(f"  [WARN] ffmpeg download failed from every source ({last_error})")
+    reporter.status("ffmpeg download", "Failed")
+    return False
+
 def persist_ffmpeg_path(local_bin: Path) -> None:
     """Make the private bundle available to future .bat/Python processes."""
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0,
