@@ -1107,7 +1107,9 @@ def check_ollama(pog_dir: Path, reporter: Reporter) -> bool:
         try:
             listing = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=15)
             pulled_text = listing.stdout
-            for name in filter(None, [model_name, judge_model_name]):
+            # dedupe: both roles default to the same model, so check it once
+            unique_names = list(dict.fromkeys(n for n in (model_name, judge_model_name) if n))
+            for name in unique_names:
                 reporter.add_row("ollama", name, f"model: {name}")
                 got = name in pulled_text
                 reporter.log(f"  {mark(got)} model pulled: {name}")
