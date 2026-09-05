@@ -49,10 +49,12 @@ def _env_list(name, default):
 # JUDGE_MODEL is separate from MODEL: discovery just reads a transcript chunk
 # and proposes candidates; verify/judge/titling need more careful structured
 # reasoning over shorter, denser prompts.
-# qwen3:8b is the long-context discovery role; qwen3.5:9b-q4_K_M fits a
-# 10GB 3080 as the judge role. qwen3.6:35b-a3b needs partial CPU offload,
-# so its preset uses a smaller JUDGE_NUM_CTX to leave memory for KV cache.
-MODEL = os.environ.get("HIGHLIGHT_MODEL", "qwen3:8b")
+# qwen3.5:9b-q4_K_M (~6.6 GB) serves BOTH roles by default - it fits a
+# 10GB 3080 with 8192 context in either role, and the per-role tunings
+# below carry the entries for every other model (including qwen3:8b).
+# qwen3.6:35b-a3b / qwen3.5:35b need partial CPU offload, so their presets
+# use a smaller context to leave memory for KV cache.
+MODEL = os.environ.get("HIGHLIGHT_MODEL", "qwen3.5:9b-q4_K_M")
 JUDGE_MODEL = os.environ.get("HIGHLIGHT_JUDGE_MODEL", "qwen3.5:9b-q4_K_M")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 # qwen3.5 thinking is controlled via Ollama's renderer, not the old
@@ -452,7 +454,7 @@ EDITABLE_PARAMS = [
 # --- Per-role model tunings (replaces combo PRESETS) ----------------------------
 # Each installed Ollama model has separate tunings for when it's used as
 # discovery vs judge. The GUI auto-fills role-specific values on selection
-# so switching qwen3:8b on discovery fills discovery-optimal values, and
+# so switching qwen3.5:9b on discovery fills discovery-optimal values, and
 # switching the same tag on judge fills judge-optimal values. Values are
 # derived from the old combo presets but split per role; heavy 35B MoE
 # (23 GB) must offload to CPU on a 10 GB 3080, so judge needs 6144 ctx,
