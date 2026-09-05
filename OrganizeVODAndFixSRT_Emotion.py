@@ -2205,7 +2205,8 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         for j in range(n - 1):
             scx = pad_x + col_width * (j + 1)
             key = f"sync:{j}"
-            color = sync_state[j]
+            cell_geometry[key] = {"kind": "sync", "index": j}
+            color = _cell_fill_color(key)
             map_ids[key] = map_canvas.create_rectangle(
                 scx - sync_w / 2, y_sync_top, scx + sync_w / 2, y_sync_bottom,
                 fill=GUI_BG if dimmed else color, outline="", tags=(key, "hover"),
@@ -2216,7 +2217,6 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 fill=GUI_BG if dimmed else _text_color_for_fill(color),
                 tags=(key, "hover", "celltext"),
             )
-            cell_geometry[key] = {"kind": "sync", "index": j}
             glow_geo[key] = [
                 (scx - sync_w / 2, y_sync_top), (scx + sync_w / 2, y_sync_top),
                 (scx + sync_w / 2, y_sync_bottom), (scx - sync_w / 2, y_sync_bottom),
@@ -2266,7 +2266,10 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 return _running_fill()
             return GUI_STATE_COLORS.get(state, GUI_PROGRESS_RED)
         if kind == "sync":
-            return sync_state[geometry["index"]]
+            state = sync_state[geometry["index"]]
+            if state == "Running":
+                return _running_fill()
+            return state
         return GUI_NEON_GREEN if finish_lit["value"] else GUI_PROGRESS_RED
 
     def _glow_sprite(kind: str, w: float, h: float, color: str, phase: int, mirror: bool, state_tag: str = "done"):
@@ -2364,7 +2367,11 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         elif kind == "st":
             state = step_state[geometry["index"]]
         elif kind == "sync":
-            state = "Done" if sync_state[geometry["index"]] == GUI_NEON_GREEN else "Waiting"
+            state = (
+                "Running" if sync_state[geometry["index"]] == "Running"
+                else "Done" if sync_state[geometry["index"]] == GUI_NEON_GREEN
+                else "Waiting"
+            )
         else:
             state = "Done" if finish_lit["value"] else "Waiting"
         return {"Running": "run", "Failed": "fail", "Stopped": "stop"}.get(state, "done")
@@ -2380,7 +2387,11 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 else (
                     step_state[geometry["index"]] == "Running"
                     if geometry["kind"] == "st"
-                    else False
+                    else (
+                        sync_state[geometry["index"]] == "Running"
+                        if geometry["kind"] == "sync"
+                        else False
+                    )
                 )
             )
             if is_running:
@@ -2472,6 +2483,16 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             if step_st != "Running":
                 continue
             fill_key = f"st:{step_index}"
+            item_id = map_ids.get(fill_key)
+            if item_id is not None:
+                try:
+                    map_canvas.itemconfigure(item_id, fill=_cell_fill_color(fill_key))
+                except tk.TclError:
+                    pass
+        for sync_index, sync_st in list(enumerate(sync_state)):
+            if sync_st != "Running":
+                continue
+            fill_key = f"sync:{sync_index}"
             item_id = map_ids.get(fill_key)
             if item_id is not None:
                 try:
@@ -2585,10 +2606,12 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             return "MINI-PROCESS", lines
         if kind == "sync":
             j = geometry["index"]
-            lit = sync_state[j] == GUI_NEON_GREEN
+            lit = sync_state[j] in {GUI_NEON_GREEN, "Running"}
+            cycling = sync_state[j] == "Running"
+            state_word = "CYCLING" if cycling else ("LIT" if lit else "WAITING")
             lines = [
                 (f"SYNC:{j + 1}-{j + 2}", GUI_ORANGE),
-                ("LIT" if lit else "WAITING", GUI_NEON_GREEN if lit else GUI_WHITE),
+                (state_word, GUI_NEON_GREEN if lit else GUI_WHITE),
                 (
                     f"Lights when Step {j + 1} finishes and Step {j + 2} starts - "
                     "proof the handoff between the two stages happened.",
@@ -2999,14 +3022,21 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         refresh_status_box()
 
     def update_syncs() -> None:
-        """SYNC:j lights when step j finished and step j+1 started (concept rule)."""
+        """SYNC:j lights when step j finished and step j+1 started (concept rule).
+        While step j+1 is still running, the lit sync cycles green-to-green
+        like the in-progress mini cells; it settles solid neon when that step
+        finishes."""
         for j in range(len(steps) - 1):
             prev_done = step_state[j] in {"Done", "Skipped"}
             next_started = step_state[j + 1] in {"Running", "Done", "Skipped", "Failed", "Stopped"}
-            lit = prev_done and next_started
-            new_color = GUI_NEON_GREEN if lit else GUI_PROGRESS_RED
-            if new_color != sync_state[j]:
-                sync_state[j] = new_color
+            if not (prev_done and next_started):
+                new_state = GUI_PROGRESS_RED
+            elif step_state[j + 1] == "Running":
+                new_state = "Running"
+            else:
+                new_state = GUI_NEON_GREEN
+            if new_state != sync_state[j]:
+                sync_state[j] = new_state
                 _paint_cell(f"sync:{j}")
 
     def update_finish() -> None:
