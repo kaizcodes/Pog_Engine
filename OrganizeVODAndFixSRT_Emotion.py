@@ -2259,6 +2259,8 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             return GUI_PROGRESS_RED
         kind = geometry["kind"]
         if kind == "st":
+            if step_state[geometry["index"]] == "Running":
+                return _running_fill()
             return GUI_STATE_COLORS[step_state[geometry["index"]]]
         if kind == "mini":
             state = mini_state.get((geometry["index"], geometry["code"]), "Waiting")
@@ -2373,8 +2375,17 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
         # the running cell's glow follows its animated fill (quantized so the
         # sprite cache stays small)
         geometry = cell_geometry.get(key)
-        if geometry is not None and geometry["kind"] == "mini":
-            if mini_state.get((geometry["index"], geometry["code"]), "Waiting") == "Running":
+        if geometry is not None:
+            is_running = (
+                mini_state.get((geometry["index"], geometry["code"]), "Waiting") == "Running"
+                if geometry["kind"] == "mini"
+                else (
+                    step_state[geometry["index"]] == "Running"
+                    if geometry["kind"] == "st"
+                    else False
+                )
+            )
+            if is_running:
                 factor = GLOW_PHASES_RUNNING[glow_clock["phase"] % 4]
                 t = max(0.0, min(1.0, (factor - 0.3) / 0.7))
                 return _blend_hex(GUI_PROGRESS_GREEN, GUI_NEON_GREEN, round(t * 4) / 4)
@@ -2453,6 +2464,16 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
             if mini_st != "Running":
                 continue
             fill_key = _mini_key(mini_index, code)
+            item_id = map_ids.get(fill_key)
+            if item_id is not None:
+                try:
+                    map_canvas.itemconfigure(item_id, fill=_cell_fill_color(fill_key))
+                except tk.TclError:
+                    pass
+        for step_index, step_st in list(enumerate(step_state)):
+            if step_st != "Running":
+                continue
+            fill_key = f"st:{step_index}"
             item_id = map_ids.get(fill_key)
             if item_id is not None:
                 try:
