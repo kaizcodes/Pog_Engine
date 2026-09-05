@@ -485,6 +485,10 @@ DISCOVERY_MODEL_TUNINGS: dict[str, dict] = {
     "qwen3.5:9b-q4_K_M":                      {"DISCOVERY_NUM_CTX": 8192},
     "qwen3.6:35b-a3b":                        {"DISCOVERY_NUM_CTX": 6144},
     "qwen3.5:35b-a3b-q4_K_M":                 {"DISCOVERY_NUM_CTX": 6144},
+    # phi4:14b is a dense 14B (Q4_K_M ~ 9.1 GB) - a 10GB card needs the
+    # discovery window trimmed to leave room for KV cache. Pull it first:
+    # ollama pull phi4:14b
+    "phi4:14b":                               {"DISCOVERY_NUM_CTX": 6144},
 }
 
 _JUDGE_LIGHT = {
@@ -534,6 +538,9 @@ JUDGE_MODEL_TUNINGS: dict[str, dict] = {
     "qwen3.5:9b-q4_K_M":                      dict(_JUDGE_LIGHT),
     "qwen3.6:35b-a3b":                        dict(_JUDGE_HEAVY),
     "qwen3.5:35b-a3b-q4_K_M":                 dict(_JUDGE_HEAVY),
+    # phi4:14b judge uses the same VRAM-pressure profile as the 35B MoE:
+    # smaller batches + more retries so the dense 14B's KV cache fits.
+    "phi4:14b":                               dict(_JUDGE_HEAVY),
 }
 
 # Fallback tunings for models not explicitly listed (e.g. future pulls).
