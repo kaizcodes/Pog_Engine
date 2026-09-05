@@ -1043,7 +1043,7 @@ def make_fix_srt_bat(script_path: Path, target_folder: Path) -> str:
         progress_message="Fixing SRT timestamps and adjacent repeats",
         command="--fix-srt",
         error_label="SRT fix",
-        done_message="Done! Fixed SRT saved next to the original as *_fixed.srt.",
+        done_message="Done! Fixed SRT saved in the VOD folder as *_fixed.srt.",
         next_message="Next: drag the *_fixed.srt file onto 4_SplitSRT.bat",
         out_dir=target_folder,
     )
@@ -1056,7 +1056,7 @@ def make_split_srt_bat(script_path: Path, target_folder: Path) -> str:
         progress_message="Splitting SRT into transcript_part files",
         command="--split-srt",
         error_label="SRT split",
-        done_message="Done! transcript_part files are ready in the folder.",
+        done_message="Done! transcript_part files are saved in the step4_split_srt folder.",
         next_message="Double-click 5_AnalyzeHighlights.bat or Run_Pog_Engine.bat to find highlights.",
         out_dir=step_subdir(target_folder, 4),
     )
@@ -4056,6 +4056,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--chunk-minutes", type=int, default=DEFAULT_CHUNK_MINUTES, help="Transcript chunk length for --split-srt.")
     parser.add_argument("--transcription-chunk-minutes", type=int, default=TRANSCRIPTION_CHUNK_MINUTES, help="Whisper audio chunk length for --prepare-audio-chunks.")
     parser.add_argument("--transcription-overlap-seconds", type=int, default=TRANSCRIPTION_CHUNK_OVERLAP_SECONDS, help="Whisper audio overlap for --prepare-audio-chunks.")
+    parser.add_argument("--out-dir", metavar="DIR", help="Output folder for --fix-srt / --split-srt results; the generated step bats bake in the VOD folder or step subfolder.")
 
     parser.add_argument("--no-pause", action="store_true", help="Do not wait for Enter before exiting.")
     return parser.parse_args(argv)
@@ -4084,11 +4085,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.fix_srt:
-            fix_srt(Path(args.fix_srt))
+            out_dir = Path(args.out_dir) if args.out_dir else None
+            fix_srt(Path(args.fix_srt), out_dir)
             return 0
 
         if args.split_srt:
-            split_srt_into_chunks(Path(args.split_srt), args.chunk_minutes)
+            out_dir = Path(args.out_dir) if args.out_dir else None
+            split_srt_into_chunks(Path(args.split_srt), args.chunk_minutes, out_dir)
             return 0
 
         if args.run_all_gui:
