@@ -3964,8 +3964,8 @@ def organize_video(video_file: Path) -> Path:
     bat_files = {
         "1_ExtractMicAudio.bat": make_extract_mic_bat(target_folder, base_name, video_suffix, is_single_track),
         "2_TranscribeAudio.bat": make_transcribe_bat(script_path),
-        "3_FixSRT.bat": make_fix_srt_bat(script_path),
-        "4_SplitSRT.bat": make_split_srt_bat(script_path),
+        "3_FixSRT.bat": make_fix_srt_bat(script_path, target_folder),
+        "4_SplitSRT.bat": make_split_srt_bat(script_path, target_folder),
         "5_AnalyzeHighlights.bat": make_analyze_bat(target_folder),
         "Run_Pog_Engine.bat": make_run_all_bat(target_folder, base_name, script_path),
         "Start_LlamaServer.bat": make_llama_server_bat(),
