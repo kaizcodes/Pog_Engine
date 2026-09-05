@@ -491,8 +491,27 @@ def transcribe_audio_in_chunks(
         "all chunk audio is already prepared.",
         flush=True,
     )
+    # The stitched SRT belongs to step 2's folder. When the mic wav lives in
+    # step 1's folder (the RunAll layout), resolve the VOD root from it;
+    # standalone/drag-drop runs keep the SRT next to the audio.
+    if audio_path.parent.name == STEP_FOLDER_NAMES[1]:
+        output_dir = step_subdir(audio_path.parent.parent, 2)
+    else:
+        output_dir = audio_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     for chunk_number, chunk_audio_path in enumerate(chunk_audio_paths, start=1):
         chunk_srt_path = chunk_audio_path.with_suffix(".srt")
+        if chunk_srt_path.is_file() and chunk_srt_path.stat().st_size > 0:
+            # A previous run already transcribed this chunk (e.g. a stitch
+            # or expected-file check failed afterward) - keep its SRT.
+            print(
+                f"Chunk {chunk_number:02d}/{len(chunk_audio_paths):02d}: "
+                f"{chunk_srt_path.name} already transcribed, reusing it.",
+                flush=True,
+            )
+            chunk_srt_paths.append(chunk_srt_path)
+            continue
         print(
             f"Running Whisper for chunk "
             f"{chunk_number:02d}/{len(chunk_audio_paths):02d}: {chunk_audio_path.name}",
@@ -502,7 +521,7 @@ def transcribe_audio_in_chunks(
         chunk_srt_paths.append(chunk_srt_path)
 
     print("All chunk SRTs finished; stitching connected timestamps.", flush=True)
-    output_path = audio_path.with_suffix(".srt")
+    output_path = output_dir / audio_path.with_suffix(".srt").name
     return stitch_transcription_chunks(chunk_srt_paths, chunk_offsets_ms, output_path)
 
 
