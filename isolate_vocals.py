@@ -411,7 +411,7 @@ def run_demucs_chunked(
         f"{input_wav.stem}_mic_demucs_chunks"
     )
     combined_path = combined_path or input_wav.parent / (
-        f"{input_wav.stem}_mic_combined.w64"
+        f"{input_wav.stem}_mic_demucs_combined.w64"
     )
 
     device = detect_device()

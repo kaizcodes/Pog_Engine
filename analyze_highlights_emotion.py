@@ -47,6 +47,7 @@ from pipeline_config import (
     LLM_BACKEND, LLAMA_SERVER_URL, LLAMA_MODEL_PATH, LLAMA_DISCOVERY_MODEL_PATH,
     LLAMA_JUDGE_MODEL_PATH, LLAMA_CONTEXT_SIZE,
     OLLAMA_RETRIES, OLLAMA_RETRY_BACKOFF_SECONDS,
+    model_memory_fit,
     TOP_N, JUDGE_POOL_SIZE, VERIFY_POOL_SIZE, VERIFY_BATCH_SIZE, VERIFY_MIN_COVERAGE_RATIO,
     VERIFY_NUM_PREDICT, JUDGE_BATCH_SIZE,
     TIMESTAMP_TOLERANCE_SECONDS,
@@ -560,57 +561,6 @@ def ollama_model_loaded(model_name, url):
         pass
     return False
 
-def _memory_status_gb() -> tuple[float, float]:
-    """(available system RAM GB, total RAM GB) via GlobalMemoryStatusEx."""
-    try:
-        import ctypes
-
-        class _MemStatus(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
-        stat = _MemStatus()
-        stat.dwLength = ctypes.sizeof(_MemStatus)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-            return stat.ullAvailPhys / 2**30, stat.ullTotalPhys / 2**30
-    except Exception:
-        pass
-    return 0.0, 0.0
-
-
-def _free_vram_gb() -> float:
-    """Free VRAM GB across all GPUs via nvidia-smi; 0.0 when unavailable."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return sum(float(line) for line in out.stdout.split() if line.strip().isdigit()) / 1024
-    except Exception:
-        return 0.0
-
-
-def _ollama_model_size_gb(model_name: str) -> float | None:
-    """On-disk size of an installed Ollama model; None when not found."""
-    try:
-        response = requests.get(ollama_base_url(OLLAMA_URL).rstrip("/") + "/api/tags", timeout=5)
-        response.raise_for_status()
-    except Exception:
-        return None
-    base_name = model_name.split(":")[0]
-    for model in response.json().get("models", []):
-        name = model.get("name", "")
-        if name == model_name or name.split(":")[0] == base_name:
-            size = model.get("size")
-            return size / 2**30 if isinstance(size, (int, float)) else None
-    return None
-
-
 def ensure_ollama_model_ready(model_name, url, stage_label):
     """Announce (and force) a stage's LLM model load before its real calls.
     Loading multi-GB weights can silently stall the first API call for a
@@ -639,11 +589,9 @@ def ensure_ollama_model_ready(model_name, url, stage_label):
     # Memory pre-flight: a partially-offloaded multi-GB load needs free RAM
     # AND free VRAM; when either is short the load dies with a cryptic
     # allocation error mid-warmup. Warn while there is still time to act.
-    model_size_gb = _ollama_model_size_gb(model_name)
-    if model_size_gb is not None:
-        avail_ram_gb, _total_ram = _memory_status_gb()
-        avail_vram_gb = _free_vram_gb()
-        required_gb = model_size_gb + 2.0  # weights + KV/compute buffer headroom
+    fit = model_memory_fit(model_name)
+    if fit is not None:
+        model_size_gb, required_gb, avail_ram_gb, avail_vram_gb = fit
         available_gb = avail_ram_gb + avail_vram_gb
         if available_gb < required_gb:
             print(
@@ -1928,10 +1876,14 @@ def run_discovery(stream_folder, parts, prompts):
             print()
             part_errors += 1
 
-    # Deduplicate by timestamp + title
+    # Deduplicate by timestamp alone: candidates anchor to real transcript
+    # block timestamps, so the same second proposed by two passes is the
+    # same moment even when the titles differ. Keep the highest score.
+    # Near-timestamp fuzzy merging (drifted seconds, audio-scan overlap)
+    # stays with merge_near_duplicates() in the audioscan stage.
     unique = {}
     for h in highlights:
-        key = (h["Timestamp"].strip(), h["Title"].strip().lower())
+        key = h["Timestamp"].strip()
         if key not in unique:
             unique[key] = h
             continue
@@ -2073,14 +2025,18 @@ def run_judge_batch(pool, keep_n, judge_instructions):
     prompt = judge_instructions.format(keep_n=keep_n)
 
     for i, h in enumerate(pool, start=1):
+        # TranscriptScore holds the pre-boost discovery score; Score has
+        # already absorbed EmotionBoost/HypePhraseBoost by judge time, so the
+        # judge gets the raw base plus the explicit boosts instead of the
+        # same number under two labels.
         prompt += (
             f"{i}. {h['Timestamp']} | "
             f"{h['Title']} | "
             f"{h['Reason']} | "
-            f"DiscoveryScore={h['Score']} | "
-            f"TranscriptScore={h.get('TranscriptScore', h['Score'])} | "
+            f"BaseScore={h.get('TranscriptScore', h['Score'])} | "
             f"Emotion={h.get('Emotion', '')} {h.get('EmotionConfidence', '')} | "
-            f"EmotionBoost={h.get('EmotionBoost', 0)}\n"
+            f"EmotionBoost={h.get('EmotionBoost', 0)} | "
+            f"HypePhraseBoost={h.get('HypePhraseBoost', 0)}\n"
         )
 
     payload = {
@@ -2886,7 +2842,7 @@ def run_stage_judge(stream_folder):
         seen = set()
         final_highlights = []
         for h in ranked:
-            key = (h["Timestamp"].strip(), h["Title"].strip().lower())
+            key = h["Timestamp"].strip()
             if key in seen:
                 continue
             seen.add(key)

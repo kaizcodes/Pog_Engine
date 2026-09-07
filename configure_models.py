@@ -172,6 +172,8 @@ def run_gui() -> int:
             for combo in model_combos.get(key, []):
                 combo.configure(values=model_values)
         root.update_idletasks()
+        _warn_memory_fit("discovery", str(var_state["MODEL"].get()).strip())
+        _warn_memory_fit("judge", str(var_state["JUDGE_MODEL"].get()).strip())
 
     models_status_var = tk.StringVar(value="Click 'Scan models' to detect installed Ollama models.")
 
@@ -217,6 +219,28 @@ def run_gui() -> int:
         except Exception:
             pass
 
+    def _warn_memory_fit(role: str, model: str) -> None:
+        """Pre-flight a selected model against free RAM+VRAM so an undersized
+        pick surfaces here instead of as a mid-run load failure. Silent when
+        the size is unknown (Ollama down, model not pulled) or the backend
+        isn't Ollama - the analyzer's stage pre-flight re-checks with live
+        numbers at load time."""
+        if not model or str(getattr(cfg, "LLM_BACKEND", "ollama")).strip().lower() != "ollama":
+            return
+        fit = cfg.model_memory_fit(model)
+        if fit is None:
+            return
+        weights_gb, required_gb, ram_gb, vram_gb = fit
+        available_gb = ram_gb + vram_gb
+        if available_gb >= required_gb:
+            return
+        _log_early(
+            f"[!] Memory: {model} ({role}) needs ~{required_gb:.1f} GB free "
+            f"({weights_gb:.1f} GB weights + KV/compute headroom) but only {available_gb:.1f} GB "
+            f"is free right now ({ram_gb:.1f} GB RAM + {vram_gb:.1f} GB VRAM). Close RAM/VRAM-heavy "
+            f"apps (browser, Discord) before running, or pick a smaller model."
+        )
+
     def on_discovery_model_selected(_event=None) -> None:
         nonlocal last_discovery_model
         model = str(var_state["MODEL"].get()).strip()
@@ -226,6 +250,7 @@ def run_gui() -> int:
         if not model:
             return
         _apply_role_tuning("discovery", model, set_state_value, _log_early)
+        _warn_memory_fit("discovery", model)
 
     def on_judge_model_selected(_event=None) -> None:
         nonlocal last_judge_model
@@ -236,6 +261,7 @@ def run_gui() -> int:
         if not model:
             return
         _apply_role_tuning("judge", model, set_state_value, _log_early)
+        _warn_memory_fit("judge", model)
 
     # Bottom-anchored chrome is packed FIRST so Tk reserves its space from
     # the window's bottom edge; the scrolling parameter list then expands

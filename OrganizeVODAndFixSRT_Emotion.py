@@ -800,7 +800,11 @@ def make_extract_mic_bat_singletrack(target_folder: Path, base_name: str, video_
     """
     mic_wav_name = f"{base_name}_mic.wav"
     mixed_wav_name = f"{base_name}_mixed_full.w64"
-    combined_wav_name = f"{base_name}_mic_combined.w64"
+    # _mic_demucs_combined.w64: the Demucs-separated (vocals-only) chunks
+    # concatenated, pre-render. The final *_mic.wav is the later ffmpeg
+    # re-render (16 kHz mono + noise gate) Whisper consumes - the names must
+    # not suggest they are interchangeable.
+    combined_wav_name = f"{base_name}_mic_demucs_combined.w64"
     demucs_chunk_dir_name = f"{base_name}_demucs_chunks"
     mic_chunk_dir_name = f"{base_name}_mic_demucs_chunks"
     video_path = target_folder / f"{base_name}{video_suffix}"
@@ -853,7 +857,7 @@ if errorlevel 1 (
 )
 echo.
 echo Step 1d: mic chunks saved in {mic_chunk_dir_name}
-echo Step 1e: combined separated audio saved as {combined_wav_name}
+echo Step 1e: Demucs-separated mic audio combined into {combined_wav_name}
 echo Step 1f: rendering the isolated mic track to {mic_wav_name} is complete.
 echo Step 1g: splitting the rendered mic track into Whisper chunks...
 python -u "{batch_quote(organizer_script)}" --prepare-audio-chunks "{batch_quote(mic_wav_path)}" --no-pause
@@ -1552,7 +1556,7 @@ MINI_DESCRIPTIONS_SINGLE_TRACK_STEP1 = {
     "1b": "The full mix is persisted as 10-minute Demucs input chunks.",
     "1c": "Demucs separates each input chunk - one run per chunk, GPU when available.",
     "1d": "Trimmed separated mic chunks are saved under *_mic_demucs_chunks/.",
-    "1e": "Separated mic chunks are concatenated into *_mic_combined.w64.",
+    "1e": "Separated mic chunks are concatenated into *_mic_demucs_combined.w64.",
     "1f": "The combined vocal audio renders to *_mic.wav at 16 kHz mono with the shared noise gate.",
     "1g": "The rendered mic WAV is cut into overlapping Whisper windows with a manifest.",
 }
@@ -1693,7 +1697,8 @@ def migrate_legacy_vod_folder(target_folder: Path, events: "queue.Queue | None" 
     at the root, as do the runner and step bats. Also renames
     6_RunAllSteps.bat to Run_Pog_Engine.bat for pre-redesign folders."""
     moves = {
-        1: ("*_mic.wav", "*_mixed_full.w64", "*_mic_combined.w64",
+        1: ("*_mic.wav", "*_mixed_full.w64", "*_mic_demucs_combined.w64",
+            "*_mic_combined.w64",  # pre-rename builds wrote this name
             "*_demucs_chunks", "*_mic_demucs_chunks"),
         2: ("*_mic.srt", "*_mic_transcription_chunks"),
         4: ("transcript_part*.txt",),

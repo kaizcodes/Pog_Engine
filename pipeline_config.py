@@ -697,6 +697,93 @@ def ollama_not_ready_message(base_url: str) -> str:
     )
 
 
+# --- Model-load memory pre-flight ---------------------------------------------
+# A partially-offloaded multi-GB load needs free RAM AND free VRAM; when
+# either is short the load dies with a cryptic allocation error mid-warmup.
+# Shared by the analyzer's stage pre-flight (ensure_ollama_model_ready) and
+# the configurator's model-selection warning.
+
+MODEL_LOAD_HEADROOM_GB = 2.0  # KV/compute buffers on top of the weights
+
+
+def memory_status_gb() -> tuple[float, float]:
+    """(available system RAM GB, total RAM GB) via GlobalMemoryStatusEx."""
+    try:
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = _MemStatus()
+        stat.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return stat.ullAvailPhys / 2**30, stat.ullTotalPhys / 2**30
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def free_vram_gb() -> float:
+    """Free VRAM GB across all GPUs via nvidia-smi; 0.0 when unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return sum(float(line) for line in out.stdout.split() if line.strip().isdigit()) / 1024
+    except Exception:
+        return 0.0
+
+
+def ollama_model_size_gb(model_name: str) -> float | None:
+    """On-disk size of an installed Ollama model (GiB); None when not found.
+
+    All sizes are collected into a dict before the lookup, so /api/tags
+    ordering can never decide which sibling answers: the old first-match
+    loop returned qwen3.5:35b-a3b-q4_K_M (22.2 GB) for a configured
+    qwen3.5:9b-q4_K_M (6.1 GB) purely because the 35B was listed first,
+    firing a false memory warning on every load. Matching is exact,
+    case-insensitively (tags are case-sensitive in Ollama; a case typo
+    between config and pull should not silently fall back); a name
+    without a tag also matches its :latest. No family fallback at all.
+    """
+    try:
+        response = requests.get(ollama_base_url(OLLAMA_URL).rstrip("/") + "/api/tags", timeout=5)
+        response.raise_for_status()
+    except Exception:
+        return None
+    wanted = str(model_name).strip().lower()
+    sizes: dict[str, float] = {}
+    for model in response.json().get("models", []):
+        name = str(model.get("name", "")).strip().lower()
+        size = model.get("size")
+        if name and isinstance(size, (int, float)):
+            sizes[name] = size / 2**30
+    if wanted in sizes:
+        return sizes[wanted]
+    if ":" not in wanted:
+        return sizes.get(wanted + ":latest")
+    return None
+
+
+def model_memory_fit(model_name: str) -> tuple[float, float, float, float] | None:
+    """(weights GB, required GB, free RAM GB, free VRAM GB) for a model-load
+    pre-flight; None when the model's installed size is unknown.
+    required = weights + MODEL_LOAD_HEADROOM_GB; the load fits when
+    free RAM + free VRAM covers it."""
+    weights_gb = ollama_model_size_gb(model_name)
+    if weights_gb is None:
+        return None
+    avail_ram_gb, _total_ram = memory_status_gb()
+    return weights_gb, weights_gb + MODEL_LOAD_HEADROOM_GB, avail_ram_gb, free_vram_gb()
+
+
 # --- Save-back ---------------------------------------------------------------
 # Rewrite only the default literal on definitions listed in EDITABLE_PARAMS.
 # The source file is replaced atomically so a failed write cannot leave a
