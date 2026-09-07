@@ -1495,7 +1495,7 @@ def _last_input_tick() -> int | None:
     except Exception:
         return None
 
-RUN_ALL_VERSION = "V1.2.1"  # shown in the RunAll GUI header (per GUI REDESIGN CONCEPT mockups)
+RUN_ALL_VERSION = "V2.0.0"  # shown in the RunAll GUI header (per GUI REDESIGN CONCEPT mockups)
 
 import tkinter as tk  # noqa: E402  (RunAll GUI helpers below live at module level)
 
@@ -1775,6 +1775,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     run_log = run_log_path.open("w", encoding="utf-8", buffering=1)
     run_log_closed = {"value": False}
     run_log.write("Step 6 run log\n")
+    run_log.write(f"Pog Engine: {RUN_ALL_VERSION}\n")
     run_log.write(f"Started: {datetime.now().isoformat(timespec='seconds')}\n")
     run_log.write(f"Run ID: {run_id}\n")
     run_log.write(f"Folder: {target_folder}\n")
