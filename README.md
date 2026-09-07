@@ -69,7 +69,7 @@ Your final result should say OK / Already Downloaded
 1. Place **Drag MP4 on me** shortcut in your **VOD folder**
 3. Drop your VOD.mp4 onto the shortcut
 4. Go to the created folder
-5. Open **6_RunAllSteps.bat**
+5. Open **Run_Pog_Engine.bat**
 6. Watch it works
 
 Files you'll need for Davinci Resolve:
