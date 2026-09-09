@@ -61,7 +61,7 @@ for /f "tokens=2 delims=." %%A in ("%PY_VER%") do set "PY_MINOR=%%A"
 if not defined PY_MINOR set "PY_MINOR=0"
 set "NEED_PY312="
 if not "%PY_MAJOR%"=="3" set "NEED_PY312=1"
-if "%PY_MAJOR%"=="3" if %PY_MINOR% LSS 12 set "NEED_PY312=1"
+if "%PY_MAJOR%"=="3" if not "%PY_MINOR%"=="12" set "NEED_PY312=1"
 if defined NEED_PY312 (
     echo.
     echo Found Python %PY_VER% - Pog Engine now requires Python 3.12+.

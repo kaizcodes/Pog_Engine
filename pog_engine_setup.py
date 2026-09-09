@@ -65,6 +65,73 @@ import zipfile
 from pathlib import Path
 
 
+def _requests_importable() -> bool:
+    """Fresh import probe (not the module-global) so retries see new paths."""
+    try:
+        import requests  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _repair_user_site() -> bool:
+    """pip fell back to --user but the package still won't import (admin-owned
+    interpreter + user site off sys.path, PYTHONNOUSERSITE, neutered `site`
+    bits, ...). Point sys.path at the user site directly and retry -
+    deterministic, no admin rights needed."""
+    try:
+        import site
+        usersite = site.getusersitepackages()
+    except Exception:
+        return False
+    try:
+        site.addsitedir(usersite)
+    except Exception:
+        if usersite and usersite not in sys.path:
+            sys.path.insert(0, usersite)
+    return _requests_importable()
+
+
+def _vendor_requests() -> bool:
+    """Last resort: pip --target into TEMP (never the repo folder, so syncs
+    and git status stay clean) and import from there. Bypasses
+    site-packages/user-site/admin entirely."""
+    try:
+        vendor = Path(tempfile.gettempdir()) / "pog_engine_vendor"
+        vendor.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install",
+             "--disable-pip-version-check", "--target", str(vendor), "requests"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            return False
+        if str(vendor) not in sys.path:
+            sys.path.insert(0, str(vendor))
+        return _requests_importable()
+    except Exception:
+        return False
+
+
+def _requests_diagnostics() -> str:
+    """One-shot env snapshot for the failure message, so a remote user can
+    paste it and we can see which site mechanism broke."""
+    try:
+        import site
+        enabled = site.ENABLE_USER_SITE
+        usersite = site.getusersitepackages()
+    except Exception:
+        enabled, usersite = "unknown", "unknown"
+    return (
+        f"Python used: {sys.executable}\n"
+        f"       user site enabled: {enabled} (PYTHONNOUSERSITE={os.environ.get('PYTHONNOUSERSITE')!r})\n"
+        f"       user site dir: {usersite}"
+    )
+
+
 def ensure_requests() -> bool:
     """Make the installer's own HTTP dependency available before setup starts."""
     global requests
@@ -92,13 +159,31 @@ def ensure_requests() -> bool:
 
     try:
         import requests as installed_requests
-    except ImportError as exc:
-        print(f"[ERROR] requests was installed but cannot be imported: {exc}")
-        print(f"       Python used: {sys.executable}")
-        return False
-    requests = installed_requests
-    print("[OK]     requests is ready.")
-    return True
+    except ImportError:
+        pass
+    else:
+        requests = installed_requests
+        print("[OK]     requests is ready.")
+        return True
+
+    # Installed but not importable (seen live: admin-owned C:\\Python314 with
+    # pip falling back to --user). Escalate before giving up.
+    print("[INFO] requests installed but not yet importable; repairing site path...")
+    if _repair_user_site():
+        import requests as installed_requests
+        requests = installed_requests
+        print("[OK]     requests is ready (via user site repair).")
+        return True
+    print("[INFO] site repair did not help; trying an isolated --target vendor dir...")
+    if _vendor_requests():
+        import requests as installed_requests
+        requests = installed_requests
+        print("[OK]     requests is ready (via isolated vendor dir).")
+        return True
+    print("[ERROR] requests was installed but cannot be imported, and all repairs failed.")
+    print(_requests_diagnostics())
+    print("       Quickest workaround: re-run this installer as administrator, then re-run normally.")
+    return False
 
 
 REQUIRED_SCRIPTS = [
