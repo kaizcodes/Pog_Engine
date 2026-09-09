@@ -1527,7 +1527,7 @@ MINI_DESCRIPTIONS = {
         "1c": "Every chunk WAV plus chunk_manifest.json is saved under *_mic_transcription_chunks/ and reused on reruns.",
     },
     1: {
-        "2a": "A fresh whisper-cli (CUDA) process decodes each saved chunk; overlap captions are deduplicated after every chunk succeeds.",
+        "2a": "A fresh whisper-cli process decodes each saved chunk (GPU-accelerated on NVIDIA; CPU-bound on AMD, where whisper.cpp ships no GPU Windows build); overlap captions are deduplicated after every chunk succeeds.",
         "2b": "Chunk SRTs shift into the full-audio clock, drop exact overlap duplicates, and stitch into the raw SRT.",
     },
     2: {

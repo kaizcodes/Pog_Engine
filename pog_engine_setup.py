@@ -12,8 +12,10 @@ sure some version of Python exists. It:
      of whatever machine they were last edited on.
   3. Installs the Python packages the pipeline actually imports (requests,
      numpy, torch, demucs, transformers, librosa, soundfile, safetensors,
-     Pillow), skipping anything already present - and picks a CUDA build of
-     torch over a CPU-only one whenever an NVIDIA GPU is detected. demucs
+     Pillow), skipping anything already present - and picks a GPU build of
+     torch whenever a supported GPU is detected (CUDA wheels for NVIDIA,
+     ROCm wheels for AMD Radeon 7000/9000-series incl. the 9070XT), falling
+     back to CPU-only torch otherwise. demucs
      (used by isolate_vocals.py to separate a streamer's voice out of a
      single-track/Twitch-style VOD's merged audio) is installed after torch
      so it picks up that same build; its own audio I/O goes through
@@ -34,7 +36,7 @@ Usage:
 
 # Keeps every `X | None` / `list[str]` type hint below as an unevaluated
 # string, so this file still parses and runs fine even if the Python already
-# on the machine turns out to be older than the 3.10 we recommend - the
+# on the machine turns out to be older than the 3.12 we target - the
 # version check further down can then print a clear warning instead of the
 # script just crashing on import with a SyntaxError/TypeError.
 from __future__ import annotations
@@ -139,6 +141,28 @@ CUDA_WHEEL_TAGS = [
     (12, 6, "cu126"),
     (11, 8, "cu118"),
 ]
+# AMD ROCm PyTorch for Windows (public preview) - the torch path for Radeon
+# 7000/9000-series cards incl. the 9070XT (gfx1201). ROCm torch exposes the
+# same torch.cuda API as the NVIDIA build, so isolate_vocals.py and the
+# emotion stage need no code change once this is installed:
+# torch.cuda.is_available() is True and device "cuda" just works.
+# Unlike the CUDA tags above these are direct wheel URLs (no index), pinned
+# to one ROCm release - bump ROCM_WINDOWS_REL when AMD publishes a newer
+# Windows release. Wheels are cp312-only, so ensure_torch() falls back to
+# CPU torch with a clear message on any other Python version.
+ROCM_WINDOWS_REL = "rocm-rel-7.2.1"
+ROCM_WINDOWS_BASE = f"https://repo.radeon.com/rocm/windows/{ROCM_WINDOWS_REL}"
+ROCM_WINDOWS_SDK_WHEELS = (
+    f"{ROCM_WINDOWS_BASE}/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
+    f"{ROCM_WINDOWS_BASE}/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+    f"{ROCM_WINDOWS_BASE}/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl",
+    f"{ROCM_WINDOWS_BASE}/rocm-7.2.1.tar.gz",
+)
+ROCM_WINDOWS_TORCH_WHEELS = (
+    f"{ROCM_WINDOWS_BASE}/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+    f"{ROCM_WINDOWS_BASE}/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+    f"{ROCM_WINDOWS_BASE}/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+)
 
 
 def mark(ok: bool) -> str:
@@ -708,13 +732,46 @@ def detect_cuda_driver_version() -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
+def detect_amd_gpu() -> str | None:
+    """AMD Radeon adapter name (e.g. 'AMD Radeon RX 9070 XT'), or None.
+    Only consulted when no NVIDIA GPU was found - a machine with both keeps
+    the NVIDIA/CUDA path. Queries Win32_VideoController via powershell CIM
+    (wmic is removed from current Win11 builds); never raises."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if name and re.search(r"\b(AMD|Radeon)\b", name, re.IGNORECASE):
+            return name
+    return None
+
+
 def torch_status() -> dict | None:
     """Checks torch in a fresh subprocess (not this process) so a package we
     just pip-installed can't be shadowed by stale import state. Returns None
-    if torch isn't importable at all."""
+    if torch isn't importable at all. 'device' is the cuda device name when a
+    GPU backend is active (NVIDIA CUDA or AMD ROCm, which exposes the same
+    torch.cuda API); 'hip' is the ROCm version on AMD builds, else None."""
+    probe = (
+        "import torch, json\n"
+        "info = {'version': torch.__version__, 'cuda': torch.cuda.is_available(), "
+        "'device': None, 'hip': getattr(torch.version, 'hip', None)}\n"
+        "try:\n"
+        "    info['device'] = torch.cuda.get_device_name(0) if info['cuda'] else None\n"
+        "except Exception:\n"
+        "    info['device'] = None\n"
+        "print(json.dumps(info))"
+    )
     result = subprocess.run(
-        [sys.executable, "-c",
-         "import torch, json; print(json.dumps({'version': torch.__version__, 'cuda': torch.cuda.is_available()}))"],
+        [sys.executable, "-c", probe],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -725,30 +782,87 @@ def torch_status() -> dict | None:
         return None
 
 
+def _torch_summary(status: dict | None) -> str:
+    """One-line 'torch <ver> (cuda: <device|True|False>, hip: <ver|None>)' for logs."""
+    if status is None:
+        return "not importable"
+    detail = f"CUDA available: {status.get('cuda')}"
+    if status.get("device"):
+        detail += f" ({status['device']})"
+    if status.get("hip"):
+        detail += f" [ROCm HIP {status['hip']}]"
+    return f"torch {status.get('version')} ({detail})"
+
+
+def _install_rocm_torch_windows(reporter: Reporter) -> bool:
+    """Install AMD's ROCm SDK wheels + ROCm torch for Windows. Returns True
+    when torch reports a GPU backend afterwards. Any failure returns False so
+    the caller can fall back to CPU torch (still fully functional, torch
+    stages just run CPU-bound) - a stale pin or network blip must never leave
+    the machine without a working torch."""
+    for url in ROCM_WINDOWS_SDK_WHEELS:
+        reporter.log(f"    installing ROCm SDK component: {Path(url).name}")
+        if not pip_install(reporter, "--no-cache-dir", url):
+            reporter.log(f"    [WARN] ROCm SDK install failed at {Path(url).name}.")
+            return False
+    for url in ROCM_WINDOWS_TORCH_WHEELS:
+        reporter.log(f"    installing ROCm torch component: {Path(url).name}")
+        if not pip_install(reporter, "--no-cache-dir", url, upgrade=True, force=True):
+            reporter.log(f"    [WARN] ROCm torch install failed at {Path(url).name}.")
+            return False
+    final = torch_status()
+    if final is not None and final.get("cuda"):
+        reporter.log(f"    ROCm torch active: {_torch_summary(final)}")
+        return True
+    reporter.log(f"    [WARN] ROCm wheels installed but no GPU backend: {_torch_summary(final)}.")
+    return False
+
+
+def _stale_gpu_torch(status: dict | None) -> bool:
+    """True when a GPU torch wheel is installed but has no GPU backend - e.g.
+    CUDA torch left over after swapping an NVIDIA card for an AMD one. A
+    plain CPU `pip install` would no-op on 'already satisfied' and leave the
+    ~2 GB dead wheel behind, so callers force-replace only in this case (and
+    never when CPU torch is already there, avoiding a pointless redownload
+    on every setup re-run)."""
+    if not status or status.get("cuda"):
+        return False
+    ver = str(status.get("version") or "")
+    return "+cu" in ver or "+rocm" in ver
+
+
 def ensure_torch(reporter: Reporter) -> None:
     reporter.log("  torch (PyTorch - needed for the speech-emotion model)")
     reporter.status("torch", "Checking...")
     driver_version = detect_cuda_driver_version()
+    # AMD is only consulted when no NVIDIA GPU is present - a mixed machine
+    # keeps the mature CUDA path.
+    amd_name = detect_amd_gpu() if driver_version is None else None
     status = torch_status()
 
     if driver_version:
         reporter.log(f"    NVIDIA GPU detected - driver supports up to CUDA {driver_version[0]}.{driver_version[1]}")
+    elif amd_name:
+        reporter.log(f"    AMD GPU detected: {amd_name} - ROCm torch path (torch.cuda API via HIP).")
     else:
-        reporter.log("    No NVIDIA GPU detected (nvidia-smi not found) - using CPU-only PyTorch.")
+        reporter.log("    No NVIDIA or AMD GPU detected - using CPU-only PyTorch.")
 
     if status is not None:
-        if driver_version is None or status["cuda"]:
-            reporter.log(f"    [OK]     already installed: torch {status['version']} "
-                         f"(CUDA available: {status['cuda']}) - skipping.")
+        if status["cuda"] or (driver_version is None and amd_name is None):
+            reporter.log(f"    [OK]     already installed: {_torch_summary(status)} - skipping.")
             reporter.status("torch", "Already installed")
             return
-        reporter.log(f"    torch {status['version']} is installed but CPU-only, and a GPU was "
-                     f"detected - upgrading to a CUDA build...")
+        if driver_version is not None:
+            reporter.log(f"    torch {status['version']} is installed but CPU-only, and an NVIDIA GPU was "
+                         f"detected - upgrading to a CUDA build...")
+        else:
+            reporter.log(f"    {_torch_summary(status)} is installed but has no GPU backend, and an AMD GPU was "
+                         f"detected - trying the ROCm build...")
 
     reporter.status("torch", "Installing...")
-    if driver_version is None:
+    if driver_version is None and amd_name is None:
         pip_install(reporter, "torch", "--index-url", "https://download.pytorch.org/whl/cpu")
-    else:
+    elif driver_version is not None:
         candidates = [tag for (maj, minr, tag) in CUDA_WHEEL_TAGS if (maj, minr) <= driver_version]
         candidates = candidates or ["cu118"]
         for tag in candidates:
@@ -759,20 +873,46 @@ def ensure_torch(reporter: Reporter) -> None:
         else:
             reporter.log("    [WARN] all CUDA wheel attempts failed - falling back to CPU-only PyTorch.")
             pip_install(reporter, "torch", "--index-url", "https://download.pytorch.org/whl/cpu")
+    else:
+        # AMD ROCm wheels are cp312-only; anything else means the user brought
+        # their own older Python (the launcher bootstraps 3.12.10 on fresh
+        # PCs). That is a setup message, not a dead end: install Python 3.12
+        # from python.org and re-run, or keep CPU torch below.
+        if sys.version_info[:2] != (3, 12):
+            reporter.log(f"    [WARN] ROCm torch for Windows needs Python 3.12 (this is "
+                         f"{sys.version.split()[0]}; wheels are cp312-only) - using CPU-only PyTorch.")
+            reporter.log("           For 9070XT GPU acceleration you need Python 3.12 - the launcher")
+            reporter.log("           installs it automatically; if you ran this script directly, switch")
+            reporter.log("           your default `python` to 3.12 and re-run (plus Adrenalin 26.2.2+).")
+            replace = _stale_gpu_torch(status)
+            if replace:
+                reporter.log("           Removing the stale GPU torch wheel left over from the previous card...")
+            pip_install(reporter, "torch", "--index-url", "https://download.pytorch.org/whl/cpu",
+                        upgrade=replace, force=replace)
+        elif not _install_rocm_torch_windows(reporter):
+            reporter.log("    [WARN] ROCm torch install failed - falling back to CPU-only PyTorch.")
+            reporter.log("           If the links above 404'd, AMD published a newer release: bump ROCM_WINDOWS_REL")
+            reporter.log("           in pog_engine_setup.py and re-run.")
+            replace = _stale_gpu_torch(status)
+            if replace:
+                reporter.log("           Removing the stale GPU torch wheel left over from the previous card...")
+            pip_install(reporter, "torch", "--index-url", "https://download.pytorch.org/whl/cpu",
+                        upgrade=replace, force=replace)
 
     final = torch_status()
     if final is None:
         reporter.log("    [WARN] torch still isn't importable after install - check the log above.")
         reporter.status("torch", "Failed")
     else:
-        reporter.log(f"    now installed: torch {final['version']} (CUDA available: {final['cuda']})")
-        reporter.status("torch", "Done" if final["cuda"] or driver_version is None else "Done (CPU only)")
+        reporter.log(f"    now installed: {_torch_summary(final)}")
+        gpu_active = bool(final.get("cuda"))
+        reporter.status("torch", "Done" if gpu_active or (driver_version is None and amd_name is None) else "Done (CPU only)")
 
 
 def ensure_demucs(reporter: Reporter) -> None:
     """demucs (vocal isolation for single-track/Twitch-style VODs - see
     isolate_vocals.py). Installed after ensure_torch() so it picks up the
-    CUDA build already installed there rather than pip resolving its own;
+    GPU build already installed there rather than pip resolving its own;
     demucs's separate CLI shells out to ffmpeg/ffprobe directly for audio
     I/O (see demucs/audio.py's AudioFile), not torchaudio, so there's no
     separate CUDA-wheel-matching needed the way there is for torch itself -
@@ -1348,9 +1488,10 @@ def create_drag_shortcut(pog_dir: Path, reporter: Reporter) -> None:
 def run_all_checks(pog_dir: Path, reporter: Reporter, install: bool = True) -> bool:
     reporter.log(f"Pog_Engine folder: {pog_dir}")
     reporter.log(f"Python: {sys.version.split()[0]} ({sys.executable})")
-    if sys.version_info < (3, 10):
-        reporter.log("[WARN] PyTorch and some other dependencies need Python 3.10+.")
-        reporter.log("       Consider installing a newer Python and re-running this installer.")
+    if sys.version_info < (3, 12):
+        reporter.log("[WARN] This pipeline targets Python 3.12+ (this is "
+                     f"{sys.version.split()[0]}). Older interpreters still work except ROCm torch.")
+        reporter.log("       Consider installing Python 3.12 and re-running this installer.")
 
     missing_scripts = check_scripts(pog_dir, reporter)
     models_dir, missing_models, whisper_cli = check_models(pog_dir, reporter)

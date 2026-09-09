@@ -186,10 +186,10 @@ TIMESTAMP_TOLERANCE_SECONDS = _env_int("HIGHLIGHT_TIMESTAMP_TOLERANCE_SECONDS", 
 # OrganizeVODAndFixSRT_Emotion.py picks between the two paths automatically
 # via count_audio_streams() (ffprobe) when a video is first dropped/organized.
 VOCAL_ISOLATION_MODEL = os.environ.get("VOCAL_ISOLATION_MODEL", "htdemucs")
-# "auto" picks CUDA if available (same as the emotion model), else CPU - see
-# detect_device() in isolate_vocals.py. CPU works but is much slower on a
-# multi-hour VOD.
-VOCAL_ISOLATION_DEVICE = os.environ.get("VOCAL_ISOLATION_DEVICE", "auto")
+# "auto" picks a GPU backend when torch has one (CUDA on NVIDIA, ROCm HIP on
+# AMD - ROCm torch exposes the same torch.cuda API, so "cuda" just works),
+# else CPU - see detect_device() in isolate_vocals.py. CPU works but is much
+# slower on a multi-hour VOD.
 # HTDemucs' model-native window is 7.8 seconds; Demucs' CLI accepts integer
 # overrides only, so the safe default is 7. Long inputs are externally split
 # into bounded windows by isolate_vocals.py because Demucs otherwise allocates
@@ -730,7 +730,14 @@ def memory_status_gb() -> tuple[float, float]:
 
 
 def free_vram_gb() -> float:
-    """Free VRAM GB across all GPUs via nvidia-smi; 0.0 when unavailable."""
+    """Free VRAM GB across all NVIDIA GPUs via nvidia-smi; 0.0 otherwise.
+
+    Deliberately NVIDIA-only: the only other Windows-readable source,
+    Win32_VideoController.AdapterRAM, is a uint32 that cannot hold modern
+    cards (a 16 GB 9070XT reports garbage there), so there is no trustworthy
+    AMD fallback. On AMD the memory pre-flight below goes RAM-only, which
+    errs toward warning early rather than missing a real shortfall - and the
+    load is attempted regardless, so a wrong-zero never blocks anything."""
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
@@ -776,7 +783,8 @@ def model_memory_fit(model_name: str) -> tuple[float, float, float, float] | Non
     """(weights GB, required GB, free RAM GB, free VRAM GB) for a model-load
     pre-flight; None when the model's installed size is unknown.
     required = weights + MODEL_LOAD_HEADROOM_GB; the load fits when
-    free RAM + free VRAM covers it."""
+    free RAM + free VRAM covers it. free VRAM reads 0.0 on non-NVIDIA GPUs
+    (see free_vram_gb), so on AMD this is effectively a RAM-only check."""
     weights_gb = ollama_model_size_gb(model_name)
     if weights_gb is None:
         return None

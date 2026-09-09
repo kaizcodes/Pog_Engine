@@ -92,7 +92,10 @@ def use_local_torch_cache() -> None:
 def detect_device() -> str:
     """VOCAL_ISOLATION_DEVICE == "auto" (the default) picks CUDA if
     available, same as the emotion model in analyze_highlights_emotion.py -
-    otherwise CPU works but is much slower on a multi-hour VOD."""
+    otherwise CPU works but is much slower on a multi-hour VOD. AMD needs no
+    special case: ROCm torch for Windows exposes the same torch.cuda API, so
+    is_available() is True on a 9070XT once the installer puts the ROCm
+    build in."""
     if VOCAL_ISOLATION_DEVICE != "auto":
         return VOCAL_ISOLATION_DEVICE
     try:

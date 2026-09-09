@@ -997,12 +997,18 @@ def classify_candidate_emotions(stream_folder, highlights):
                 print(f"[emotion] Local model had {len(unexpected_keys)} unexpected key(s); continuing with loaded weights.")
         else:
             model = AutoModelForAudioClassification.from_pretrained(model_source)
+        # "cuda" covers NVIDIA CUDA and AMD ROCm HIP alike - ROCm torch for
+        # Windows exposes the same torch.cuda API, so no separate branch.
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
         use_fp16 = device.type == "cuda" and EMOTION_USE_FP16
         if use_fp16:
             model = model.half()
-        print(f"[emotion] Device: {device}; batch size: {EMOTION_BATCH_SIZE}; fp16: {use_fp16}")
+        try:
+            device_label = f"{device} ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else str(device)
+        except Exception:
+            device_label = str(device)
+        print(f"[emotion] Device: {device_label}; batch size: {EMOTION_BATCH_SIZE}; fp16: {use_fp16}")
         model.eval()
         sample_rate = feature_extractor.sampling_rate
         audio, _ = librosa.load(mic_wav, sr=sample_rate, mono=True)
