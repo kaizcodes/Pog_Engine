@@ -65,7 +65,7 @@ if "%PY_MAJOR%"=="3" if %PY_MINOR% LSS 12 set "NEED_PY312=1"
 if defined NEED_PY312 (
     echo.
     echo Found Python %PY_VER% - Pog Engine now requires Python 3.12+.
-    echo Downloading and installing Python 3.12.10 (your existing Python is left untouched) ...
+    echo Downloading and installing Python 3.12.10 - your existing Python is left untouched ...
     call :INSTALL_PY312
     if errorlevel 1 exit /b 1
     set "PY_CMD=%LocalAppData%\Programs\Python\Python312\python.exe"
