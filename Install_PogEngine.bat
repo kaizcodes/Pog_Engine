@@ -15,56 +15,50 @@ echo.
 set "DEFAULT_DIR=%~dp0"
 set "DEFAULT_DIR=%DEFAULT_DIR:~0,-1%"
 
-rem ---- Locate Python, or install it if nothing is found ---------------------
+rem ---- Locate Python 3.12 - reuse an existing install, download only if none -
 set "PY_CMD="
-where python >nul 2>nul
-if not errorlevel 1 (
-    python --version >nul 2>nul
-    if not errorlevel 1 set "PY_CMD=python"
-)
-
-if not defined PY_CMD (
-    where py >nul 2>nul
-    if not errorlevel 1 (
-        py -3 --version >nul 2>nul
-        if not errorlevel 1 (
-            for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "PY_CMD=%%P"
-        )
-    )
-)
-
-if not defined PY_CMD (
-    echo Python was not found on this PC - downloading and installing Python 3.12.10 ...
-    call :INSTALL_PY312
-    if errorlevel 1 exit /b 1
-    set "PY_CMD=%LocalAppData%\Programs\Python\Python312\python.exe"
-    if not exist "!PY_CMD!" (
-        set "PY_CMD="
-        where python >nul 2>nul
-        if not errorlevel 1 set "PY_CMD=python"
-    )
-    if not defined PY_CMD (
-        echo.
-        echo ERROR: Python was installed but could not be located automatically.
-        echo Close this window, open a NEW Command Prompt, and run this installer again.
-        pause
-        exit /b 1
-    )
-)
-rem ---- Require Python 3.12 - older interpreters are no longer used ------------
-set "PY_VER="
-for /f "tokens=2" %%V in ('"%PY_CMD%" --version 2^>^&1') do set "PY_VER=%%V"
+set "FOUND_VER="
 set "PY_MAJOR="
 set "PY_MINOR="
-for /f "tokens=1 delims=." %%A in ("%PY_VER%") do set "PY_MAJOR=%%A"
-for /f "tokens=2 delims=." %%A in ("%PY_VER%") do set "PY_MINOR=%%A"
-if not defined PY_MINOR set "PY_MINOR=0"
-set "NEED_PY312="
-if not "%PY_MAJOR%"=="3" set "NEED_PY312=1"
-if "%PY_MAJOR%"=="3" if not "%PY_MINOR%"=="12" set "NEED_PY312=1"
-if defined NEED_PY312 (
+
+rem 1) python on PATH, but only when it is already 3.12
+where python >nul 2>nul
+if not errorlevel 1 call :TRY_EXE python
+
+rem 2) exact-version py launcher, unaffected by which Python is newest
+if not defined PY_CMD (
+    py -3.12 --version >nul 2>nul
+    if not errorlevel 1 (
+        for /f "delims=" %%P in ('py -3.12 -c "import sys; print(sys.executable)" 2^>nul') do set "PY_CMD=%%P"
+    )
+)
+
+rem 3) well-known install paths, for a 3.12 that is neither on PATH nor the default py
+if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python312\python.exe" call :TRY_EXE "%LocalAppData%\Programs\Python\Python312\python.exe"
+if not defined PY_CMD if exist "C:\Python312\python.exe" call :TRY_EXE "C:\Python312\python.exe"
+if not defined PY_CMD if exist "C:\Program Files\Python312\python.exe" call :TRY_EXE "C:\Program Files\Python312\python.exe"
+
+rem 4) no 3.12 anywhere - report what was found, then download 3.12.10
+if not defined PY_CMD (
+    if not defined FOUND_VER (
+        where python >nul 2>nul
+        if not errorlevel 1 (
+            for /f "tokens=2" %%V in ('python --version 2^>^&1') do set "FOUND_VER=%%V"
+        )
+    )
+    if not defined FOUND_VER (
+        where py >nul 2>nul
+        if not errorlevel 1 (
+            for /f "tokens=2" %%V in ('py -3 --version 2^>^&1') do set "FOUND_VER=%%V"
+        )
+    )
+    if defined FOUND_VER call :PARSE_VER "!FOUND_VER!"
     echo.
-    echo Found Python %PY_VER% - Pog Engine now requires Python 3.12+.
+    if defined FOUND_VER (
+        echo Found Python !FOUND_VER! - Pog Engine now requires Python 3.12 ...
+    ) else (
+        echo Python 3.12 was not found on this PC - downloading Python 3.12.10 ...
+    )
     echo Downloading and installing Python 3.12.10 - your existing Python is left untouched ...
     call :INSTALL_PY312
     if errorlevel 1 exit /b 1
@@ -77,9 +71,11 @@ if defined NEED_PY312 (
         exit /b 1
     )
     echo.
-    echo RECOMMENDED: uninstall the old Python %PY_VER% to avoid mixing interpreters.
-    echo   Settings ^> Apps ^> Installed apps ^> Python %PY_MAJOR%.%PY_MINOR% ^> Uninstall
-    choice /T 15 /D N /M "Open Installed apps for you now (auto-No in 15s)"
+    if defined FOUND_VER (
+        echo RECOMMENDED: uninstall the old Python !PY_MAJOR!.!PY_MINOR! to avoid mixing interpreters.
+        echo   Settings ^> Apps ^> Installed apps ^> Python !PY_MAJOR!.!PY_MINOR! ^> Uninstall
+    )
+    choice /T 15 /D N /M "Open Installed apps for you now - auto-No in 15s"
     if not errorlevel 2 start ms-settings:appsfeatures
     echo.
 )
@@ -118,4 +114,26 @@ if not exist "!PY_INSTALLER!" (
 )
 echo Installing Python silently - this can take a minute or two...
 "!PY_INSTALLER!" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_pip=1 Include_test=0
+exit /b 0
+rem ---- Adopt one Python exe when it is 3.12, else remember its version for the message
+:TRY_EXE
+set "TRY_VER="
+for /f "tokens=2" %%V in ('"%~1" --version 2^>^&1') do set "TRY_VER=%%V"
+if not defined TRY_VER exit /b 1
+call :PARSE_VER "!TRY_VER!"
+if "!PY_MAJOR!"=="3" if "!PY_MINOR!"=="12" (
+    set "PY_CMD=%~1"
+    set "FOUND_VER=!TRY_VER!"
+    exit /b 0
+)
+if not defined FOUND_VER set "FOUND_VER=!TRY_VER!"
+exit /b 1
+
+rem ---- Split a dotted version into PY_MAJOR / PY_MINOR
+:PARSE_VER
+set "PY_MAJOR="
+set "PY_MINOR="
+for /f "tokens=1 delims=." %%A in ("%~1") do set "PY_MAJOR=%%A"
+for /f "tokens=2 delims=." %%A in ("%~1") do set "PY_MINOR=%%A"
+if not defined PY_MINOR set "PY_MINOR=0"
 exit /b 0
