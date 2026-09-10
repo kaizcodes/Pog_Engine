@@ -206,6 +206,17 @@ def probe_audio_duration_seconds(audio_path: Path) -> float:
     return duration
 
 
+def _cli_path(path: Path) -> str:
+    """Verbatim `\\\\?\\` form of an absolute path for whisper.cpp's argv.
+
+    VOD folders nest a UUID folder + UUID file names + step subfolders (seen
+    at 265 chars) - past MAX_PATH, Python still opens them fine but
+    whisper.cpp's narrow fopen fails with `input file not found`. The
+    verbatim prefix lifts the limit for the child process; Python-side
+    existence checks keep using the plain path."""
+    return "\\\\?\\" + str(Path(path).resolve())
+
+
 def _transcribe_audio_chunk(
     chunk_audio_path: Path,
     chunk_srt_path: Path,
@@ -215,10 +226,10 @@ def _transcribe_audio_chunk(
     command = [
         str(WHISPER_CLI),
         "-m", str(WHISPER_MODEL),
-        "-f", str(chunk_audio_path),
+        "-f", _cli_path(chunk_audio_path),
         "-l", "en",
         "-osrt",
-        "-of", str(chunk_srt_path.with_suffix("")),
+        "-of", _cli_path(chunk_srt_path.with_suffix("")),
         "-mc", "-1",
         "--beam-size", "5",
         "--best-of", "5",
@@ -544,6 +555,7 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
     """Fix bad Whisper SRT timestamps, collapse adjacent repeats, and renumber."""
     input_path = input_path.resolve()
     output_path = (out_dir or input_path.parent) / f"{input_path.stem}_fixed.srt"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fixed_blocks: list[str] = []
     previous_end_ms = 0
@@ -701,9 +713,11 @@ def split_srt_into_chunks(input_path: Path, chunk_minutes: int = DEFAULT_CHUNK_M
         chunks[chunk_index].append(output_line)
 
     output_paths: list[Path] = []
+    resolved_out = out_dir or input_path.resolve().parent
+    resolved_out.mkdir(parents=True, exist_ok=True)
     print("\nCreated:")
     for index, chunk in enumerate(chunks, start=1):
-        part_path = (out_dir or input_path.resolve().parent) / f"transcript_part{index}.txt"
+        part_path = resolved_out / f"transcript_part{index}.txt"
         write_text_crlf(part_path, "\r\n\r\n".join(chunk), encoding="utf-8")
         output_paths.append(part_path)
         print(f"  {part_path.name}")
@@ -753,7 +767,8 @@ def make_extract_mic_bat_multitrack(target_folder: Path, base_name: str, video_s
     """
     mic_wav_name = f"{base_name}_mic.wav"
     video_path = target_folder / f"{base_name}{video_suffix}"
-    wav_path = step_subdir(target_folder, 1) / mic_wav_name
+    step1_dir = step_subdir(target_folder, 1)
+    wav_path = step1_dir / mic_wav_name
     organizer_script = SCRIPT_DIR / "OrganizeVODAndFixSRT_Emotion.py"
     audio_filters = (
         f"agate=threshold={NOISE_GATE_THRESHOLD_DB}dB:"
@@ -764,6 +779,7 @@ def make_extract_mic_bat_multitrack(target_folder: Path, base_name: str, video_s
     return f'''@echo off
 echo This VOD has separate game/mic audio tracks - extracting and gating/
 echo normalizing the mic track (track index 1) from {base_name}{video_suffix} ...
+if not exist "{batch_quote(step1_dir)}" mkdir "{batch_quote(step1_dir)}"
 ffmpeg -i "{batch_quote(video_path)}" -map 0:a:1 -ar 16000 -ac 1 -af "{audio_filters}" "{batch_quote(wav_path)}"
 if errorlevel 1 (
     echo.
@@ -822,6 +838,7 @@ echo chunk, save the separated mic chunks, combine and render the mic track,
 echo then split the rendered track for Whisper.
 echo The full mix remains available as {mixed_wav_name}.
 echo.
+if not exist "{batch_quote(step1_dir)}" mkdir "{batch_quote(step1_dir)}"
 if exist "{batch_quote(mixed_wav_path)}" (
     echo Found existing extracted full mix: {mixed_wav_name}
     echo Reusing it and skipping full-mix extraction.

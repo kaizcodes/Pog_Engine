@@ -385,6 +385,10 @@ _PINNED_SHA256 = {
     # change for this tag. Verified 2026-08-11.
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip":
         "3fc4d3ebd9a678313de50c04d9e59c43117ae190f0cb7bff602d4aeefc4efe3d",
+    # CPU (OpenBLAS) build for non-NVIDIA boxes - same release, same API
+    # listing, digest likewise immutable for the tag.
+    "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-blas-bin-x64.zip":
+        "adde1afb6e915ae522fffeef117ca178e2561d39487c164f1a7c3899d41b4a1d",
 }
 
 _HF_TREE_CACHE: dict[tuple[str, str], dict[str, dict]] = {}
@@ -525,46 +529,85 @@ def download_emotion_model_files(models_dir: Path, reporter: Reporter) -> bool:
     return ok
 
 
-def download_whisper_cpp_cublas(models_dir: Path, reporter: Reporter) -> bool:
-    """Download the whisper.cpp cublas release ZIP (via download_file()'s
-    size/sha256-verified fetch) and extract whisper-cli.exe to models/Release/."""
-    dest_exe = models_dir / "Release" / "whisper-cli.exe"
-    if dest_exe.is_file():
-        reporter.log(f"  [OK]     whisper-cli.exe already exists at {dest_exe}")
-        reporter.status("whisper-cli.exe", "Already downloaded")
-        return True
+WHISPER_CUBLAS_URL = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip"
+WHISPER_BLAS_URL = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-blas-bin-x64.zip"
 
-    reporter.status("whisper.cpp cublas", "Downloading...")
+
+def _whisper_exe_runs(exe: Path) -> bool:
+    """True when whisper-cli.exe actually starts (--help exits 0). Catches a
+    cublas build stranded on a driver-less box (0xC0000135, missing
+    nvcuda.dll - seen live on the 9070XT machine) so the installer never
+    blesses a dead binary."""
+    try:
+        result = subprocess.run([str(exe), "--help"], capture_output=True, timeout=30)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def download_whisper_cpp_build(models_dir: Path, reporter: Reporter) -> bool:
+    """Download the whisper.cpp release ZIP (via download_file()'s
+    size/sha256-verified fetch) and extract whisper-cli.exe to models/Release/.
+
+    cublas build on NVIDIA boxes; OpenBLAS CPU build wherever nvidia-smi is
+    absent (AMD, Intel, no GPU) - the cublas exe can't even start there
+    (loader error 0xC0000135, no nvcuda.dll), so "CPU fallback" was never
+    real. Both zips share the same top-level Release/ layout, so one
+    extractor serves both. An existing but dead exe (cublas leftover from a
+    GPU swap) is wiped and replaced with the working build."""
+    dest_exe = models_dir / "Release" / "whisper-cli.exe"
+    use_blas = detect_cuda_driver_version() is None
+    if use_blas and detect_amd_gpu() is not None:
+        box = "AMD GPU detected - OpenBLAS CPU build"
+    elif use_blas:
+        box = "no NVIDIA GPU detected - OpenBLAS CPU build"
+    else:
+        box = "NVIDIA GPU detected - cublas build"
+    label = "whisper.cpp OpenBLAS" if use_blas else "whisper.cpp cublas"
+    url = WHISPER_BLAS_URL if use_blas else WHISPER_CUBLAS_URL
+    tmp_zip = models_dir / ("whisper-blas.zip.tmp" if use_blas else "whisper-cublas.zip.tmp")
+    if dest_exe.is_file():
+        if _whisper_exe_runs(dest_exe):
+            reporter.log(f"  [OK]     whisper-cli.exe already exists and starts at {dest_exe}")
+            reporter.status("whisper-cli.exe", "Already downloaded")
+            return True
+        reporter.log(f"  [WARN]   existing whisper-cli.exe does not start ({box}); replacing it...")
+        shutil.rmtree(dest_exe.parent, ignore_errors=True)
+
+    reporter.status(label, "Downloading...")
+    reporter.log(f"  [INFO]   {box}: {url}")
     dest_exe.parent.mkdir(parents=True, exist_ok=True)
-    url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-cublas-12.4.0-bin-x64.zip"
-    tmp_zip = models_dir / "whisper-cublas.zip.tmp"
-    if not download_file(url, tmp_zip, reporter, "whisper.cpp cublas release"):
-        reporter.status("whisper.cpp cublas", "Failed")
+    if not download_file(url, tmp_zip, reporter, f"{label} release"):
+        reporter.status(label, "Failed")
         return False
 
     reporter.log(f"  [INFO]   Extracting whisper.cpp release...")
-    tmp_extract = models_dir / "whisper-cublas-extract.tmp"
+    tmp_extract = models_dir / ("whisper-blas-extract.tmp" if use_blas else "whisper-cublas-extract.tmp")
     try:
         with zipfile.ZipFile(tmp_zip, 'r') as z:
             z.extractall(tmp_extract)
-        # The ZIP contains a top-level Release/ folder; move its contents to models/Release/
+        # Both ZIPs contain a top-level Release/ folder; move its contents to models/Release/
         inner_release = tmp_extract / "Release"
         if not inner_release.is_dir():
             reporter.log(f"  [WARN] Release folder not found in ZIP")
-            reporter.status("whisper.cpp cublas", "Failed")
+            reporter.status(label, "Failed")
             return False
         for item in inner_release.iterdir():
             shutil.move(str(item), str(dest_exe.parent / item.name))
     except Exception as exc:
-        reporter.log(f"  [WARN] whisper.cpp cublas extract failed: {exc}")
-        reporter.status("whisper.cpp cublas", "Failed")
+        reporter.log(f"  [WARN] {label} extract failed: {exc}")
+        reporter.status(label, "Failed")
         return False
     finally:
         tmp_zip.unlink(missing_ok=True)
         shutil.rmtree(tmp_extract, ignore_errors=True)
 
-    reporter.log(f"  [OK]     Extracted whisper.cpp release to {dest_exe.parent}")
-    reporter.status("whisper.cpp cublas", "Downloaded")
+    if not _whisper_exe_runs(dest_exe):
+        reporter.log(f"  [WARN] extracted whisper-cli.exe does not start - see above.")
+        reporter.status(label, "Failed")
+        return False
+    reporter.log(f"  [OK]     Extracted working whisper.cpp release to {dest_exe.parent}")
+    reporter.status(label, "Downloaded")
     return True
 
 
@@ -573,18 +616,20 @@ def download_all_models(models_dir: Path, reporter: Reporter) -> None:
     download_whisper_model(models_dir, reporter)
     download_whisper_vad(models_dir, reporter)
     download_emotion_model_files(models_dir, reporter)
-    download_whisper_cpp_cublas(models_dir, reporter)
+    download_whisper_cpp_build(models_dir, reporter)
 
 
 def find_whisper_cli(pog_dir: Path, reporter: Reporter) -> Path | None:
-    reporter.section("Checking for whisper.cpp (CUDA / cublas build)")
+    reporter.section("Checking for whisper.cpp (cublas on NVIDIA, OpenBLAS CPU otherwise)")
     for candidate in pog_dir.rglob("whisper-cli.exe"):
-        reporter.log(f"  {mark(True)} found: {candidate}")
-        reporter.status("whisper-cli.exe", "OK")
-        return candidate
-    reporter.log(f"  {mark(False)} whisper-cli.exe not found anywhere under {pog_dir}")
-    reporter.log("      -> download the CUDA/cublas build from the whisper.cpp GitHub")
-    reporter.log("         releases page, unzip it, and place the folder inside Pog_Engine.")
+        if _whisper_exe_runs(candidate):
+            reporter.log(f"  {mark(True)} found working: {candidate}")
+            reporter.status("whisper-cli.exe", "OK")
+            return candidate
+        reporter.log(f"  [SKIP]   found but does not start (dead build?): {candidate}")
+    reporter.log(f"  {mark(False)} no working whisper-cli.exe anywhere under {pog_dir}")
+    reporter.log("      -> re-run Start Setup to download the matching build (cublas for")
+    reporter.log("         NVIDIA, OpenBLAS CPU otherwise), or place one manually.")
     reporter.status("whisper-cli.exe", "Missing")
     return None
 
@@ -741,7 +786,7 @@ def patch_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None,
         if organize_py.is_file():
             patch_raw_string_constant(organize_py, "WHISPER_CLI", str(whisper_cli), False, reporter)
     else:
-        # Falls back to where download_whisper_cpp_cublas() extracts the exe
+        # Falls back to where download_whisper_cpp_build() extracts the exe
         # (models\Release\whisper-cli.exe) so the patched constant lands on a
         # path the installer can actually populate. Once you run Start Setup
         # again with the exe present, find_whisper_cli() locates it via rglob
@@ -892,7 +937,13 @@ def _install_rocm_torch_windows(reporter: Reporter) -> bool:
             return False
     for url in ROCM_WINDOWS_TORCH_WHEELS:
         reporter.log(f"    installing ROCm torch component: {Path(url).name}")
-        if not pip_install(reporter, "--no-cache-dir", url, upgrade=True, force=True):
+        # --no-deps: with --upgrade/--force-reinstall pip would otherwise
+        # resolve the wheels' `rocm==7.2.1` dependency from PyPI (which only
+        # hosts a 0.1.0 stub) and clobber the SDK installed just above -
+        # every install then silently fell back to CPU torch while reporting
+        # green (seen live on the 9070XT box). Transitive deps left missing
+        # here are picked up by the later demucs/package installs' resolver.
+        if not pip_install(reporter, "--no-cache-dir", "--no-deps", url, upgrade=True, force=True):
             reporter.log(f"    [WARN] ROCm torch install failed at {Path(url).name}.")
             return False
     final = torch_status()
@@ -1376,8 +1427,8 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
     if whisper_cli is not None:
         expected_whisper_cli = str(whisper_cli.resolve())
     else:
-        # Matches where download_whisper_cpp_cublas() actually extracts the
-        # exe (models\Release\whisper-cli.exe, see download_whisper_cpp_cublas
+        # Matches where download_whisper_cpp_build() actually extracts the
+        # exe (models\Release\whisper-cli.exe, see download_whisper_cpp_build
         # and check_models). The old guess pointed at a side folder named
         # "whisper cublas 12.4.0\Release\" - the installer never writes there,
         # so the constant could never match even after a successful download.

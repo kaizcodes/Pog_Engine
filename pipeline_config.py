@@ -187,6 +187,7 @@ TIMESTAMP_TOLERANCE_SECONDS = _env_int("HIGHLIGHT_TIMESTAMP_TOLERANCE_SECONDS", 
 # OrganizeVODAndFixSRT_Emotion.py picks between the two paths automatically
 # via count_audio_streams() (ffprobe) when a video is first dropped/organized.
 VOCAL_ISOLATION_MODEL = os.environ.get("VOCAL_ISOLATION_MODEL", "htdemucs")
+VOCAL_ISOLATION_DEVICE = os.environ.get("VOCAL_ISOLATION_DEVICE", "auto")
 # "auto" picks a GPU backend when torch has one (CUDA on NVIDIA, ROCm HIP on
 # AMD - ROCm torch exposes the same torch.cuda API, so "cuda" just works),
 # else CPU - see detect_device() in isolate_vocals.py. CPU works but is much
