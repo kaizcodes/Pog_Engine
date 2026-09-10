@@ -67,8 +67,9 @@ def step_subdir(stream_folder, step: int):
 
 # --- Ollama models ---------------------------------------------------------
 # JUDGE_MODEL is separate from MODEL: discovery just reads a transcript chunk
-# and proposes candidates; verify/judge/titling need more careful structured
-# reasoning over shorter, denser prompts.
+# and proposes candidates; verify/judge need more careful structured
+# reasoning over shorter, denser prompts. Audio-scan titling (short-title
+# writing, no comparative ranking) runs on MODEL, already resident.
 # qwen3.5:9b-q4_K_M (~6.6 GB) serves BOTH roles by default - it fits a
 # 10GB 3080 with 8192 context in either role, and the per-role tunings
 # below carry the entries for every other model (including qwen3:8b).
@@ -81,7 +82,7 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 # "/no_think" prompt tag. /api/generate ignores think:false for qwen3.5
 # (ollama/ollama#14793) and newer Ollama emits its reasoning into a separate
 # `thinking` field that counts against num_predict, leaving "response" empty.
-# Every JUDGE_MODEL call needing thinking OFF (titling, verify, judge) must
+# Every JUDGE_MODEL call needing thinking OFF (verify, judge) must
 # therefore use OLLAMA_CHAT_URL with top-level think:false - and since the
 # discovery default switched to qwen3.5:9b, the MODEL discovery calls do too.
 # See the call sites in analyze_highlights_emotion.py.
@@ -296,9 +297,9 @@ AUDIO_SCAN_SKIP_NEAR_EXISTING_SECONDS = _env_float("AUDIO_SCAN_SKIP_NEAR_EXISTIN
 AUDIO_SCAN_LOUDNESS_WEIGHT = _env_float("AUDIO_SCAN_LOUDNESS_WEIGHT", 0.6)
 AUDIO_SCAN_RATE_WEIGHT = _env_float("AUDIO_SCAN_RATE_WEIGHT", 0.4)
 AUDIO_SCAN_TITLE_BATCH_SIZE = _env_int("AUDIO_SCAN_TITLE_BATCH_SIZE", 10)
-# Raise if titles come back empty. Titling now calls JUDGE_MODEL via
-# OLLAMA_CHAT_URL with think:false, so this no longer needs to cover a hidden
-# reasoning trace - 1200 holds with margin.
+# Raise if titles come back empty. Titling calls MODEL via OLLAMA_CHAT_URL
+# with think:false (same path as discovery), so this no longer needs to cover
+# a hidden reasoning trace - 1200 holds with margin.
 AUDIO_SCAN_TITLE_NUM_PREDICT = _env_int("AUDIO_SCAN_TITLE_NUM_PREDICT", 1200)
 
 # --- Preview clips (optional, off by default) --------------------------------
@@ -346,10 +347,10 @@ EDITABLE_PARAMS = [
      "help": "Base URL for the managed llama-server. The pipeline starts/stops the server itself, so this is just the host:port it binds to (default http://localhost:8080). Only used when LLM_BACKEND is llamacpp."},
     {"key": "LLAMA_DISCOVERY_MODEL_PATH", "env": "LLAMA_DISCOVERY_MODEL_PATH", "kind": "text", "stage": "LLM backend",
      "label": "llama.cpp discovery GGUF (LLAMA_DISCOVERY_MODEL_PATH)",
-     "help": "GGUF for discovery passes. Falls back to LLAMA_MODEL_PATH if empty (single-GGUF mode). Pipeline starts the server with this before discovery, then restarts with the judge GGUF for verify/judge."},
+     "help": "GGUF for discovery passes and audio-scan titling. Falls back to LLAMA_MODEL_PATH if empty (single-GGUF mode). Pipeline starts the server with this before discovery, then restarts with the judge GGUF for verify/judge."},
     {"key": "LLAMA_JUDGE_MODEL_PATH", "env": "LLAMA_JUDGE_MODEL_PATH", "kind": "text", "stage": "LLM backend",
      "label": "llama.cpp judge GGUF (LLAMA_JUDGE_MODEL_PATH)",
-     "help": "GGUF for audioscan/verify/judge. Falls back to LLAMA_MODEL_PATH/discovery path if empty. Pipeline hot-swaps to this after the emotion stage to free VRAM."},
+     "help": "GGUF for verify/judge. Falls back to LLAMA_MODEL_PATH/discovery path if empty. Pipeline hot-swaps to this after the emotion stage to free VRAM."},
     {"key": "LLAMA_MODEL_PATH", "env": "LLAMA_MODEL_PATH", "kind": "text", "stage": "LLM backend",
      "label": "llama.cpp GGUF fallback (LLAMA_MODEL_PATH)",
      "help": "Legacy single-GGUF path. Used when per-role paths are empty. Kept for backward compat."},
@@ -372,18 +373,18 @@ EDITABLE_PARAMS = [
      "help": "Overlap between adjacent audio chunks so speech at boundaries is not lost. 10 seconds is the default."},
     # --- Models (per-step role assignment) ---
     {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
-     "label": "Discovery model (MODEL)",
-     "help": "Reads each transcript chunk and proposes highlight candidates. Long context, less careful reasoning."},
+     "label": "Discovery / audio-titling model (MODEL)",
+     "help": "Reads each transcript chunk and proposes highlight candidates, plus writes audio-scan clip titles. Long context, less careful reasoning."},
     {"key": "JUDGE_MODEL",      "env": "HIGHLIGHT_JUDGE_MODEL",      "kind": "model", "stage": "Models",
-     "label": "Judge / verify / titling model (JUDGE_MODEL)",
-     "help": "Verify, judge ranking, and audio-scan titling. Shorter prompts, careful structured output. Must support /api/chat with think:false (the qwen3.5 family does)."},
+     "label": "Judge / verify model (JUDGE_MODEL)",
+     "help": "Verify and judge ranking. Shorter prompts, careful structured output. Must support /api/chat with think:false (the qwen3.5 family does)."},
     # --- Ollama connection / generation budget ---
     {"key": "DISCOVERY_NUM_CTX", "env": "HIGHLIGHT_DISCOVERY_NUM_CTX", "kind": "int", "stage": "Ollama",
      "label": "Discovery context window (DISCOVERY_NUM_CTX, tokens)",
      "help": "Max prompt+output tokens for each full transcript discovery request. This is sent as API options.num_ctx; larger values preserve more transcript context but use more KV-cache VRAM."},
     {"key": "JUDGE_NUM_CTX",     "env": "HIGHLIGHT_JUDGE_NUM_CTX",     "kind": "int", "stage": "Ollama",
      "label": "Judge context window (JUDGE_NUM_CTX, tokens)",
-     "help": "Max prompt+output tokens for audio titling, verification, and final judging. Keep lower for qwen3.6:35b-a3b to reduce CPU/GPU memory pressure."},
+     "help": "Max prompt+output tokens for verification and final judging. Keep lower for qwen3.6:35b-a3b to reduce CPU/GPU memory pressure."},
     {"key": "DISCOVERY_NUM_PREDICT", "env": "HIGHLIGHT_DISCOVERY_NUM_PREDICT", "kind": "int", "stage": "Ollama",
      "label": "Discovery max output tokens (DISCOVERY_NUM_PREDICT)",
      "help": "Per discovery pass. If discovery keeps parsing 0 candidates while responses arrive, raise this - the model is running out of output budget before finishing its CSV rows."},

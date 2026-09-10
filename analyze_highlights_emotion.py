@@ -102,7 +102,7 @@ def _llama_resolve_model(role: str) -> str:
         if p2:
             return p2
         return ""
-    # judge / audioscan / verify
+    # judge / verify (audioscan titling runs on the discovery model)
     p = (LLAMA_JUDGE_MODEL_PATH or "").strip()
     if p:
         return p
@@ -1455,8 +1455,9 @@ def describe_audio_signal(loudness_z, rate_z):
 
 def title_audio_candidates(raw_candidates, all_blocks, stream_folder):
     """Generates a Title/Reason for each audio-scan peak, batched through
-    JUDGE_MODEL. When nearby transcript text exists it's given as grounding
-    context (same as the discovery passes); when it doesn't, the model is
+    MODEL (the discovery model - short-title writing needs no judge reasoning).
+    When nearby transcript text exists it's given as grounding context (same
+    as the discovery passes); when it doesn't, the model is
     explicitly told to describe the audio signal itself rather than invent
     dialogue, so the Reason stays honest for the later verification pass.
 
@@ -1506,13 +1507,13 @@ STRICT OUTPUT FORMAT:
         # /api/chat + think:false, per the qwen3.5 note on OLLAMA_CHAT_URL in
         # pipeline_config.py.
         payload = {
-            "model": JUDGE_MODEL,
+            "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "think": False,
             "stream": False,
             "options": {
                 "temperature": 0,
-                "num_ctx": JUDGE_NUM_CTX,
+                "num_ctx": DISCOVERY_NUM_CTX,
                 "num_predict": AUDIO_SCAN_TITLE_NUM_PREDICT,
             },
         }
@@ -1534,6 +1535,14 @@ STRICT OUTPUT FORMAT:
                 pieces = next(reader)
             except Exception:
                 continue
+            if len(pieces) == 4:
+                # Prompt numbers items ("1. Signal: ...") AND asks for an
+                # ItemNumber field, so the model echoes the index twice:
+                # 1,1,"Title","Reason". Drop the duplicate index.
+                first_match = re.search(r"\d+", pieces[0])
+                second_match = re.search(r"\d+", pieces[1])
+                if first_match and second_match:
+                    pieces = [pieces[0], pieces[2], pieces[3]]
             if len(pieces) != 3:
                 continue
             idx_text, title, reason = pieces
@@ -1785,7 +1794,7 @@ def run_discovery(stream_folder, parts, prompts):
                 added = 0
                 rejected_hallucinated = 0
                 rejected_malformed = 0
-
+                no_moments_reported = 0
                 for line in result.splitlines():
                     line = line.strip()
 
@@ -1793,6 +1802,13 @@ def run_discovery(stream_folder, parts, prompts):
                         continue
 
                     if line.lower().startswith("timestamp"):
+                        continue
+
+                    # Honest empty: the model reports the part holds no moments
+                    # (quiet stretch, music, lag complaints). Count separately
+                    # from malformed CSV so the log doesn't cry wolf.
+                    if re.search(r"no\s+moments?\s+found", line, re.IGNORECASE):
+                        no_moments_reported += 1
                         continue
 
                     # Use a CSV reader so quoted fields containing commas
@@ -1868,11 +1884,17 @@ def run_discovery(stream_folder, parts, prompts):
                 if rejected_malformed > 0:
                     print(f"     [!] Skipped {rejected_malformed} malformed lines")
 
+                if no_moments_reported > 0:
+                    print(f"     [i] Model reports no moments in {no_moments_reported} line(s) - quiet part, not a parse failure")
+
                 if added == 0:
                     debug_path = os.path.join(step_subdir(stream_folder, 5), f"debug_{part_path.stem}_{pass_name}.txt")
                     with open(debug_path, "w", encoding="utf-8") as dbg:
                         dbg.write(result)
-                    print(f"     [!] 0 candidates parsed - raw response saved to {debug_path}")
+                    if no_moments_reported > 0 and rejected_malformed == 0 and rejected_hallucinated == 0:
+                        print(f"     [i] 0 candidates - model reports no moments, raw response saved to {debug_path}")
+                    else:
+                        print(f"     [!] 0 candidates parsed - raw response saved to {debug_path}")
 
                 print()
 
@@ -2710,14 +2732,12 @@ def run_stage_audioscan(stream_folder):
         stage_start = time.time()
 
         if LLM_BACKEND == "llamacpp":
-            if not _ensure_llama_server_for_role("judge", stage):
+            if not _ensure_llama_server_for_role("discovery", stage):
                 sys.exit(1)
         else:
-            # Titling is this stage's only model use; ensure its (possibly cold) load is visible.
-            # Unload discovery MODEL first when it differs from JUDGE_MODEL - 14b+35b cannot co-reside on 10GB VRAM (2026-09-04 OOM).
-            if MODEL.strip() != JUDGE_MODEL.strip():
-                unload_ollama_model(MODEL, stage)
-            ensure_ollama_model_ready(JUDGE_MODEL, OLLAMA_CHAT_URL, stage)
+            # Titling runs on MODEL, already resident from discovery in a full
+            # run; ensure its load is visible on forced --stage reruns.
+            ensure_ollama_model_ready(MODEL, OLLAMA_CHAT_URL, stage)
         highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["discovery"], stage)
         transcript_blocks_by_part = build_transcript_blocks_by_part(stream_folder)
 
@@ -2735,7 +2755,7 @@ def run_stage_audioscan(stream_folder):
             print(
                 f"[audio-scan] Found {candidates_kept} candidate(s) worth titling, but the "
                 f"titling pass returned 0 usable titles for every single one - this looks "
-                f"like a broken or truncated {JUDGE_MODEL} response, not a stream with "
+                f"like a broken or truncated {MODEL} response, not a stream with "
                 f"nothing worth titling. Check any debug_audioscan_titles_batch_*.txt just "
                 f"written to this folder."
             )
@@ -2988,7 +3008,7 @@ def main():
     # so just check that the GGUF paths exist rather than requiring /health.
     if args.stage != "export":
         if LLM_BACKEND == "llamacpp":
-            roles = ["discovery", "judge"] if args.stage is None else (["discovery"] if args.stage == "discovery" else ["judge"])
+            roles = ["discovery", "judge"] if args.stage is None else (["discovery"] if args.stage in ("discovery", "audioscan") else ["judge"])
             missing = []
             for role in roles:
                 needed = _llama_resolve_model(role)

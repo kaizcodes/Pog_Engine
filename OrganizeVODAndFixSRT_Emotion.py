@@ -1149,7 +1149,7 @@ ANALYSIS_STAGE_DETAILS = {
     },
     "5b. Audio Scan": {
         "task": "Audio Scan: model-free energy analysis",
-        "model": f"Title model when needed: {JUDGE_MODEL}",
+        "model": f"Title model when needed: {MODEL}",
         "next": "Next: Emotion Scoring — load speech-emotion model",
     },
     "5c. Emotion Scoring": {
@@ -3336,7 +3336,7 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 state["model"] = f"Model: {EMOTION_MODEL_ID}" if EMOTION_ENABLED else "Model: disabled by configuration"
             elif "full-file audio scan" in lowered:
                 state["task"] = "Running mini-process: Audio Scan"
-                state["model"] = f"Title model when needed: {JUDGE_MODEL}"
+                state["model"] = f"Title model when needed: {MODEL}"
             elif "verifying " in lowered:
                 state["task"] = "Running mini-process: Verification"
                 state["model"] = f"Model: {JUDGE_MODEL}"
