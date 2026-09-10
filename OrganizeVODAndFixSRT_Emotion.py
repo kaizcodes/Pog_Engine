@@ -2054,13 +2054,18 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
     # Glow = pre-rendered Gaussian-blur RGBA sprites, cross-faded through the
     # intensity tables below. Tk canvas has no per-item alpha, so blurred
     # PhotoImage sprites are the only clean way to do this; they build one per
-    # event-loop tick so the UI never freezes. Intensity is per state: done
-    # and lit cells breathe gently, the in-progress cell throbs hard and
-    # shifts green-to-green, failed throbs red.
+    # event-loop tick so the UI never freezes. Intensity is per state (16
+    # smooth cosine steps each, one full breath per cycle): done and lit cells
+    # breathe gently, the in-progress cell throbs hard and shifts
+    # green-to-green, failed throbs red. All three tables share one length so
+    # the single glow_clock phase drives every lookup directly.
     GLOW_MARGIN = 44
-    GLOW_PHASES_DEFAULT = (0.8, 0.95, 1.0, 0.95)
-    GLOW_PHASES_RUNNING = (0.3, 0.7, 1.0, 0.7)
-    GLOW_PHASES_FAILED = (0.35, 0.75, 1.0, 0.75)
+    GLOW_PHASES_DEFAULT = (0.800, 0.808, 0.829, 0.862, 0.900, 0.938, 0.971, 0.992, 1.000, 0.992, 0.971, 0.938, 0.900, 0.862, 0.829, 0.808)
+    # RUNNING is deliberately asymmetric (fast rise, slower fall): a mirrored
+    # breath would repeat the same colors downhill, but this way all 16 phases
+    # are distinct fills gliding Progress Green to Neon Green and back.
+    GLOW_PHASES_RUNNING = (0.300, 0.338, 0.424, 0.544, 0.680, 0.812, 0.919, 0.985, 1.000, 0.962, 0.876, 0.756, 0.620, 0.488, 0.381, 0.315)
+    GLOW_PHASES_FAILED = (0.350, 0.375, 0.445, 0.551, 0.675, 0.799, 0.905, 0.975, 1.000, 0.975, 0.905, 0.799, 0.675, 0.551, 0.445, 0.375)
     glow_sprite_cache: dict[tuple, tuple] = {}
     glow_build_queue: list[tuple] = []
     glow_builder_scheduled = {"value": False}
@@ -2481,9 +2486,10 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 local = [(wr, 0), (wr, cap), (0, hr), (0, hr - cap)]
         else:
             local = [(0, 0), (wr, 0), (wr, hr), (0, hr)]
-        factor = {"run": GLOW_PHASES_RUNNING, "fail": GLOW_PHASES_FAILED}.get(
+        table = {"run": GLOW_PHASES_RUNNING, "fail": GLOW_PHASES_FAILED}.get(
             state_tag, GLOW_PHASES_DEFAULT
-        )[phase % 4]
+        )
+        factor = table[phase % len(table)]
         photos = []
         # three stacked layers: wide bloom + dense mid + hot white-tinted core
         # rim; the low gammas pack the falloff dense so the ring reads bright
@@ -2505,9 +2511,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 _apply_glow(glow_key)
 
     def _running_fill() -> str:
-        """The in-progress cell's fill: cycling from Progress Green to Neon
-        Green and back on the pulse clock (settles on Neon when it finishes)."""
-        factor = GLOW_PHASES_RUNNING[glow_clock["phase"] % 4]
+        """The in-progress cell's fill: gliding Progress Green to Neon Green
+        and back over the 16-step pulse table (settles on Neon when done)."""
+        factor = GLOW_PHASES_RUNNING[glow_clock["phase"] % len(GLOW_PHASES_RUNNING)]
         t = max(0.0, min(1.0, (factor - 0.3) / 0.7))
         return _blend_hex(GUI_PROGRESS_GREEN, GUI_NEON_GREEN, t)
 
@@ -2549,9 +2555,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 )
             )
             if is_running:
-                factor = GLOW_PHASES_RUNNING[glow_clock["phase"] % 4]
+                factor = GLOW_PHASES_RUNNING[glow_clock["phase"] % len(GLOW_PHASES_RUNNING)]
                 t = max(0.0, min(1.0, (factor - 0.3) / 0.7))
-                return _blend_hex(GUI_PROGRESS_GREEN, GUI_NEON_GREEN, round(t * 4) / 4)
+                return _blend_hex(GUI_PROGRESS_GREEN, GUI_NEON_GREEN, t)
         return _cell_fill_color(key)
 
     def _apply_glow(key: str) -> None:
@@ -2653,7 +2659,9 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                     map_canvas.itemconfigure(item_id, fill=_cell_fill_color(fill_key))
                 except tk.TclError:
                     pass
-        root.after(480, glow_tick)
+        # 120 ms x 16 phases: same ~1.9 s breath as the old 480 ms x 4 clock,
+        # now gliding through 16 distinct fill colors instead of ~2.
+        root.after(120, glow_tick)
 
     def start_glow() -> None:
         if glow_clock["running"]:
