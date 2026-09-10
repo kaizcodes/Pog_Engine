@@ -1382,12 +1382,26 @@ def check_ollama(pog_dir: Path, reporter: Reporter) -> bool:
     else:
         try:
             listing = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=15)
-            pulled_text = listing.stdout
+            # Parse `ollama list` first-column names (skip the NAME header) and
+            # compare case-insensitively: Ollama tags differ only by case
+            # (qwen3.5:9b-q4_k_m vs qwen3.5:9b-q4_K_M) for the same model.
+            pulled: set[str] = set()
+            for line in (listing.stdout or "").splitlines()[1:]:
+                token = line.strip().split()[0] if line.strip() else ""
+                if token:
+                    pulled.add(token.lower())
             # dedupe: both roles default to the same model, so check it once
             unique_names = list(dict.fromkeys(n for n in (model_name, judge_model_name) if n))
             for name in unique_names:
                 reporter.add_row("ollama", name, f"model: {name}")
-                got = name in pulled_text
+                wanted = str(name).strip().lower()
+                got = wanted in pulled
+                # Ollama defaults a missing tag to :latest (`pull qwen3:8b`
+                # lists as qwen3:8b:latest); match both directions.
+                if not got and not wanted.endswith(":latest"):
+                    got = wanted + ":latest" in pulled
+                if not got and wanted.endswith(":latest"):
+                    got = wanted[: -len(":latest")] in pulled
                 reporter.log(f"  {mark(got)} model pulled: {name}")
                 reporter.status(name, "OK" if got else "Missing")
                 if not got:
