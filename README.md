@@ -91,8 +91,16 @@ Launch **ConfigurePogEngine.bat**
 You can change the presets model I have written to use on my own machine and I know will work on machines with similar spec.
 
 ## Updating Pog Engine:
-When there is a new Pog Engine update, you should grab it from Releases and replace all the files in your folder with the files in the ZIP.
-This will unfortunately override your preset if you have adjusted it.
+Run **Update_PogEngine.bat** in your Pog Engine folder. It checks the latest
+GitHub release, and if yours is older it downloads the release ZIP and
+replaces **only the code files that actually changed** (compared by hash).
+Your models, VOD folders, gallery, and run histories are never touched, and
+your ConfigurePogEngine tunings plus your machine's paths (whisper/model
+folders) are carried into the new files automatically. Replaced originals are
+kept in `update_backup_<release>_<date>/` so you can undo by copying them back.
+Useful flags: `Update_PogEngine.bat --check-only` (just show versions),
+`--ref v2.0.1` (update to a specific release), `--yes` (skip the confirm
+prompt), `--force` (re-apply even when versions match).
 
 ## Companion tools (COMING SOON): 
 These are scripts that I wrote to speed up your editing process, you can buy the full pack here:
@@ -133,7 +141,7 @@ Discovery: qwen3:14b-q4_K_M / qwen3.5:9b-q4_K_M
 
 ## Tech Stack
 
-- Python 3.11
+- Python 3.12
 - Ollama
 - Whisper.cpp
 - FFmpeg

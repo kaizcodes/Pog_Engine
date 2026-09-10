@@ -45,6 +45,15 @@ def _env_list(name, default):
     return unique
 
 
+# --- Release version -----------------------------------------------------------
+# Single source of truth for the installed version. pog_engine_update.py reads
+# this literal (via regex, never import) and compares it to the latest GitHub
+# release tag. Bump on every release; release tags are "v" + this value
+# (e.g. v2.0.0). Keep OUT of EDITABLE_PARAMS so the config GUI never rewrites
+# it and user's tunings never collide with it.
+POG_ENGINE_VERSION = "2.0.0"
+
+
 # --- Per-step VOD folder layout ----------------------------------------------
 # The RunAll GUI organizes each step's artifacts into its own subfolder so the
 # VOD folder stays readable: the runner bat, the big run log, and the two
