@@ -24,7 +24,7 @@ Built around an RTX 3080 (10GB VRAM). If you have more VRAM you can try using la
 
 IF YOU ARE USING AMD GPU:
 - 8GB+ VRAM
-- ROCm compatible [list](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html)
+- **ROCm compatible, [list of cards that has ROCm support](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html)**
 - You will be very slow during step 1 and 2 because they will be running on CPU, I can't find a workaround.
 - AMD SUPPORT WILL BE LIMITED BECAUSE I DON'T OWN AN AMD GPU.
 
