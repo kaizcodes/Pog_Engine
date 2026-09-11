@@ -18,11 +18,9 @@ Built by solo content creator, for solo content creators & editors.
 - CUDA 12.4 compatible
 - Ollama capable of running:
   - `qwen3.5:9b-q4_K_M`
- >`qwen3.6:35b-a3b` 
-  >*OPTIONAL, This model is a lot smarter and slower than qwen3.5 but will require some RAM overflow if you have a 10gb card like me, will be mainly used to judge what qwen3.5:9b finds to go viral
+  - More models in testing below, qwen3.5:9b should suffice on most machines.
 
-
-Built around an RTX 3080 (10GB VRAM). Larger models may work better on GPUs with more VRAM. Qwen performed best in my testing.
+Built around an RTX 3080 (10GB VRAM). If you have more VRAM you can try using larger and smarter models.
 
 ## OBS Setup Requirement FOR LOCAL RECORDED VOD
 
@@ -44,9 +42,6 @@ After finish installing Ollama, LOGIN NOT REQUIRED.
 Open Command Prompt and type
 
 Download qwen3.5:9b-q4_K_M : ```ollama run qwen3.5:9b-q4_K_M```
-
->Download qwen3.6:35b-a3b (OPTIONAL)```ollama run qwen3.6:35b-a3b```
-
 
 ## 2. Setting up Pog_Engine
 Get PogEngine.zip here
@@ -83,6 +78,7 @@ highlights.edl (your highlight markers)
 
 You are welcomed to use any marker conversion tool to convert Davinci Resolve markers to use in other programs.
 
+
 ## Configure Pog Engine (ADVANCED USER ONLY)
 I made the default settings for Pog Engine to work on all machines, this configurator tool is more for advanced power users who want to tweak their parameters.
 
@@ -90,7 +86,12 @@ Launch **ConfigurePogEngine.bat**
 
 You can change the presets model I have written to use on my own machine and I know will work on machines with similar spec.
 
+You can adjust whisper parameters if you know the parameters works for you specifically.
+
 ## Updating Pog Engine:
+
+If you are on v.1, please remove everything inside of your current install of Pog Engine.
+
 Run **Update_PogEngine.bat** in your Pog Engine folder. It checks the latest
 GitHub release, and if yours is older it downloads the release ZIP and
 replaces **only the code files that actually changed** (compared by hash).
@@ -108,35 +109,35 @@ These are scripts that I wrote to speed up your editing process, you can buy the
 1-Click Import 
 >Import needed files and create a a folder with your VOD.mp4, VOD.srt (transcription), highlights_markers.edl, and automatically populate a timeline with needed items (transcription need to be imported manually)
 
+Send Markers from Timeline to Clip
+>Send marker from timeline to clip so when you move the clip to another timeline to edit, the marker follows.
+
 Marker Tracker
->View your markers in order and categories
+>Instead of using Index, you can move this window around to view your markers in order and categories
 
 Subtitle to Marker 
 >Turn keywords in transcription into markers to find words you say a lot during hype moments like "nice!", this feature is already included in Pog Engine, this script is here just in case the AI misjudged your hype moment so you can manually find these moments yourself.
 
-Send Markers from Timeline to Clip
->Send marker from timeline to clip so when you move the clip to another timeline to edit, the marker follows.
 
 ## Known Issues:
-Please report any issues to the issues tab.
+Please report any issues to the [issues tab](https://github.com/kaizcodes/Pog_Engine/issues).
 
 - Step 5 is unbearably slow.
 > Open Task Manager and see if your **GPU** is 100% usage, if it says CPU then you need to reinstall Ollama
 
-## ROADMAP:
-1. Auto clips extraction, cut the middle man and get the clips immediately to use
-
 ## If you wish to support me
-You could buy me a coffee here: https://ko-fi.com/kaizuchaneru
+You can buy me a coffee here: https://ko-fi.com/kaizuchaneru
+or check out my Twitch: https://www.twitch.tv/kaizuchaneru
 
-The money will be put into development and maintaining this project.
+The money will be put into development and maintaining this project and any spare change will be donated to local orphanages.
 
 ## TESTING OTHER MODELS:
+
 You can just change them in the configurator if you have it installed via Ollama
 
 Currently in testing:
 
-Discovery: qwen3:14b-q4_K_M / qwen3.5:9b-q4_K_M
+qwen3.6:35b-a3b-iq4 for judging, this model is a lot smarter and better than qwen3.5:9b but the problem is, it's slow, it needs 18gb vram, i only have 10, so 8 of it has to be offloaded to RAM and CPU.
 
 
 ## Tech Stack
