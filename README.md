@@ -17,7 +17,7 @@ Built by solo content creator, for solo content creators & editors.
 - NVIDIA GPU (8GB+ VRAM, 10GB recommended)
 - CUDA 12.4 compatible
 - Ollama capable of running:
-  - `qwen3.5:9b-q4_K_M`
+  - `qwen3.5:9b-q4_K_M` (6.6GB, should fit on 8gb cards with headroom for context)
   - More models in testing below, qwen3.5:9b should suffice on most machines.
 
 Built around an RTX 3080 (10GB VRAM). If you have more VRAM you can try using larger and smarter models.
@@ -149,8 +149,16 @@ qwen3.6:35b-a3b-iq4 for judging, this model is a lot smarter and better than qwe
 - PyTorch
 - DaVinci Resolve
 
-## Special Thanks to Gootecks the inspiration behind the project
+## Special Thanks to Gootecks the inspiration behind the project:
 
 <img width="656" height="180" alt="image" src="https://github.com/user-attachments/assets/0e03bcc3-31a0-4f13-be90-3da26305eeac" />
 
 I met him at an event before COVID, genuinely a cool guy.
+
+## Pog Engine history:
+
+I remember hearing that 99% of streamers quit because they can't put out content on other platforms to grow their audience so they get stuck streaming to 1 viewer and burn out. I, myself, fell into this trap multiple times. Laziness or the willingness to watch over 5-6 hours of my own VOD is just too time consuming, even at 2x speed. It's just impossible to grow unless you have a lot of free time or spend money on someone who can scrub the VOD and edit it for you. So I built tools that help me cut down time spent scrubbing.
+
+Pog Engine started as a caption finder, I used another tool to transcribe my content then a script would look through the transcription to find where I say things like "clip that" or "that's crazy" and it would mark it down for me in Davinci Resolve. This script is still available as "Subtitle to Marker".
+
+Online AI models were too expensive and a 5 hour transcript would eat up all the quota before it can even give you something useful. Then local AI models became free and usable on consumer machines. I had the idea to point AIs to read my transcription to find if what I said during the stream could go viral. After a year of sleepless nights, dogfooding, trials and errors until I've finally arrived at Pog Engine today.
