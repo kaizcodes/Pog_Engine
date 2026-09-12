@@ -144,8 +144,22 @@ LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
 # Long uninterrupted Whisper runs can enter a repeated-text decoding loop.
 # Independent chunks reset the decoder context; overlap protects words at
 # chunk boundaries. Both values remain environment-overridable for tuning.
+# When a finished chunk SRT is dominated by one repeated caption (a decoder
+# loop, not real speech), Step 2 subdivides that span and re-transcribes the
+# halves with fresh decoder contexts instead of stitching the loop through.
+# Subdivision stops at TRANSCRIPTION_RETRY_MIN_MINUTES and the run caps extra
+# Whisper invocations at TRANSCRIPTION_RETRY_BUDGET_FACTOR times the chunk
+# count, so a pathological VOD burns bounded GPU and records the surviving
+# suspect spans in transcription_warnings.json instead of hanging the run.
+# Empty chunk SRTs over near-silent audio (a muted mic) are accepted as-is;
+# only empty output over live audio re-enters the retry path.
 TRANSCRIPTION_CHUNK_MINUTES = _env_int("TRANSCRIPTION_CHUNK_MINUTES", 30)
 TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", 10)
+TRANSCRIPTION_LOOP_MIN_REPEATS = _env_int("TRANSCRIPTION_LOOP_MIN_REPEATS", 10)
+TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS = _env_int("TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS", 180)
+TRANSCRIPTION_RETRY_MIN_MINUTES = _env_int("TRANSCRIPTION_RETRY_MIN_MINUTES", 5)
+TRANSCRIPTION_RETRY_BUDGET_FACTOR = _env_float("TRANSCRIPTION_RETRY_BUDGET_FACTOR", 1.0)
+TRANSCRIPTION_SILENCE_RMS = _env_float("TRANSCRIPTION_SILENCE_RMS", 0.002)
 
 # --- Pipeline behavior -------------------------------------------------------
 # The RunAll GUI can optionally suspend Windows after every pipeline step
@@ -381,6 +395,21 @@ EDITABLE_PARAMS = [
     {"key": "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", "env": "TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", "kind": "int", "stage": "Transcription",
      "label": "Whisper chunk overlap (seconds)",
      "help": "Overlap between adjacent audio chunks so speech at boundaries is not lost. 10 seconds is the default."},
+    {"key": "TRANSCRIPTION_LOOP_MIN_REPEATS", "env": "TRANSCRIPTION_LOOP_MIN_REPEATS", "kind": "int", "stage": "Transcription",
+     "label": "Loop detection min repeats (TRANSCRIPTION_LOOP_MIN_REPEATS)",
+     "help": "A chunk SRT flags as a decoder loop when this many consecutive identical captions span the min span below."},
+    {"key": "TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS", "env": "TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS", "kind": "int", "stage": "Transcription",
+     "label": "Loop detection min span seconds (TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS)",
+     "help": "Short repeated choruses stay below this; a real decoder loop runs for minutes."},
+    {"key": "TRANSCRIPTION_RETRY_MIN_MINUTES", "env": "TRANSCRIPTION_RETRY_MIN_MINUTES", "kind": "int", "stage": "Transcription",
+     "label": "Retry subdivision floor minutes (TRANSCRIPTION_RETRY_MIN_MINUTES)",
+     "help": "Looped spans split in halves down to this window size, then the best effort is accepted and flagged."},
+    {"key": "TRANSCRIPTION_RETRY_BUDGET_FACTOR", "env": "TRANSCRIPTION_RETRY_BUDGET_FACTOR", "kind": "float", "stage": "Transcription",
+     "label": "Retry extra-run budget factor (TRANSCRIPTION_RETRY_BUDGET_FACTOR)",
+     "help": "Caps extra Whisper invocations at this times the chunk count so a pathological VOD burns bounded GPU."},
+    {"key": "TRANSCRIPTION_SILENCE_RMS", "env": "TRANSCRIPTION_SILENCE_RMS", "kind": "float", "stage": "Transcription",
+     "label": "Silence RMS threshold (TRANSCRIPTION_SILENCE_RMS)",
+     "help": "Empty chunk output under this audio RMS is a muted mic (accepted); empty output over louder audio is retried."},
     # --- Models (per-step role assignment) ---
     {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
      "label": "Discovery / audio-titling model (MODEL)",

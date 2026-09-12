@@ -40,6 +40,11 @@ from pipeline_config import (
     STEP_HISTORY_FILENAME,
     TRANSCRIPTION_CHUNK_MINUTES,
     TRANSCRIPTION_CHUNK_OVERLAP_SECONDS,
+    TRANSCRIPTION_LOOP_MIN_REPEATS,
+    TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
+    TRANSCRIPTION_RETRY_BUDGET_FACTOR,
+    TRANSCRIPTION_RETRY_MIN_MINUTES,
+    TRANSCRIPTION_SILENCE_RMS,
     VOCAL_ISOLATION_MODEL,
     ollama_base_url,
     ollama_is_reachable,
@@ -485,6 +490,433 @@ def _load_prepared_audio_chunks(audio_path: Path) -> tuple[list[Path], list[int]
         chunk_paths.append(chunk_path)
         offsets_ms.append(offset_ms)
     return chunk_paths, offsets_ms
+def _count_transcription_blocks(chunk_srt_path: Path) -> int:
+    """Caption block count of a chunk SRT; zero when missing or unparseable."""
+    try:
+        content = read_text(chunk_srt_path)
+    except OSError:
+        return 0
+    return len(split_srt_blocks(content))
+
+
+def detect_transcription_loop(
+    chunk_srt_path: Path,
+) -> tuple[int, int, int, str] | None:
+    """Find a decoder repeat loop: longest run of consecutive identical captions.
+
+    Returns (onset_ms, run_length, span_ms, text) in the chunk-local clock when
+    the run reaches TRANSCRIPTION_LOOP_MIN_REPEATS captions spanning at least
+    TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS, else None. Runs at chunk edges below
+    the thresholds (overlap duplicates, short choruses) do not flag.
+    """
+    try:
+        content = read_text(chunk_srt_path)
+    except OSError:
+        return None
+    best: tuple[int, int, int, str] | None = None
+    current_key: str | None = None
+    current_start = 0
+    current_end = 0
+    current_length = 0
+    current_text = ""
+
+    def consider() -> None:
+        nonlocal best
+        if current_key is None or current_length <= 0:
+            return
+        span_ms = current_end - current_start
+        if best is None or (current_length, span_ms) > (best[1], best[2]):
+            best = (current_start, current_length, span_ms, current_text)
+
+    for block in split_srt_blocks(content):
+        lines = re.split(r"\r?\n", block)
+        if len(lines) < 3 or "-->" not in lines[1]:
+            continue
+        try:
+            start_text, end_text = [part.strip() for part in lines[1].split("-->", 1)]
+            start_ms = parse_srt_time(start_text)
+            end_ms = parse_srt_time(end_text)
+        except ValueError:
+            continue
+        if end_ms <= start_ms:
+            continue
+        text = normalize_caption_text(lines[2:])
+        key = normalize_repeated_sentence_key(text)
+        if not key:
+            continue
+        if key == current_key:
+            current_length += 1
+            current_end = end_ms
+        else:
+            consider()
+            current_key = key
+            current_start = start_ms
+            current_end = end_ms
+            current_length = 1
+            current_text = text
+    consider()
+    if (
+        best is not None
+        and best[1] >= TRANSCRIPTION_LOOP_MIN_REPEATS
+        and best[2] >= TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS * 1_000
+    ):
+        return best
+    return None
+
+
+def transcription_chunk_max_rms(chunk_audio_path: Path) -> float | None:
+    """Peak 30 s-block RMS (0..1) of a PCM WAV chunk; None when unreadable."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        import wave
+        peak = 0.0
+        with wave.open(str(chunk_audio_path), "rb") as wav:
+            if wav.getsampwidth() != 2:
+                return None
+            block_frames = max(1, wav.getframerate() * 30)
+            while True:
+                raw = wav.readframes(block_frames)
+                if not raw:
+                    break
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if samples.size:
+                    peak = max(peak, float((samples**2).mean() ** 0.5))
+        return peak
+    except (OSError, EOFError):
+        return None
+
+
+def _chunk_retries_path(chunk_dir: Path) -> Path:
+    return chunk_dir / "chunk_retries.json"
+
+
+def _transcription_warnings_path(chunk_dir: Path) -> Path:
+    return chunk_dir / "transcription_warnings.json"
+
+
+def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
+    """Retry verdicts are only valid for the chunk layout that produced them."""
+    return {
+        "source_audio": manifest.get("source_audio"),
+        "duration_ms": manifest.get("duration_ms"),
+        "chunk_minutes": manifest.get("chunk_minutes"),
+        "overlap_seconds": manifest.get("overlap_seconds"),
+        "loop_min_repeats": TRANSCRIPTION_LOOP_MIN_REPEATS,
+        "loop_min_span_seconds": TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
+        "retry_min_minutes": TRANSCRIPTION_RETRY_MIN_MINUTES,
+        "retry_budget_factor": TRANSCRIPTION_RETRY_BUDGET_FACTOR,
+        "silence_rms": TRANSCRIPTION_SILENCE_RMS,
+    }
+
+
+def _load_retry_state(
+    chunk_dir: Path, manifest: dict[str, object]
+) -> dict[str, dict[str, object]]:
+    try:
+        state = json.loads(_chunk_retries_path(chunk_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(state, dict) or state.get("fingerprint") != _retry_state_fingerprint(manifest):
+        return {}
+    retries = state.get("retries")
+    return retries if isinstance(retries, dict) else {}
+
+
+def _save_retry_state(
+    chunk_dir: Path, manifest: dict[str, object], retries: dict[str, dict[str, object]]
+) -> None:
+    temporary_path = _chunk_retries_path(chunk_dir).with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps({"fingerprint": _retry_state_fingerprint(manifest), "retries": retries}, indent=2),
+        encoding="utf-8",
+    )
+    temporary_path.replace(_chunk_retries_path(chunk_dir))
+
+
+def _read_retry_manifest(chunk_dir: Path) -> dict[str, object]:
+    """Manifest dict for retry fingerprinting; empty when unreadable."""
+    try:
+        manifest = json.loads(_chunk_manifest_path(chunk_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def _retry_min_span_ms() -> int:
+    return max(1, TRANSCRIPTION_RETRY_MIN_MINUTES) * 60 * 1_000
+
+
+def _can_subdivide_span(start_ms: int, end_ms: int) -> bool:
+    """A span splits only when both halves stay above the retry floor."""
+    if end_ms - start_ms < 2 * _retry_min_span_ms():
+        return False
+    return (start_ms + end_ms) // 2 not in (start_ms, end_ms)
+
+
+def _extract_retry_subchunk(
+    audio_path: Path, start_ms: int, end_ms: int, dest_path: Path
+) -> None:
+    """Slice a retry sub-window from the full mic audio (ffmpeg, reuse if kept)."""
+    if dest_path.is_file() and dest_path.stat().st_size > 0:
+        return
+    start_seconds = start_ms / 1_000
+    duration_seconds = (end_ms - start_ms) / 1_000
+    ffmpeg_result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-ss", f"{start_seconds:.3f}",
+            "-i", str(audio_path),
+            "-t", f"{duration_seconds:.3f}",
+            "-map", "0:a:0",
+            "-c:a", "pcm_s16le",
+            str(dest_path),
+        ]
+    )
+    if (
+        ffmpeg_result.returncode != 0
+        or not dest_path.is_file()
+        or dest_path.stat().st_size <= 0
+    ):
+        raise RuntimeError(f"ffmpeg failed to create retry sub-chunk {dest_path.name}.")
+
+
+def _resolve_retry_span(
+    audio_path: Path,
+    chunk_dir: Path,
+    name_prefix: str,
+    span_start_ms: int,
+    span_end_ms: int,
+    depth: int,
+    extra_budget: list[int],
+    duration_ms: int,
+    chunk_label: str,
+    warnings: list[dict[str, object]],
+) -> list[tuple[Path, int]]:
+    """Transcribe a span as overlapped halves, recursing into looped pieces.
+
+    Returns (srt_path, offset_ms) pairs replacing the failed span. extra_budget
+    caps Whisper invocations across the whole run; exhausted or below-floor
+    spans are accepted as-is and recorded in warnings instead of retried.
+    """
+    overlap_ms = TRANSCRIPTION_CHUNK_OVERLAP_SECONDS * 1_000
+    middle_ms = (span_start_ms + span_end_ms) // 2
+    halves = [
+        (span_start_ms, min(middle_ms + overlap_ms, duration_ms), f"R{depth}a"),
+        (max(middle_ms - overlap_ms, 0), span_end_ms, f"R{depth}b"),
+    ]
+    resolved: list[tuple[Path, int]] = []
+    for sub_start_ms, sub_end_ms, suffix in halves:
+        sub_stem = f"{name_prefix}{suffix}"
+        sub_wav_path = chunk_dir / f"{sub_stem}.wav"
+        sub_srt_path = chunk_dir / f"{sub_stem}.srt"
+        _extract_retry_subchunk(audio_path, sub_start_ms, sub_end_ms, sub_wav_path)
+        if not (sub_srt_path.is_file() and sub_srt_path.stat().st_size > 0):
+            if extra_budget[0] <= 0:
+                warnings.append({
+                    "chunk": chunk_label,
+                    "kind": "budget-exhausted",
+                    "detail": f"{sub_stem}: retry budget spent; span left untranscribed.",
+                })
+                print(f"[RETRY] {sub_stem}: budget exhausted, leaving span hole and moving on.", flush=True)
+                continue
+            print(
+                f"Running Whisper for chunk {chunk_label} retry sub-chunk "
+                f"(depth {depth}): {sub_wav_path.name}",
+                flush=True,
+            )
+            _transcribe_audio_chunk(sub_wav_path, sub_srt_path)
+            extra_budget[0] -= 1
+        block_count = _count_transcription_blocks(sub_srt_path)
+        if block_count == 0:
+            peak_rms = transcription_chunk_max_rms(sub_wav_path)
+            if peak_rms is not None and peak_rms < TRANSCRIPTION_SILENCE_RMS:
+                warnings.append({
+                    "chunk": chunk_label,
+                    "kind": "silent-span",
+                    "detail": f"{sub_stem}: empty output over silent audio (rms {peak_rms:.5f}); accepted.",
+                })
+                print(f"[SILENT] {sub_stem}: silent audio, accepting empty SRT.", flush=True)
+                resolved.append((sub_srt_path, sub_start_ms))
+            elif _can_subdivide_span(sub_start_ms, sub_end_ms):
+                resolved.extend(_resolve_retry_span(
+                    audio_path, chunk_dir, sub_stem, sub_start_ms, sub_end_ms,
+                    depth + 1, extra_budget, duration_ms, chunk_label, warnings,
+                ))
+            else:
+                warnings.append({
+                    "chunk": chunk_label,
+                    "kind": "empty-accepted",
+                    "detail": f"{sub_stem}: empty output over live audio below the retry floor; accepted as hole.",
+                })
+                print(f"[RETRY] {sub_stem}: empty over live audio below floor, accepting hole.", flush=True)
+            continue
+        loop = detect_transcription_loop(sub_srt_path)
+        if loop is None:
+            resolved.append((sub_srt_path, sub_start_ms))
+        elif _can_subdivide_span(sub_start_ms, sub_end_ms):
+            onset_ms, run_length, span_ms, _text = loop
+            print(
+                f"[LOOP] {sub_srt_path.name}: {run_length}x repeat spanning "
+                f"{span_ms // 1_000}s from local {format_plain_time(onset_ms)} - subdividing.",
+                flush=True,
+            )
+            resolved.extend(_resolve_retry_span(
+                audio_path, chunk_dir, sub_stem, sub_start_ms, sub_end_ms,
+                depth + 1, extra_budget, duration_ms, chunk_label, warnings,
+            ))
+        else:
+            _onset_ms, run_length, span_ms, _text = loop
+            warnings.append({
+                "chunk": chunk_label,
+                "kind": "loop-accepted",
+                "detail": f"{sub_stem}: {run_length}x repeat over {span_ms // 1_000}s below the retry floor; kept.",
+            })
+            print(f"[RETRY] {sub_stem}: loop below floor, keeping output and flagging it.", flush=True)
+            resolved.append((sub_srt_path, sub_start_ms))
+    return resolved
+
+
+
+def _resolve_manifest_chunk(
+    audio_path: Path,
+    chunk_dir: Path,
+    chunk_audio_path: Path,
+    chunk_offset_ms: int,
+    chunk_label: str,
+    extra_budget: list[int],
+    duration_ms: int,
+    retries: dict[str, dict[str, object]],
+    warnings: list[dict[str, object]],
+) -> list[tuple[Path, int]]:
+    """Stitch entries for one prepared chunk: its SRT when clean, else retried subs.
+
+    Cached verdicts in chunk_retries.json skip re-detection on reruns; looped or
+    empty-over-live chunks subdivide into fresh-context halves inside the shared
+    extra-run budget. Silent chunks (muted mic) are accepted as-is.
+    """
+    chunk_srt_path = chunk_audio_path.with_suffix(".srt")
+    chunk_name = chunk_audio_path.name
+    wav_size = chunk_audio_path.stat().st_size
+    entry = retries.get(chunk_name)
+    if (
+        isinstance(entry, dict)
+        and entry.get("wav_size") == wav_size
+        and entry.get("verdict") in ("clean", "silent")
+        and chunk_srt_path.is_file()
+    ):
+        print(
+            f"Chunk {chunk_label}: {chunk_srt_path.name} already checked, reusing it.",
+            flush=True,
+        )
+        return [(chunk_srt_path, chunk_offset_ms)]
+    if (
+        isinstance(entry, dict)
+        and entry.get("verdict") == "retried"
+        and entry.get("wav_size") == wav_size
+        and isinstance(entry.get("subs"), list)
+        and entry["subs"]
+    ):
+        resolved: list[tuple[Path, int]] = []
+        complete = True
+        for sub in entry["subs"]:
+            if not isinstance(sub, dict):
+                complete = False
+                break
+            sub_srt_path = chunk_dir / str(sub.get("filename"))
+            sub_offset_ms = sub.get("offset_ms")
+            if not (
+                isinstance(sub_offset_ms, int)
+                and sub_srt_path.with_suffix(".wav").is_file()
+                and sub_srt_path.with_suffix(".wav").stat().st_size > 0
+                and sub_srt_path.is_file()
+            ):
+                complete = False
+                break
+            resolved.append((sub_srt_path, sub_offset_ms))
+        if complete:
+            print(
+                f"Chunk {chunk_label}: reusing {len(resolved)} retry sub-chunk(s).",
+                flush=True,
+            )
+            return resolved
+    if not (chunk_srt_path.is_file() and chunk_srt_path.stat().st_size > 0):
+        print(
+            f"Running Whisper for chunk {chunk_label}: {chunk_audio_path.name}",
+            flush=True,
+        )
+        _transcribe_audio_chunk(chunk_audio_path, chunk_srt_path)
+    block_count = _count_transcription_blocks(chunk_srt_path)
+    if block_count == 0:
+        peak_rms = transcription_chunk_max_rms(chunk_audio_path)
+        if peak_rms is not None and peak_rms < TRANSCRIPTION_SILENCE_RMS:
+            print(
+                f"[SILENT] {chunk_srt_path.name}: silent audio (rms {peak_rms:.5f}), "
+                "accepting empty SRT.",
+                flush=True,
+            )
+            warnings.append({
+                "chunk": chunk_label,
+                "kind": "silent-span",
+                "detail": f"{chunk_name}: empty output over silent audio; accepted as muted mic.",
+            })
+            retries[chunk_name] = {"wav_size": wav_size, "verdict": "silent", "subs": []}
+            return [(chunk_srt_path, chunk_offset_ms)]
+        problem = "empty output over live audio"
+    else:
+        loop = detect_transcription_loop(chunk_srt_path)
+        if loop is None:
+            retries[chunk_name] = {"wav_size": wav_size, "verdict": "clean", "subs": []}
+            return [(chunk_srt_path, chunk_offset_ms)]
+        onset_ms, run_length, span_ms, _text = loop
+        print(
+            f"[LOOP] {chunk_srt_path.name}: {run_length}x repeat spanning "
+            f"{span_ms // 1_000}s from local {format_plain_time(onset_ms)} - subdividing.",
+            flush=True,
+        )
+        problem = f"{run_length}x repeat over {span_ms // 1_000}s"
+    try:
+        parent_span_ms = round(probe_audio_duration_seconds(chunk_audio_path) * 1_000)
+    except RuntimeError:
+        warnings.append({
+            "chunk": chunk_label,
+            "kind": "span-unmeasurable",
+            "detail": f"{chunk_name}: {problem}; audio length unreadable, keeping output as-is.",
+        })
+        print(f"[RETRY] {chunk_name}: cannot measure span, keeping output.", flush=True)
+        retries[chunk_name] = {"wav_size": wav_size, "verdict": "accepted", "subs": []}
+        return [(chunk_srt_path, chunk_offset_ms)] if block_count > 0 else []
+    span_start_ms = chunk_offset_ms
+    span_end_ms = min(chunk_offset_ms + parent_span_ms, duration_ms)
+    if not _can_subdivide_span(span_start_ms, span_end_ms):
+        warnings.append({
+            "chunk": chunk_label,
+            "kind": "loop-accepted" if block_count > 0 else "empty-accepted",
+            "detail": f"{chunk_name}: {problem} below the retry floor; accepted.",
+        })
+        print(f"[RETRY] {chunk_name}: below retry floor, accepting and flagging.", flush=True)
+        retries[chunk_name] = {"wav_size": wav_size, "verdict": "accepted", "subs": []}
+        return [(chunk_srt_path, chunk_offset_ms)] if block_count > 0 else []
+    resolved = _resolve_retry_span(
+        audio_path, chunk_dir, chunk_audio_path.stem,
+        span_start_ms, span_end_ms, 1, extra_budget, duration_ms, chunk_label, warnings,
+    )
+    warnings.append({
+        "chunk": chunk_label,
+        "kind": "loop-subdivided",
+        "detail": f"{chunk_name}: {problem}; split into {len(resolved)} replacement span(s).",
+    })
+    retries[chunk_name] = {
+        "wav_size": wav_size,
+        "verdict": "retried",
+        "subs": [{"filename": path.name, "offset_ms": offset} for path, offset in resolved],
+    }
+    return resolved
 
 
 def transcribe_audio_in_chunks(
@@ -511,25 +943,40 @@ def transcribe_audio_in_chunks(
         output_dir = audio_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for chunk_number, chunk_audio_path in enumerate(chunk_audio_paths, start=1):
-        chunk_srt_path = chunk_audio_path.with_suffix(".srt")
-        if chunk_srt_path.is_file() and chunk_srt_path.stat().st_size > 0:
-            # A previous run already transcribed this chunk (e.g. a stitch
-            # or expected-file check failed afterward) - keep its SRT.
-            print(
-                f"Chunk {chunk_number:02d}/{len(chunk_audio_paths):02d}: "
-                f"{chunk_srt_path.name} already transcribed, reusing it.",
-                flush=True,
-            )
-            chunk_srt_paths.append(chunk_srt_path)
-            continue
-        print(
-            f"Running Whisper for chunk "
-            f"{chunk_number:02d}/{len(chunk_audio_paths):02d}: {chunk_audio_path.name}",
-            flush=True,
-        )
-        _transcribe_audio_chunk(chunk_audio_path, chunk_srt_path)
-        chunk_srt_paths.append(chunk_srt_path)
+    chunk_dir = chunk_audio_paths[0].parent
+    manifest = _read_retry_manifest(chunk_dir)
+    duration_ms = manifest.get("duration_ms")
+    if not isinstance(duration_ms, int) or duration_ms <= 0:
+        duration_ms = round(probe_audio_duration_seconds(audio_path) * 1_000)
+    retries = _load_retry_state(chunk_dir, manifest)
+    warnings: list[dict[str, object]] = []
+    extra_budget = [max(0, math.ceil(len(chunk_audio_paths) * TRANSCRIPTION_RETRY_BUDGET_FACTOR))]
+    print(
+        f"Loop-retry budget: {extra_budget[0]} extra Whisper run(s) for this run.",
+        flush=True,
+    )
+    chunk_entries: list[tuple[Path, int]] = []
+    for chunk_number, (chunk_audio_path, chunk_offset_ms) in enumerate(
+        zip(chunk_audio_paths, chunk_offsets_ms), start=1
+    ):
+        chunk_label = f"{chunk_number:02d}/{len(chunk_audio_paths):02d}"
+        chunk_entries.extend(_resolve_manifest_chunk(
+            audio_path, chunk_dir, chunk_audio_path, chunk_offset_ms,
+            chunk_label, extra_budget, duration_ms, retries, warnings,
+        ))
+        _save_retry_state(chunk_dir, manifest, retries)
+
+    warnings_path = _transcription_warnings_path(chunk_dir)
+    warnings_temporary_path = warnings_path.with_suffix(".json.tmp")
+    warnings_temporary_path.write_text(json.dumps(warnings, indent=2), encoding="utf-8")
+    warnings_temporary_path.replace(warnings_path)
+    print(
+        f"Retry summary: {len(chunk_entries)} span(s) to stitch, "
+        f"{len(warnings)} warning(s) in {warnings_path.name}.",
+        flush=True,
+    )
+    chunk_srt_paths = [entry_path for entry_path, _offset_ms in chunk_entries]
+    chunk_offsets_ms = [entry_offset_ms for _entry_path, entry_offset_ms in chunk_entries]
 
     print("All chunk SRTs finished; stitching connected timestamps.", flush=True)
     output_path = output_dir / audio_path.with_suffix(".srt").name
@@ -1544,7 +1991,7 @@ MINI_DESCRIPTIONS = {
         "1c": "Every chunk WAV plus chunk_manifest.json is saved under *_mic_transcription_chunks/ and reused on reruns.",
     },
     1: {
-        "2a": "A fresh whisper-cli process decodes each saved chunk (GPU-accelerated on NVIDIA; CPU-bound on AMD, where whisper.cpp ships no GPU Windows build); overlap captions are deduplicated after every chunk succeeds.",
+        "2a": "A fresh whisper-cli process decodes each saved chunk (GPU-accelerated on NVIDIA; CPU-bound on AMD, where whisper.cpp ships no GPU Windows build); overlap captions are deduplicated after every chunk succeeds. Chunks that collapse into a repeat loop are subdivided and re-decoded with fresh contexts inside a bounded retry budget; silent chunks are accepted as muted mic.",
         "2b": "Chunk SRTs shift into the full-audio clock, drop exact overlap duplicates, and stitch into the raw SRT.",
     },
     2: {
