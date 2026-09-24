@@ -564,7 +564,32 @@ DISCOVERY_MODEL_TUNINGS: dict[str, dict] = {
     # less system RAM than the bigger tag. Same MoE profile as the 35B
     # entries; matching is case-insensitive.
     "qwen3.6-35b-a3b:iq4_xs":                 {"DISCOVERY_NUM_CTX": 6144},
+    # qwen3.8-27b-mtp:latest is a dense 27B at 14.54 GB (IQ4_XS) - past the
+    # 10 GB card, so it always partial-offloads and every token runs all
+    # 27.3B params (slower per token than the MoE 35B tags under offload).
+    # Same VRAM-pressure profile as the 35B entries: trimmed discovery
+    # window. Matching is case-insensitive.
+    "qwen3.8-27b-mtp:latest":                 {"DISCOVERY_NUM_CTX": 6144},
+    # qwen3.8 9B dense pair (Q4_K_M ~5.8 GB) - fits fully on a 10 GB card
+    # at 8192 ctx like qwen3.5:9b. The -long tag ships Modelfile
+    # num_ctx 16384 vs 8192 on the base tag; both stay at 8192 here so
+    # KV cache leaves headroom for weights + compute buffers.
+    "empero-qwen3.8-9b:latest":                {"DISCOVERY_NUM_CTX": 8192},
+    "empero-qwen3.8-9b-long:latest":           {"DISCOVERY_NUM_CTX": 8192},
+    # qwen3.8-27b-nodraft:latest is the same dense 27B IQ4_XS (~14 GB) as
+    # the -mtp tag (Modelfile num_ctx 4096 / num_gpu 35) - partial offload
+    # on a 10 GB card, so the same trimmed 6144 window.
+    "qwen3.8-27b-nodraft:latest":              {"DISCOVERY_NUM_CTX": 6144},
+    # huihui_ai abliterated 9B (Q4_K_M ~6.6 GB) - same light dense-9B
+    # profile as qwen3.5:9b. Full tag is :9b-q4_K (no trailing M).
+    "huihui_ai/qwen3.5-abliterated:9b-q4_K":   {"DISCOVERY_NUM_CTX": 8192},
+    # batiai 35B MoE IQ4_XS (~18 GB) - lighter quant of the 35B MoE, still
+    # partial-offloads a 10 GB card. Same trimmed window as the other 35B
+    # entries. (Sibling tag qwen3.6-35b-a3b:iq4_xs covers the same weights
+    # under a different registry name.)
+    "batiai/qwen3.6-35b:iq4":                  {"DISCOVERY_NUM_CTX": 6144},
 }
+
 
 _JUDGE_LIGHT = {
     "JUDGE_NUM_CTX": 8192,
@@ -617,6 +642,24 @@ JUDGE_MODEL_TUNINGS: dict[str, dict] = {
     # smaller batches + more retries so the dense 14B's KV cache fits.
     "phi4:14b":                               dict(_JUDGE_HEAVY),
     "qwen3.6-35b-a3b:iq4_xs":                 dict(_JUDGE_HEAVY),
+    # qwen3.8-27b-mtp:latest (dense 27B, 14.54 GB IQ4_XS) shares the 35B
+    # VRAM-pressure profile: partial offload on a 10 GB card, so smaller
+    # batches + more retries. Matching is case-insensitive.
+    "qwen3.8-27b-mtp:latest":                 dict(_JUDGE_HEAVY),
+    # qwen3.8 9B dense pair (Q4_K_M ~5.8 GB) - light profile: full offload
+    # on a 10 GB card at 8192 ctx, same as qwen3.5:9b.
+    "empero-qwen3.8-9b:latest":                dict(_JUDGE_LIGHT),
+    "empero-qwen3.8-9b-long:latest":           dict(_JUDGE_LIGHT),
+    # qwen3.8-27b-nodraft:latest (dense 27B IQ4_XS ~14 GB) - same heavy
+    # profile as the -mtp tag: partial offload, smaller batches.
+    "qwen3.8-27b-nodraft:latest":              dict(_JUDGE_HEAVY),
+    # huihui_ai abliterated 9B (Q4_K_M ~6.6 GB) - light dense-9B profile.
+    # Full tag is :9b-q4_K (no trailing M).
+    "huihui_ai/qwen3.5-abliterated:9b-q4_K":   dict(_JUDGE_LIGHT),
+    # batiai 35B MoE IQ4_XS (~18 GB) - heavy MoE profile like the other
+    # 35B entries (sibling tag qwen3.6-35b-a3b:iq4_xs covers the same
+    # weights under a different registry name).
+    "batiai/qwen3.6-35b:iq4":                  dict(_JUDGE_HEAVY),
 }
 
 # Fallback tunings for models not explicitly listed (e.g. future pulls).
