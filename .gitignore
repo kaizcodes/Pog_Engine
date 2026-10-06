@@ -1,2 +1,9 @@
 *.zip
 *.rar
+**/__pycache__/
+*.py[cod]
+build/
+dist/
+
+# Deferred LM Studio/Bionic experiment
+deferred_lm_studio/
