@@ -1201,3 +1201,58 @@ checkpoint format change.
 ### Resume
 Re-run the VOD's `2_TranscribeAudio.bat` (Step 1 chunks reused; stale VAD-era
 chunk SRTs auto-cleared), then steps 3-5 normally.
+
+## Fix History: wall-clock decode hallucinations + retry-budget holes (2026-10-06)
+
+### Symptom
+`F:\OBS VOD\2026-09-20 12-47-24\step6_run_20261005_234908.log`: chunks 6-8
+looped ("Thank you" chains, repeated phrases), and the retry budget (1.0x
+chunk count = 8 extra runs) was spent on chunk 6's subdivision - chunks 7
+and 8 then hit `budget exhausted, leaving span hole` on BOTH halves, so
+~50 min of audio (02:56:20 onward) has no transcript at all in the fixed SRT
+(ends at 02:56:19). Discovery found 0 candidates on parts 1-3 (hallucinated
+SRT text has no real content to rank). Same run on an earlier VOD generation
+(VAD-era) did not show this: VAD excised silence before decode, hiding the
+silence-hallucination path the 2026-09-29 wall-clock removal exposed.
+
+### Root causes
+1. `--no-speech-thold 0.7` too permissive: wall-clock decode feeds silence
+   straight to the decoder, and 0.7 lets it transcribe dead air as confident
+   speech (upstream guidance for silence-heavy audio: 0.2-0.5). No timestamp
+   smear anymore (fix held), but silence becomes phantom words instead.
+2. `--best-of 5` wasted GPU: best-of diversifies greedy sampling only, so at
+   temperature 0 + beam 5 it ran 5 identical decodes per chunk.
+3. `budget-exhausted` left transcript HOLES: `continue` skipped the span
+   entirely (no WAV decode, no entry in resolved), so stitched SRT jumps
+   over the audio. 1.0x budget too small for a pathological VOD (chunk 6
+   alone ate it via 2-level subdivision).
+
+### Fix
+- `_transcribe_audio_chunk()`: explicit `--temperature 0`, `--best-of 1`
+  (was 5), `--no-speech-thold 0.5` (was 0.7). Beam 5, entropy 2.6, logprob
+  -0.8, fallback ON all unchanged (loop recovery on real repetitive speech).
+- `_resolve_retry_span()`: budget-exhausted spans now decode ONCE and are
+  accepted with a warning (transcript flagged for review, but present) -
+  no more holes. Budget raise covers the subdivision depth: pathological
+  VODs need ~2x to finish all flagged chunks.
+- `pipeline_config.py`: `TRANSCRIPTION_RETRY_BUDGET_FACTOR` 1.0 -> 2.0.
+- Retry fingerprint gains `decode_flags` generation marker
+  ("temp0-bs5-bo1-et2.6-lpt-0.8-nst0.5"); `_clear_stale_model_srts()`
+  generalized to `_clear_stale_decode_srts()` (fires on model OR flag
+  change). Old SRTs decoded under 0.7/bo5 auto-clear once; chunk audio reused.
+  Bump the marker string on any future flag change or old SRTs silently reuse.
+
+### Not changed
+Silero VAD stays out (timestamp smear was worse than hallucinations); no
+`--no-context` (kills cross-chunk continuity for marginal gain);
+`--suppress-nst` kept as-is (does not cause repetition loops).
+
+### Applied
+Repository source + `G:\pog_dev` install copy (both files, byte-identical,
+py_compile clean). Script-only change: no bat regeneration, no checkpoint
+format change. Synthetic checks: zero-budget span decodes once and stitches
+(no hole); old-flag SRTs clear once; current-flag SRTs survive.
+
+### Resume
+Re-run that VOD's `2_TranscribeAudio.bat` (Step 1 chunks reused; stale SRTs
+auto-cleared), then steps 3-5 normally.

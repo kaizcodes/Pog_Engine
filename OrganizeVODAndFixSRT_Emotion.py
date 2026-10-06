@@ -42,8 +42,8 @@ from pipeline_config import (
     TRANSCRIPTION_CHUNK_OVERLAP_SECONDS,
     TRANSCRIPTION_LOOP_MIN_REPEATS,
     TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
-    TRANSCRIPTION_RETRY_BUDGET_FACTOR,
     TRANSCRIPTION_RETRY_MIN_MINUTES,
+    TRANSCRIPTION_RETRY_BUDGET_FACTOR,
     TRANSCRIPTION_SILENCE_RMS,
     VOCAL_ISOLATION_MODEL,
     ollama_base_url,
@@ -77,7 +77,6 @@ GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 # Edit these if your whisper.cpp install moves.
 WHISPER_CLI = r"G:\pog_dev\models\Release\whisper-cli.exe"
 WHISPER_MODEL = r"G:\pog_dev\models\ggml-large-v3.bin"
-
 
 
 @dataclass(frozen=True)
@@ -225,6 +224,11 @@ def _cli_path(path: Path) -> str:
     return "\\\\?\\" + str(Path(path).resolve())
 
 
+def resolve_whisper_model_path() -> str:
+    """Weights file Step 2 decodes: always the large bin (turbo removed)."""
+    return str(WHISPER_MODEL)
+
+
 def _transcribe_audio_chunk(
     chunk_audio_path: Path,
     chunk_srt_path: Path,
@@ -233,23 +237,44 @@ def _transcribe_audio_chunk(
     chunk_srt_path.unlink(missing_ok=True)
     command = [
         str(WHISPER_CLI),
-        "-m", str(WHISPER_MODEL),
+        "-m", resolve_whisper_model_path(),
         "-f", _cli_path(chunk_audio_path),
         "-l", "en",
         "-osrt",
         "-of", _cli_path(chunk_srt_path.with_suffix("")),
         "-mc", "-1",
+        "--temperature", "0",
         "--beam-size", "5",
-        "--best-of", "5",
+        "--best-of", "1",
         "--entropy-thold", "2.6",
         "--logprob-thold", "-0.8",
-        "--no-speech-thold", "0.7",
+        "--no-speech-thold", "0.5",
         "--suppress-nst",
-        "-t", "16",
+        "-fa",
+        "-t", "8",
     ]
     # No --vad: VAD concatenated detected speech and stretched captions back
     # across the excised silence, smearing timestamps over minutes of dead
-    # air. Wall-clock decode is slower but stays true.
+    # air. Wall-clock decode is slower but stays true. No --no-fallback
+    # either: temperature fallback is the decoder's loop recovery on
+    # repetitive streamer speech - removing it collapsed chunks into repeat
+    # loops in benchmarks (2026-10-04). Silence gate is --no-speech-thold
+    # 0.5 (was 0.7): wall-clock decode feeds silence straight to the
+    # decoder, and 0.7 let it transcribe dead air as "Thank you" chains
+    # (09-20 VOD, 2026-10-05). Lower = stricter; 0.5 keeps quiet speech
+    # while rejecting silence (upstream range for silence-heavy audio is
+    # 0.2-0.5; below 0.5 risks eating quiet mic). --best-of 1 (was 5):
+    # best-of only diversifies greedy sampling, so at temperature 0 with
+    # beam-size 5 it ran 5 identical decodes - pure GPU waste, no accuracy.
+    # Beam 5 stays (offline chunks, accuracy-oriented). -fa (flash
+    # attention, ~6% faster on sm_86 in isolated A/B, 47s->44s x2 runs on
+    # a 5-min slice) changes segmentation (finer 2-5 s blocks vs merged
+    # 8-25 s blocks, same words - deterministic per setting, verified by
+    # hash) but not content; harmless downstream since split regroups
+    # into 30-word thoughts under a 15 s tolerance. -t 8 (16
+    # oversubscribes an 8c/16t box; threads only feed CPU-side work)
+    # benchmarked neutral. Flag changes must bump the decode_flags
+    # fingerprint below, or old SRTs decode under stale flags and reuse.
     result = subprocess.run(command)
     if result.returncode != 0:
         raise RuntimeError(
@@ -589,6 +614,20 @@ def transcription_chunk_max_rms(chunk_audio_path: Path) -> float | None:
         return None
 
 
+def _chunk_audio_is_silent(chunk_audio_path: Path) -> tuple[bool, float | None]:
+    """Pre-decode silence gate: (is_silent, peak_rms) for a chunk WAV.
+
+    True only when the audio measurably reads below TRANSCRIPTION_SILENCE_RMS
+    (muted mic) - unreadable audio returns False so decoding is attempted.
+    Callers check this BEFORE launching whisper.cpp; a full 30-minute decode
+    of silence costs ~200 s of GPU for an empty SRT (benchmark 2026-10-04).
+    """
+    peak_rms = transcription_chunk_max_rms(chunk_audio_path)
+    if peak_rms is None:
+        return False, None
+    return peak_rms < TRANSCRIPTION_SILENCE_RMS, peak_rms
+
+
 def _chunk_retries_path(chunk_dir: Path) -> Path:
     return chunk_dir / "chunk_retries.json"
 
@@ -609,6 +648,19 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
         "retry_min_minutes": TRANSCRIPTION_RETRY_MIN_MINUTES,
         "retry_budget_factor": TRANSCRIPTION_RETRY_BUDGET_FACTOR,
         "silence_rms": TRANSCRIPTION_SILENCE_RMS,
+        # Model marker: kept so turbo-era verdicts (different decode text)
+        # never validate - a turbo SRT reused under large would stitch the
+        # wrong model's output. One-shot: after the first large run saves a
+        # fresh fingerprint, turbo-era states clear once via
+        # _clear_stale_decode_srts below, then this is a no-op.
+        "whisper_model": Path(resolve_whisper_model_path()).name,
+        # Decode-generation marker: bump the string whenever
+        # _transcribe_audio_chunk flags change (temperature, beam, best-of,
+        # entropy/logprob/no-speech thresholds). Stale SRTs decoded under
+        # older flags are otherwise valid files, so without this the loader
+        # below would silently reuse them and the flag change would only
+        # apply to new VODs.
+        "decode_flags": "temp0-bs5-bo1-et2.6-lpt-0.8-nst0.5",
         # One-way marker: every state written before the --vad removal lacks
         # this key, so its fingerprint can never equal a post-removal one.
         # Without it, a VAD-era state (same layout + knobs) would compare
@@ -722,21 +774,28 @@ def _resolve_retry_span(
         sub_srt_path = chunk_dir / f"{sub_stem}.srt"
         _extract_retry_subchunk(audio_path, sub_start_ms, sub_end_ms, sub_wav_path)
         if not (sub_srt_path.is_file() and sub_srt_path.stat().st_size > 0):
-            if extra_budget[0] <= 0:
+            is_silent, _rms = _chunk_audio_is_silent(sub_wav_path)
+            if is_silent:
+                print(f"[SILENT] {sub_stem}: silent audio, skipping Whisper decode.", flush=True)
+                sub_srt_path.touch(exist_ok=True)
+            elif extra_budget[0] <= 0:
                 warnings.append({
                     "chunk": chunk_label,
                     "kind": "budget-exhausted",
-                    "detail": f"{sub_stem}: retry budget spent; span left untranscribed.",
+                    "detail": f"{sub_stem}: retry budget spent; decoded once and accepted, flagged for review.",
                 })
-                print(f"[RETRY] {sub_stem}: budget exhausted, leaving span hole and moving on.", flush=True)
-                continue
-            print(
-                f"Running Whisper for chunk {chunk_label} retry sub-chunk "
-                f"(depth {depth}): {sub_wav_path.name}",
-                flush=True,
-            )
+                print(
+                    f"[RETRY] {sub_stem}: budget exhausted, decoding once and accepting.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Running Whisper for chunk {chunk_label} retry sub-chunk "
+                    f"(depth {depth}): {sub_wav_path.name}",
+                    flush=True,
+                )
+                extra_budget[0] -= 1
             _transcribe_audio_chunk(sub_wav_path, sub_srt_path)
-            extra_budget[0] -= 1
         block_count = _count_transcription_blocks(sub_srt_path)
         if block_count == 0:
             peak_rms = transcription_chunk_max_rms(sub_wav_path)
@@ -851,6 +910,22 @@ def _resolve_manifest_chunk(
             )
             return resolved
     if not (chunk_srt_path.is_file() and chunk_srt_path.stat().st_size > 0):
+        is_silent, peak_rms = _chunk_audio_is_silent(chunk_audio_path)
+        if is_silent:
+            rms_text = f"{peak_rms:.5f}" if peak_rms is not None else "unknown"
+            print(
+                f"[SILENT] {chunk_name}: silent audio (rms {rms_text}), "
+                "skipping Whisper decode.",
+                flush=True,
+            )
+            warnings.append({
+                "chunk": chunk_label,
+                "kind": "silent-span",
+                "detail": f"{chunk_name}: silent audio (rms {rms_text}); decode skipped as muted mic.",
+            })
+            retries[chunk_name] = {"wav_size": wav_size, "verdict": "silent", "subs": []}
+            chunk_srt_path.touch(exist_ok=True)
+            return [(chunk_srt_path, chunk_offset_ms)]
         print(
             f"Running Whisper for chunk {chunk_label}: {chunk_audio_path.name}",
             flush=True,
@@ -924,6 +999,49 @@ def _resolve_manifest_chunk(
     return resolved
 
 
+def _clear_stale_decode_srts(chunk_dir: Path, manifest: dict[str, object]) -> None:
+    """Delete chunk SRTs decoded under an older model or decode-flag set.
+
+    Both the weights (large vs turbo-era) and the decoder flags change the
+    SRT bytes, so an SRT produced under either older generation is stale
+    even though its audio is untouched. Caught when the stored fingerprint
+    is post-VAD-removal (has vad_removed) but differs in whisper_model or
+    decode_flags. One-shot: after the first current-generation run saves a
+    fresh fingerprint, this is a no-op. Chunk audio is reused.
+    """
+    if not manifest:
+        return
+    try:
+        state = json.loads(_chunk_retries_path(chunk_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or not isinstance(state.get("fingerprint"), dict):
+        return
+    if state.get("fingerprint") == _retry_state_fingerprint(manifest):
+        return
+    if state["fingerprint"].get("vad_removed") is not True:
+        return
+    stored = state["fingerprint"]
+    current = _retry_state_fingerprint(manifest)
+    if (
+        stored.get("whisper_model") == current.get("whisper_model")
+        and stored.get("decode_flags") == current.get("decode_flags")
+    ):
+        return
+    removed = 0
+    for srt_path in sorted(chunk_dir.glob("*.srt")):
+        try:
+            srt_path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    print(
+        "Whisper model or decode flags changed; removed {0} stale chunk SRT(s) "
+        "for re-transcription. Chunk audio is reused.".format(removed),
+        flush=True,
+    )
+
+
 def _clear_vad_era_srts(chunk_dir: Path, manifest: dict[str, object]) -> None:
     """Delete chunk SRTs transcribed under the old always-on --vad.
 
@@ -954,8 +1072,8 @@ def _clear_vad_era_srts(chunk_dir: Path, manifest: dict[str, object]) -> None:
         except OSError:
             pass
     print(
-        f"Old VAD-era transcription found; removed {removed} stale chunk SRT(s) "
-        "for wall-clock re-transcription. Chunk audio is reused.",
+        "Old VAD-era transcription found; removed {0} stale chunk SRT(s) "
+        "for wall-clock re-transcription. Chunk audio is reused.".format(removed),
         flush=True,
     )
 
@@ -971,7 +1089,8 @@ def transcribe_audio_in_chunks(
     chunk_audio_paths, chunk_offsets_ms = _load_prepared_audio_chunks(audio_path)
     chunk_srt_paths: list[Path] = []
     print(
-        f"Transcribing {audio_path.name} in {len(chunk_audio_paths)} saved chunk(s); "
+        f"Transcribing {audio_path.name} in {len(chunk_audio_paths)} saved chunk(s) "
+        f"with {Path(resolve_whisper_model_path()).name}; "
         "all chunk audio is already prepared.",
         flush=True,
     )
@@ -986,6 +1105,7 @@ def transcribe_audio_in_chunks(
 
     chunk_dir = chunk_audio_paths[0].parent
     manifest = _read_retry_manifest(chunk_dir)
+    _clear_stale_decode_srts(chunk_dir, manifest)
     _clear_vad_era_srts(chunk_dir, manifest)
     duration_ms = manifest.get("duration_ms")
     if not isinstance(duration_ms, int) or duration_ms <= 0:
@@ -1769,7 +1889,7 @@ def _step_model_details(index: int, target_folder: Path | None = None) -> tuple[
     if index == 1:
         return (
             "Process: Whisper each saved chunk, then stitch shifted timestamps",
-            f"Whisper model: {Path(WHISPER_MODEL).name}",
+            f"Whisper model: {Path(resolve_whisper_model_path()).name}",
         )
     if index == 2:
         return "Process: repair timestamps and remove adjacent repeats", ""
@@ -2038,7 +2158,7 @@ MINI_DESCRIPTIONS = {
         "1c": "Every chunk WAV plus chunk_manifest.json is saved under *_mic_transcription_chunks/ and reused on reruns.",
     },
     1: {
-        "2a": "A fresh whisper-cli process decodes each saved chunk (GPU-accelerated on NVIDIA; CPU-bound on AMD, where whisper.cpp ships no GPU Windows build); overlap captions are deduplicated after every chunk succeeds. Chunks that collapse into a repeat loop are subdivided and re-decoded with fresh contexts inside a bounded retry budget; silent chunks are accepted as muted mic.",
+        "2a": "A fresh whisper-cli process decodes each saved chunk (GPU-accelerated on NVIDIA; CPU-bound on AMD, where whisper.cpp ships no GPU Windows build); overlap captions are deduplicated after every chunk succeeds. Chunks that collapse into a repeat loop are subdivided and re-decoded with fresh contexts inside a bounded retry budget; silent chunks skip decoding entirely and are accepted as muted mic.",
         "2b": "Chunk SRTs shift into the full-audio clock, drop exact overlap duplicates, and stitch into the raw SRT.",
     },
     2: {

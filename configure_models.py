@@ -55,6 +55,7 @@ def run_gui() -> int:
     var_state: dict[str, tk.Variable] = {}
     phrase_editors: dict[str, tk.Text] = {}
     installed_models: list[str] = []
+    help_labels: list = []
     config_path = Path(cfg.__file__).resolve()
     last_discovery_model = str(getattr(cfg, "MODEL", "") or "").strip()
     last_judge_model = str(getattr(cfg, "JUDGE_MODEL", "") or "").strip()
@@ -63,7 +64,6 @@ def run_gui() -> int:
         if isinstance(value, (list, tuple)):
             return "\n".join(str(item) for item in value)
         return "" if value is None else str(value)
-
 
     def make_var(param: dict, value) -> tk.Variable:
         kind = param["kind"]
@@ -146,31 +146,33 @@ def run_gui() -> int:
             else:
                 widget = ttk.Entry(general_frame, textvariable=var_state[param["key"]], width=14)
             widget.grid(row=row_index * 2, column=1, sticky="w", pady=(2, 0))
-            ttk.Label(
+            _gen_help = ttk.Label(
                 general_frame,
                 text=param["help"],
                 foreground="#8a8a8a",
                 wraplength=900,
-            ).grid(row=row_index * 2 + 1, column=0, columnspan=2, sticky="w", pady=(0, 4))
-
+                justify="left",
+                anchor="w",
+            )
+            _gen_help.grid(row=row_index * 2 + 1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+            help_labels.append((general_frame, _gen_help))
 
     def refresh_models() -> None:
         nonlocal installed_models
-        installed_models, warning = cfg.list_ollama_models()
-        model_values = installed_models
+        names, warning = cfg.list_ollama_models()
         if warning:
-            model_values = []
             models_status_var.set(warning)
         else:
+            installed_models = names
             count = len(installed_models)
             models_status_var.set(
                 f"{count} model(s) detected by `ollama list`."
                 if count
                 else "No models found. Pull one with `ollama pull <name>`."
             )
-        for key in ("MODEL", "JUDGE_MODEL"):
-            for combo in model_combos.get(key, []):
-                combo.configure(values=model_values)
+            for key in ("MODEL", "JUDGE_MODEL"):
+                for combo in model_combos.get(key, []):
+                    combo.configure(values=installed_models)
         root.update_idletasks()
         _warn_memory_fit("discovery", str(var_state["MODEL"].get()).strip())
         _warn_memory_fit("judge", str(var_state["JUDGE_MODEL"].get()).strip())
@@ -192,10 +194,12 @@ def run_gui() -> int:
             values=installed_models,
         )
         combo.grid(row=0, column=1, sticky="ew")
-        ttk.Label(row_frame, text=param["help"], foreground="#8a8a8a").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(2, 0)
-        )
         model_combos.setdefault(param["key"], []).append(combo)
+        _top_help = ttk.Label(row_frame, text=param["help"], foreground="#8a8a8a", justify="left", anchor="w", wraplength=800)
+        _top_help.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0)
+        )
+        help_labels.append((row_frame, _top_help))
 
     scan_row = ttk.Frame(top)
     scan_row.pack(fill="x", pady=(6, 0))
@@ -366,10 +370,27 @@ def run_gui() -> int:
                 sticky="ew" if kind == "phrases" else "w",
                 pady=(2, 0),
             )
-            ttk.Label(section, text=param["help"], foreground="#8a8a8a", wraplength=720).grid(
-                row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 4)
+            help_label = ttk.Label(section, text=param["help"], foreground="#8a8a8a", wraplength=720, justify="left", anchor="w")
+            help_label.grid(
+                row=row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 4)
             )
-
+            help_labels.append((section, help_label))
+    # Fixed wraplength=720 clips help text when windowed; track each section
+    # width so help re-wraps on resize instead of running off-screen. One
+    # binding per section (not per row); initial pass runs after layout.
+    def _rewrap_help(_event=None) -> None:
+        for _section, _label in help_labels:
+            try:
+                _label.configure(wraplength=max(200, _section.winfo_width() - 32))
+            except Exception:
+                pass
+    _seen_sections = set()
+    for _section, _label in help_labels:
+        _sid = str(_section)
+        if _sid not in _seen_sections:
+            _seen_sections.add(_sid)
+            _section.bind("<Configure>", lambda _e: _rewrap_help(), add="+")
+    root.after(100, _rewrap_help)
 
     def log(message: str) -> None:
         log_box.configure(state="normal")

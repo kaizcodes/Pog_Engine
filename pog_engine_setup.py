@@ -313,7 +313,8 @@ def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str], Pa
             reporter.status(name, "Missing")
         # Also check for whisper-cli.exe in models/Release/
         reporter.status("whisper-cli.exe", "Missing")
-        return models_dir, list(REQUIRED_MODEL_FILES) + ["whisper-cli.exe"], None
+        reporter.status("Installed Whisper model", "none")
+        return models_dir, sorted(REQUIRED_MODEL_FILES) + ["whisper-cli.exe"], None
 
     missing = []
     for name in REQUIRED_MODEL_FILES:
@@ -322,6 +323,10 @@ def check_models(pog_dir: Path, reporter: Reporter) -> tuple[Path, list[str], Pa
         reporter.status(name, "OK" if ok else "Missing")
         if not ok:
             missing.append(name)
+    large_ok = (models_dir / "ggml-large-v3.bin").is_file()
+    installed = "large" if large_ok else "none"
+    reporter.log(f"  Installed Whisper model(s): {installed}")
+    reporter.status("Installed Whisper model", installed)
     # Check for whisper-cli.exe in models/Release/
     whisper_cli_path = models_dir / "Release" / "whisper-cli.exe"
     whisper_cli_ok = whisper_cli_path.is_file()
@@ -1258,12 +1263,40 @@ def ensure_simple_packages(reporter: Reporter) -> None:
                 reporter.status(pip_name, "Failed")
 
 
+def ensure_whisper_packages(reporter: Reporter) -> None:
+    """Whisper large-v3 runtime deps (from the openai/whisper-large-v3 model
+    card: https://huggingface.co/openai/whisper-large-v3):
+    `pip install --upgrade pip` then
+    `pip install --upgrade transformers datasets[audio] accelerate`.
+    The ggml large bin needs nothing new, but a user on the HF transformers
+    path does, so Start Setup keeps these importable. Skip-if-present:
+    pip --upgrade only runs when the module won't import."""
+    reporter.section("Whisper packages (transformers path)")
+    pip_ok = pip_install(reporter, "pip", upgrade=True)
+    if not pip_ok:
+        reporter.log("    [WARN] pip self-upgrade failed - continuing with the current pip.")
+    for module_name, pip_name in (("transformers", "transformers"), ("datasets", "datasets[audio]"), ("accelerate", "accelerate")):
+        reporter.status(pip_name, "Checking...")
+        if is_importable(module_name):
+            reporter.log(f"  [OK]     {pip_name} already installed - skipping.")
+            reporter.status(pip_name, "Already installed")
+        else:
+            reporter.log(f"  installing {pip_name} ...")
+            reporter.status(pip_name, "Installing...")
+            if pip_install(reporter, pip_name, upgrade=True):
+                reporter.status(pip_name, "Done")
+            else:
+                reporter.log(f"    [WARN] {pip_name} failed to install - check the log above.")
+                reporter.status(pip_name, "Failed")
+
+
 def install_dependencies(reporter: Reporter, models_dir: Path) -> None:
     reporter.section("Installing Python packages (skipping anything already present)")
     ensure_torch(reporter)
     ensure_demucs(reporter)
     predownload_demucs_model(models_dir, reporter)
     ensure_simple_packages(reporter)
+    ensure_whisper_packages(reporter)
 
 
 # ============================================================================
@@ -1441,7 +1474,7 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
     expected_emotion_model_file = str((models_dir / "speech-emotion-recognition-with-openai-whisper-large-v3.safetensors").resolve())
     expected_torch_cache = str((models_dir / "torch_cache").resolve())
     expected_hf_cache = str((models_dir / "hf_cache").resolve())
-    
+
     def check_var(content: str, var_name: str, expected: str) -> bool:
         # Check for both raw string and regular string formats
         patterns = [
@@ -1450,10 +1483,10 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
             f'{var_name} = Path(r"{expected}")',
         ]
         return any(p in content for p in patterns)
-    
+
     if organize_py.is_file():
         content = organize_py.read_text(encoding="utf-8")
-        
+
         for var_name, expected in [
             ("WHISPER_CLI", expected_whisper_cli),
             ("WHISPER_MODEL", expected_whisper_model),
@@ -1466,10 +1499,10 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
                 reporter.log(f"  [WARN] {organize_py.name}: {var_name} needs patching")
                 reporter.status(var_name, "Warn")
                 all_ok = False
-    
+
     if analyze_py.is_file():
         content = analyze_py.read_text(encoding="utf-8")
-        
+
         for var_name, expected in [
             ("EMOTION_LOCAL_MODEL_DIR", expected_emotion_model_dir),
             ("EMOTION_LOCAL_MODEL_FILE", expected_emotion_model_file),
@@ -1547,7 +1580,15 @@ def _verify_python_packages(models_dir: Path, reporter: Reporter,
             reporter.status(pip_name, "Missing")
             all_ok = False
 
-    return all_ok and demucs_model_ok
+    for module_name, pip_name in (("datasets", "datasets[audio]"), ("accelerate", "accelerate")):
+        reporter.status(pip_name, "Checking...")
+        if is_importable(module_name):
+            reporter.log(f"  [OK]     {pip_name} {installed_label} (whisper large-v3 dep)")
+            reporter.status(pip_name, "Already installed" if installed_label.startswith("already") else "OK")
+        else:
+            reporter.log(f"  [MISSING] {pip_name} not installed (whisper large-v3 dep)")
+            reporter.status(pip_name, "Missing")
+            all_ok = False
 
 
 def check_python_packages(models_dir: Path, reporter: Reporter, install: bool) -> bool:
@@ -1631,7 +1672,7 @@ def run_all_checks(pog_dir: Path, reporter: Reporter, install: bool = True) -> b
 
     missing_scripts = check_scripts(pog_dir, reporter)
     models_dir, missing_models, whisper_cli = check_models(pog_dir, reporter)
-    
+
     if install:
         download_all_models(models_dir, reporter)
         # Re-check models after downloads so summary is accurate
@@ -1739,6 +1780,7 @@ def run_gui(default_dir_str: str) -> int:
         "Done (CPU only)": "#8bc34a",
         "Already installed": "#4caf50",
         "Already downloaded": "#4caf50",
+        "Skipped": "#777777",
         "Missing": "#e05252",
         "Failed": "#e05252",
         "Warn": "#e0a852",
@@ -1821,6 +1863,7 @@ def run_gui(default_dir_str: str) -> int:
     for name in REQUIRED_MODEL_FILES:
         add_row_widget("models", name, name)
     add_row_widget("models", "whisper-cli.exe", "whisper-cli.exe (in models\\Release\\)")
+    add_row_widget("models", "Installed Whisper model", "Installed Whisper model (large/none)")
 
     ffmpeg_frame = make_section("ffmpeg", "ffmpeg / ffprobe")
     add_row_widget("ffmpeg", "ffmpeg", "ffmpeg on PATH")
@@ -1838,6 +1881,8 @@ def run_gui(default_dir_str: str) -> int:
     add_row_widget("packages", "demucs model", "demucs separation model (~80MB)")
     for pip_name in SIMPLE_PACKAGES.values():
         add_row_widget("packages", pip_name, pip_name)
+    add_row_widget("packages", "datasets[audio]", "datasets[audio] (whisper large-v3 dep)")
+    add_row_widget("packages", "accelerate", "accelerate (whisper large-v3 dep)")
 
     ollama_frame = make_section("ollama", "Ollama")
     add_row_widget("ollama", "ollama", "ollama command on PATH")

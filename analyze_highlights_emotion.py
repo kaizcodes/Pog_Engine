@@ -2132,10 +2132,16 @@ def run_judge_batch(pool, keep_n, judge_instructions, transcript_blocks_by_part=
 
         pieces = line.split(",", 3)
 
-        if len(pieces) != 4:
+        if len(pieces) == 3:
+            # Model omitted the Title column (Rank,Score,Timestamp). The pool
+            # record keeps its own Title - matching is by Timestamp alone -
+            # so accept the row; Title still feeds dedup/EDL/clip names downstream.
+            rank, score, timestamp = pieces
+        elif len(pieces) == 4:
+            rank, score, timestamp, title = pieces
+        else:
             continue
 
-        rank, score, timestamp, title = pieces
         timestamp = timestamp.strip().strip('"')
         # The model sometimes quotes fields ("00:03:28") and/or emits decimal
         # scores (7.5). Strip quotes; round decimals rather than mangling

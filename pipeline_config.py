@@ -149,8 +149,8 @@ LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
 # halves with fresh decoder contexts instead of stitching the loop through.
 # Subdivision stops at TRANSCRIPTION_RETRY_MIN_MINUTES and the run caps extra
 # Whisper invocations at TRANSCRIPTION_RETRY_BUDGET_FACTOR times the chunk
-# count, so a pathological VOD burns bounded GPU and records the surviving
-# suspect spans in transcription_warnings.json instead of hanging the run.
+# count (2.0: a pathological VOD burns bounded GPU and records the surviving
+# suspect spans in transcription_warnings.json instead of hanging the run).
 # Empty chunk SRTs over near-silent audio (a muted mic) are accepted as-is;
 # only empty output over live audio re-enters the retry path.
 # VAD is gone: whisper.cpp's --vad concatenated detected speech, decoded it
@@ -163,8 +163,13 @@ TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECO
 TRANSCRIPTION_LOOP_MIN_REPEATS = _env_int("TRANSCRIPTION_LOOP_MIN_REPEATS", 10)
 TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS = _env_int("TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS", 180)
 TRANSCRIPTION_RETRY_MIN_MINUTES = _env_int("TRANSCRIPTION_RETRY_MIN_MINUTES", 5)
-TRANSCRIPTION_RETRY_BUDGET_FACTOR = _env_float("TRANSCRIPTION_RETRY_BUDGET_FACTOR", 1.0)
+TRANSCRIPTION_RETRY_BUDGET_FACTOR = _env_float("TRANSCRIPTION_RETRY_BUDGET_FACTOR", 2.0)
 TRANSCRIPTION_SILENCE_RMS = _env_float("TRANSCRIPTION_SILENCE_RMS", 0.002)
+# Whisper weights used by Step 2 (whisper.cpp): ggml-large-v3.bin (~3 GB)
+# from the ggerganov/whisper.cpp repo. The large-v3-turbo bin was removed
+# 2026-10-03 (accuracy drop too big) - Step 2 always decodes large now, via
+# the organizer's machine-specific WHISPER_MODEL path constant (patched by
+# setup). A stale ggml-large-v3-turbo.bin left in models/ is inert.
 
 # --- Pipeline behavior -------------------------------------------------------
 # The RunAll GUI can optionally suspend Windows after every pipeline step
@@ -418,10 +423,10 @@ EDITABLE_PARAMS = [
     # --- Models (per-step role assignment) ---
     {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
      "label": "Discovery / audio-titling model (MODEL)",
-     "help": "Reads each transcript chunk and proposes highlight candidates, plus writes audio-scan clip titles. Long context, less careful reasoning."},
+     "help": "Reads each transcript chunk and proposes highlight candidates, plus writes audio-scan clip titles. Long context, less careful reasoning - so this role wants a model that fits your VRAM fully and runs fast. Light models (8b/9b/14b) hold 8192 ctx on a 10 GB card; anything past ~10 GB of weights partial-offloads to CPU and slows every discovery pass. Scan auto-applies the matching tuning on selection."},
     {"key": "JUDGE_MODEL",      "env": "HIGHLIGHT_JUDGE_MODEL",      "kind": "model", "stage": "Models",
      "label": "Judge / verify model (JUDGE_MODEL)",
-     "help": "Verify and judge ranking. Shorter prompts, careful structured output. Must support /api/chat with think:false (the qwen3.5 family does)."},
+     "help": "Verify and judge ranking. Shorter prompts, careful structured output - so this role wants the smartest dense model your machine can hold. Must support /api/chat with think:false. Dense weights run every parameter per token (accurate but slower under offload); MoE weights fire a fraction per token (cheaper per token but bigger on disk/RAM). Big models need ~16 GB free RAM for partial offload - the pre-flight warns before loading."},
     # --- Ollama connection / generation budget ---
     {"key": "DISCOVERY_NUM_CTX", "env": "HIGHLIGHT_DISCOVERY_NUM_CTX", "kind": "int", "stage": "Ollama",
      "label": "Discovery context window (DISCOVERY_NUM_CTX, tokens)",
@@ -892,8 +897,6 @@ def _coerce_for_write(kind: str, value):
         return str(int(value)) if value not in (None, "") else "0"
     if kind == "float":
         return repr(float(value)) if value not in (None, "") else "0.0"
-    if kind in ("model", "backend"):
-        return f'"{value}"'
     if value in (None, ""):
         return "None"
     return f'"{value}"'
