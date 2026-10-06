@@ -162,6 +162,10 @@ TRANSCRIPTION_CHUNK_MINUTES = _env_int("TRANSCRIPTION_CHUNK_MINUTES", 30)
 TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", 10)
 TRANSCRIPTION_LOOP_MIN_REPEATS = _env_int("TRANSCRIPTION_LOOP_MIN_REPEATS", 10)
 TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS = _env_int("TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS", 180)
+# Burst gate (OR-condition with the two above): a fast silence-hallucination
+# chain ("Thank you" every ~3 s) hits 30 repeats in ~90 s without tripping the
+# 180 s span gate. Real choruses repeat 3-5x, so 30 stays far above them.
+TRANSCRIPTION_LOOP_BURST_REPEATS = _env_int("TRANSCRIPTION_LOOP_BURST_REPEATS", 30)
 TRANSCRIPTION_RETRY_MIN_MINUTES = _env_int("TRANSCRIPTION_RETRY_MIN_MINUTES", 5)
 TRANSCRIPTION_RETRY_BUDGET_FACTOR = _env_float("TRANSCRIPTION_RETRY_BUDGET_FACTOR", 2.0)
 TRANSCRIPTION_SILENCE_RMS = _env_float("TRANSCRIPTION_SILENCE_RMS", 0.002)
@@ -411,6 +415,9 @@ EDITABLE_PARAMS = [
     {"key": "TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS", "env": "TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS", "kind": "int", "stage": "Transcription",
      "label": "Loop detection min span seconds (TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS)",
      "help": "Short repeated choruses stay below this; a real decoder loop runs for minutes."},
+    {"key": "TRANSCRIPTION_LOOP_BURST_REPEATS", "env": "TRANSCRIPTION_LOOP_BURST_REPEATS", "kind": "int", "stage": "Transcription",
+     "label": "Loop burst repeats (TRANSCRIPTION_LOOP_BURST_REPEATS)",
+     "help": "OR-condition: flags at this many consecutive identical captions even under the min span. Catches fast silence chains; choruses repeat far fewer times."},
     {"key": "TRANSCRIPTION_RETRY_MIN_MINUTES", "env": "TRANSCRIPTION_RETRY_MIN_MINUTES", "kind": "int", "stage": "Transcription",
      "label": "Retry subdivision floor minutes (TRANSCRIPTION_RETRY_MIN_MINUTES)",
      "help": "Looped spans split in halves down to this window size, then the best effort is accepted and flagged."},

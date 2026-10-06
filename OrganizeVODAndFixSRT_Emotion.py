@@ -42,6 +42,7 @@ from pipeline_config import (
     TRANSCRIPTION_CHUNK_OVERLAP_SECONDS,
     TRANSCRIPTION_LOOP_MIN_REPEATS,
     TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
+    TRANSCRIPTION_LOOP_BURST_REPEATS,
     TRANSCRIPTION_RETRY_MIN_MINUTES,
     TRANSCRIPTION_RETRY_BUDGET_FACTOR,
     TRANSCRIPTION_SILENCE_RMS,
@@ -326,22 +327,45 @@ def stitch_transcription_chunks(
         entries.extend(_read_transcription_chunk(chunk_path, offset_ms, chunk_index))
     entries.sort(key=lambda item: (item[0], item[1], item[3]))
 
+    overlap_ms = TRANSCRIPTION_CHUNK_OVERLAP_SECONDS * 1_000
     deduped: list[list[int | str]] = []
     removed_overlap_count = 0
+    removed_fuzzy_count = 0
+    seam_totals: dict[tuple[int, int], int] = {}
+    seam_deduped: dict[tuple[int, int], int] = {}
     for start_ms, end_ms, text, chunk_index in entries:
         if deduped:
             previous_start, previous_end, previous_text, previous_chunk = deduped[-1]
-            same_overlap_caption = (
-                chunk_index != previous_chunk
-                and normalize_repeated_sentence_key(text)
-                == normalize_repeated_sentence_key(str(previous_text))
-                and start_ms <= int(previous_end) + 1_000
-            )
-            if same_overlap_caption:
-                deduped[-1][0] = min(int(previous_start), start_ms)
-                deduped[-1][1] = max(int(previous_end), end_ms)
-                removed_overlap_count += 1
-                continue
+            near_in_time = start_ms <= int(previous_end) + max(overlap_ms, 1_000)
+            if chunk_index != previous_chunk and near_in_time:
+                seam = (min(int(previous_chunk), chunk_index), max(int(previous_chunk), chunk_index))
+                seam_totals[seam] = seam_totals.get(seam, 0) + 1
+                text_key = normalize_repeated_sentence_key(text)
+                previous_key = normalize_repeated_sentence_key(str(previous_text))
+                if text_key and text_key == previous_key:
+                    # Exact overlap duplicate: same caption decoded twice in
+                    # the shared overlap window. One entry, union span.
+                    deduped[-1][0] = min(int(previous_start), start_ms)
+                    deduped[-1][1] = max(int(previous_end), end_ms)
+                    removed_overlap_count += 1
+                    seam_deduped[seam] = seam_deduped.get(seam, 0) + 1
+                    continue
+                if (
+                    text_key
+                    and previous_key
+                    and _captions_are_near_identical(text_key, previous_key)
+                    and len(text_key.split()) >= MIN_REPEAT_SENTENCE_WORDS
+                ):
+                    # Fuzzy overlap duplicate: same speech reworded under the
+                    # other chunk's decoder context. One entry, union span,
+                    # longer text (more words survived the decode).
+                    deduped[-1][0] = min(int(previous_start), start_ms)
+                    deduped[-1][1] = max(int(previous_end), end_ms)
+                    if len(text_key) > len(previous_key):
+                        deduped[-1][2] = text
+                    removed_fuzzy_count += 1
+                    seam_deduped[seam] = seam_deduped.get(seam, 0) + 1
+                    continue
         deduped.append([start_ms, end_ms, text, chunk_index])
 
     if not deduped:
@@ -359,8 +383,14 @@ def stitch_transcription_chunks(
     temporary_path.replace(output_path)
     print(
         f"Stitched {len(blocks)} subtitle block(s) into {output_path.name}; "
-        f"removed {removed_overlap_count} overlap duplicate(s)."
+        f"removed {removed_overlap_count} overlap duplicate(s), "
+        f"{removed_fuzzy_count} fuzzy reword duplicate(s)."
     )
+    for seam in sorted(seam_totals):
+        print(
+            f"Seam {seam[0]}-{seam[1]}: {seam_deduped.get(seam, 0)}/{seam_totals[seam]} cross-chunk neighbor(s) deduped.",
+            flush=True,
+        )
     return output_path
 
 
@@ -524,35 +554,65 @@ def _count_transcription_blocks(chunk_srt_path: Path) -> int:
     return len(split_srt_blocks(content))
 
 
+def _captions_are_near_identical(first_key: str, second_key: str) -> bool:
+    """Fuzzy equality for adjacent captions from different decoder contexts.
+
+    The stitch overlap window re-decodes the same speech under a different
+    context, so boundary captions reword slightly. Exact keys miss those;
+    token-set ratio >= 0.8 catches rewordings while unrelated sentences
+    score far below it.
+    """
+    if not first_key or not second_key:
+        return False
+    if first_key == second_key:
+        return True
+    first_tokens = set(first_key.split())
+    second_tokens = set(second_key.split())
+    if not first_tokens or not second_tokens:
+        return False
+    return len(first_tokens & second_tokens) / len(first_tokens | second_tokens) >= 0.8
+
+def _block_intra_repeat_ratio(text: str) -> float:
+    """Fraction of sentences inside one caption repeating the previous one.
+
+    A one-block loop (decoder emits one giant caption of the same sentence
+    40x) never builds a consecutive-caption run, so the run detector sees a
+    length-1 run and passes. Ratio >= 0.5 with >= 10 sentences is a loop.
+    """
+    sentence_units = [match.group(0).strip() for match in re.finditer(r"[^.!?]+[.!?]*", text) if match.group(0).strip()]
+    if len(sentence_units) < 10:
+        return 0.0
+    repeated = 0
+    previous_key = ""
+    for sentence in sentence_units:
+        sentence_key = normalize_repeated_sentence_key(sentence)
+        if sentence_key and sentence_key == previous_key and is_repeat_sentence_candidate(sentence_key):
+            repeated += 1
+        previous_key = sentence_key
+    return repeated / len(sentence_units)
+
 def detect_transcription_loop(
     chunk_srt_path: Path,
 ) -> tuple[int, int, int, str] | None:
-    """Find a decoder repeat loop: longest run of consecutive identical captions.
+    """Find a decoder repeat loop: consecutive run, alternation, or one-block.
 
-    Returns (onset_ms, run_length, span_ms, text) in the chunk-local clock when
-    the run reaches TRANSCRIPTION_LOOP_MIN_REPEATS captions spanning at least
-    TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS, else None. Runs at chunk edges below
-    the thresholds (overlap duplicates, short choruses) do not flag.
+    Returns (onset_ms, run_length, span_ms, text) in the chunk-local clock.
+    Flags when EITHER gate trips: the classic run reaches
+    TRANSCRIPTION_LOOP_MIN_REPEATS captions spanning at least
+    TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS, OR the burst gate reaches
+    TRANSCRIPTION_LOOP_BURST_REPEATS identical captions at any span (fast
+    silence chains like 3 s "Thank you" blocks hit 30x in ~90 s without
+    tripping the 180 s span gate). Whole-chunk checks would miss the tail
+    shape (chunk had 247 blocks, only the tail looped), so detection is
+    run-localized and reports the onset. Additionally flags an A-B-A-B
+    alternation of two fuzz-matched captions (run length never exceeds 1
+    there) and a single caption whose sentences are >= 50% repeats.
     """
     try:
         content = read_text(chunk_srt_path)
     except OSError:
         return None
-    best: tuple[int, int, int, str] | None = None
-    current_key: str | None = None
-    current_start = 0
-    current_end = 0
-    current_length = 0
-    current_text = ""
-
-    def consider() -> None:
-        nonlocal best
-        if current_key is None or current_length <= 0:
-            return
-        span_ms = current_end - current_start
-        if best is None or (current_length, span_ms) > (best[1], best[2]):
-            best = (current_start, current_length, span_ms, current_text)
-
+    entries: list[tuple[int, int, str, str]] = []
     for block in split_srt_blocks(content):
         lines = re.split(r"\r?\n", block)
         if len(lines) < 3 or "-->" not in lines[1]:
@@ -569,6 +629,27 @@ def detect_transcription_loop(
         key = normalize_repeated_sentence_key(text)
         if not key:
             continue
+        entries.append((start_ms, end_ms, text, key))
+    # Single-block loop: one giant caption of the same sentence.
+    for start_ms, end_ms, text, _key in entries:
+        if _block_intra_repeat_ratio(text) >= 0.5:
+            return (start_ms, 1, end_ms - start_ms, text)
+    best: tuple[int, int, int, str] | None = None
+    current_key: str | None = None
+    current_start = 0
+    current_end = 0
+    current_length = 0
+    current_text = ""
+
+    def consider() -> None:
+        nonlocal best
+        if current_key is None or current_length <= 0:
+            return
+        span_ms = current_end - current_start
+        if best is None or (current_length, span_ms) > (best[1], best[2]):
+            best = (current_start, current_length, span_ms, current_text)
+
+    for start_ms, end_ms, text, key in entries:
         if key == current_key:
             current_length += 1
             current_end = end_ms
@@ -580,10 +661,37 @@ def detect_transcription_loop(
             current_length = 1
             current_text = text
     consider()
-    if (
-        best is not None
-        and best[1] >= TRANSCRIPTION_LOOP_MIN_REPEATS
-        and best[2] >= TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS * 1_000
+    # A-B-A-B alternation: exact-run detector never exceeds length 1.
+    # A window of 8 blocks over <= 2 fuzzy-distinct captions is a loop
+    # (real dialogue alternates speakers, not identical sentences).
+    if best is None or best[1] < 6:
+        window = 8
+        for index in range(len(entries) - window + 1):
+            window_entries = entries[index:index + window]
+            distinct: list[str] = []
+            matched = True
+            for _start_ms, _end_ms, _text, key in window_entries:
+                placed = False
+                for seen in distinct:
+                    if _captions_are_near_identical(key, seen):
+                        placed = True
+                        break
+                if not placed:
+                    distinct.append(key)
+                    if len(distinct) > 2:
+                        matched = False
+                        break
+            if not matched or len(distinct) > 2:
+                continue
+            alternate_a = {window_entries[i][3] for i in range(0, window, 2)}
+            alternate_b = {window_entries[i][3] for i in range(1, window, 2)}
+            if len(alternate_a) == 1 and len(alternate_b) == 1:
+                span_ms = window_entries[-1][1] - window_entries[0][0]
+                return (window_entries[0][0], window, span_ms, window_entries[0][2])
+    if best is not None and (
+        (best[1] >= TRANSCRIPTION_LOOP_MIN_REPEATS
+         and best[2] >= TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS * 1_000)
+        or best[1] >= TRANSCRIPTION_LOOP_BURST_REPEATS
     ):
         return best
     return None
@@ -645,6 +753,7 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
         "overlap_seconds": manifest.get("overlap_seconds"),
         "loop_min_repeats": TRANSCRIPTION_LOOP_MIN_REPEATS,
         "loop_min_span_seconds": TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
+        "loop_burst_repeats": TRANSCRIPTION_LOOP_BURST_REPEATS,
         "retry_min_minutes": TRANSCRIPTION_RETRY_MIN_MINUTES,
         "retry_budget_factor": TRANSCRIPTION_RETRY_BUDGET_FACTOR,
         "silence_rms": TRANSCRIPTION_SILENCE_RMS,
@@ -758,8 +867,11 @@ def _resolve_retry_span(
     """Transcribe a span as overlapped halves, recursing into looped pieces.
 
     Returns (srt_path, offset_ms) pairs replacing the failed span. extra_budget
-    caps Whisper invocations across the whole run; exhausted or below-floor
-    spans are accepted as-is and recorded in warnings instead of retried.
+    caps total Whisper invocations across the run: recursion stops when it
+    hits zero, and the span decodes once and is accepted with a warning.
+    Silent halves skip Whisper entirely (muted mic needs no GPU). Empty
+    output over live audio at/below the retry floor still decodes once so
+    the stitched SRT has no holes; the warning flags it for review.
     """
     overlap_ms = TRANSCRIPTION_CHUNK_OVERLAP_SECONDS * 1_000
     middle_ms = (span_start_ms + span_end_ms) // 2
@@ -774,11 +886,19 @@ def _resolve_retry_span(
         sub_srt_path = chunk_dir / f"{sub_stem}.srt"
         _extract_retry_subchunk(audio_path, sub_start_ms, sub_end_ms, sub_wav_path)
         if not (sub_srt_path.is_file() and sub_srt_path.stat().st_size > 0):
-            is_silent, _rms = _chunk_audio_is_silent(sub_wav_path)
+            is_silent, peak_rms = _chunk_audio_is_silent(sub_wav_path)
             if is_silent:
-                print(f"[SILENT] {sub_stem}: silent audio, skipping Whisper decode.", flush=True)
+                rms_text = f"{peak_rms:.5f}" if peak_rms is not None else "unknown"
+                print(f"[SILENT] {sub_stem}: silent audio (rms {rms_text}), skipping Whisper decode.", flush=True)
                 sub_srt_path.touch(exist_ok=True)
-            elif extra_budget[0] <= 0:
+                warnings.append({
+                    "chunk": chunk_label,
+                    "kind": "silent-span",
+                    "detail": f"{sub_stem}: silent audio (rms {rms_text}); decode skipped as muted mic.",
+                })
+                resolved.append((sub_srt_path, sub_start_ms))
+                continue
+            if extra_budget[0] <= 0:
                 warnings.append({
                     "chunk": chunk_label,
                     "kind": "budget-exhausted",
@@ -807,23 +927,30 @@ def _resolve_retry_span(
                 })
                 print(f"[SILENT] {sub_stem}: silent audio, accepting empty SRT.", flush=True)
                 resolved.append((sub_srt_path, sub_start_ms))
-            elif _can_subdivide_span(sub_start_ms, sub_end_ms):
+            elif _can_subdivide_span(sub_start_ms, sub_end_ms) and extra_budget[0] > 0:
                 resolved.extend(_resolve_retry_span(
                     audio_path, chunk_dir, sub_stem, sub_start_ms, sub_end_ms,
                     depth + 1, extra_budget, duration_ms, chunk_label, warnings,
                 ))
             else:
+                # Below the floor or out of budget: decode once and accept so
+                # the stitched SRT covers this span (flagged for review).
+                # Never append an empty SRT without an entry - that left
+                # transcript HOLES skipping the audio entirely (2026-10-06).
+                reason = "below the retry floor" if extra_budget[0] > 0 else "retry budget spent"
                 warnings.append({
                     "chunk": chunk_label,
-                    "kind": "empty-accepted",
-                    "detail": f"{sub_stem}: empty output over live audio below the retry floor; accepted as hole.",
+                    "kind": "budget-exhausted" if extra_budget[0] <= 0 else "empty-accepted",
+                    "detail": f"{sub_stem}: empty output over live audio {reason}; decoded once and accepted, flagged for review.",
                 })
-                print(f"[RETRY] {sub_stem}: empty over live audio below floor, accepting hole.", flush=True)
+                print(f"[RETRY] {sub_stem}: empty over live audio {reason}, decoding once and accepting.", flush=True)
+                _transcribe_audio_chunk(sub_wav_path, sub_srt_path)
+                resolved.append((sub_srt_path, sub_start_ms))
             continue
         loop = detect_transcription_loop(sub_srt_path)
         if loop is None:
             resolved.append((sub_srt_path, sub_start_ms))
-        elif _can_subdivide_span(sub_start_ms, sub_end_ms):
+        elif _can_subdivide_span(sub_start_ms, sub_end_ms) and extra_budget[0] > 0:
             onset_ms, run_length, span_ms, _text = loop
             print(
                 f"[LOOP] {sub_srt_path.name}: {run_length}x repeat spanning "
@@ -836,12 +963,13 @@ def _resolve_retry_span(
             ))
         else:
             _onset_ms, run_length, span_ms, _text = loop
+            reason = "below the retry floor" if extra_budget[0] > 0 else "retry budget spent"
             warnings.append({
                 "chunk": chunk_label,
-                "kind": "loop-accepted",
-                "detail": f"{sub_stem}: {run_length}x repeat over {span_ms // 1_000}s below the retry floor; kept.",
+                "kind": "budget-exhausted" if extra_budget[0] <= 0 else "loop-accepted",
+                "detail": f"{sub_stem}: {run_length}x repeat over {span_ms // 1_000}s {reason}; kept and flagged.",
             })
-            print(f"[RETRY] {sub_stem}: loop below floor, keeping output and flagging it.", flush=True)
+            print(f"[RETRY] {sub_stem}: loop {reason}, keeping output and flagging it.", flush=True)
             resolved.append((sub_srt_path, sub_start_ms))
     return resolved
 
