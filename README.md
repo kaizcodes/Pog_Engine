@@ -77,9 +77,9 @@ Files you'll need for Davinci Resolve:
 
 VOD.mp4
 
-VOD**fixed**.srt (must have fixed in name)
+VOD_**fixed**.srt (must have fixed in name)
 
-highlights.edl (your highlight markers)
+top50_highlights.edl (your highlight markers)
 
 
 You are welcomed to use any marker conversion tool to convert Davinci Resolve markers to use in other programs.
