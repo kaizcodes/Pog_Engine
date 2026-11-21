@@ -1589,6 +1589,7 @@ def _verify_python_packages(models_dir: Path, reporter: Reporter,
             reporter.log(f"  [MISSING] {pip_name} not installed (whisper large-v3 dep)")
             reporter.status(pip_name, "Missing")
             all_ok = False
+    return all_ok
 
 
 def check_python_packages(models_dir: Path, reporter: Reporter, install: bool) -> bool:
