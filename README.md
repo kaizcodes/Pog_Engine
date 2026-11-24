@@ -163,7 +163,7 @@ I met him at an event before COVID, genuinely a cool guy.
 
 ## Pog Engine history:
 
-I remember hearing that 99% of streamers quit because they can't put out content on other platforms to grow their audience so they get stuck streaming to 1 viewer and burn out. I, myself, fell into this trap multiple times. Laziness or the willingness to watch over 5-6 hours of my own VOD is just too time consuming, even at 2x speed. It's just impossible to grow unless you have a lot of free time or spend money on someone who can scrub the VOD and edit it for you. So I built tools that help me cut down time spent scrubbing.
+I remember hearing that 99% of streamers quit because they can't put out content on other platforms to grow their audience so they get stuck streaming to 1 viewer and burn out. I, myself, fell into this trap multiple times. Laziness or the unwillingness to watch over 5-6 hours of my own VOD is just too time consuming, even at 2x speed. It's just impossible to grow unless you have a lot of free time or spend money on someone who can scrub the VOD and edit it for you. So I built tools that help me cut down time spent scrubbing.
 
 Pog Engine started as a caption finder, I used another tool to transcribe my content then a script would look through the transcription to find where I say things like "clip that" or "that's crazy" and it would mark it down for me in Davinci Resolve. This script is still available as "Subtitle to Marker".
 
